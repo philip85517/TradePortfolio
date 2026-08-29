@@ -1,0 +1,82 @@
+# AlphaLab ETF 日线轮动 V0 —— SPEC-ETF-PAPER-001 默认配置
+# 所有参数变更都会改变 config_hash，必须同步提升 strategy.version。
+strategy:
+  id: etf_rotation_v0
+  version: 0.1.0
+  rebalance_frequency: weekly
+  rebalance_weekday: 4          # 0=周一 ... 4=周五
+  max_positions: 5
+
+universe:
+  min_listing_days: 180
+  min_aum_cny: 500000000
+  min_avg_turnover_20d_cny: 30000000
+  exclude_leveraged: true
+  exclude_inverse: true
+  exclude_active: true
+  exclude_single_stock: true
+
+alpha:
+  ranking_method: composite
+  momentum_window: 60
+  short_window: 20
+  effective_move_window: 20
+  atr_window: 20
+  top_n: 5
+  weights:
+    return_60d: 0.35
+    return_20d: 0.20
+    return_atr_20d: 0.20
+    effective_move_20d: 0.15
+    liquidity: 0.10
+
+trend_filter:
+  enabled: true
+  moving_average_window: 60
+
+entry:
+  ema_pullback_enabled: false
+  ema_window: 20
+
+portfolio:
+  weighting_method: equal_weight
+  max_single_weight: 0.20
+  reserve_cash_pct: 0.05
+  rebalance_threshold_pct: 0.00
+
+risk:
+  atr_position_sizing_enabled: false
+  atr_stop_enabled: false
+  allow_negative_cash: false
+
+account:
+  initial_cash: 100000
+  currency: CNY
+
+execution:
+  signal_time: close
+  execution_time: next_open
+  price_type: open
+  slippage_bps: 5
+  commission_bps: 3
+  min_commission_cny: 0
+  lot_size: 100
+  allow_partial_fill: false
+  reject_if_price_missing: true
+  sell_before_buy: true
+  order_generation_version_prefix: "v1"
+
+data:
+  market_dir: alphalab/data/market
+  synthetic_fallback: true
+  synthetic_seed: 42
+  warmup_days: 260
+
+storage:
+  db_path: alphalab/storage/paper_trading.db
+
+validation:
+  asset_balance_tolerance_cny: 0.01
+  cash_balance_tolerance_cny: 0.01
+  reject_future_data: true
+

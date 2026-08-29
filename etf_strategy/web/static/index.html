@@ -1,0 +1,375 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>alphaLab Quant Workbench</title>
+    <link rel="stylesheet" href="styles.css?v=workbench-visual-20260702d" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar">
+        <div class="brand">
+          <div class="brand-mark">αL</div>
+          <div>
+            <h1>alphaLab</h1>
+            <p>Quant Research Workbench</p>
+          </div>
+        </div>
+
+        <div class="sidebar-context">
+          <span>DATA WINDOW</span>
+          <strong id="dataRange">Loading data</strong>
+        </div>
+
+        <nav class="workbench-nav" aria-label="量化研究工作台">
+          <div class="nav-section-label">RESEARCH</div>
+          <button id="homeNav" class="active" type="button" data-page="home">
+            <span>Research Home</span>
+            <small>状态 / 信号</small>
+          </button>
+          <button id="etfScoringNav" type="button" data-page="etf-scoring">
+            <span>ETF Scoring Lab</span>
+            <small>排名 / 拆解</small>
+          </button>
+          <button id="etfPortfolioNav" type="button" data-page="etf-portfolio">
+            <span>ETF Portfolio Lab</span>
+            <small>模拟 / 调仓</small>
+          </button>
+          <button id="stockScoringNav" type="button" data-page="stock-scoring">
+            <span>Stock Scoring Lab</span>
+            <small>行业 / 股票池</small>
+          </button>
+          <div class="nav-section-label">OPERATIONS</div>
+          <button id="dataHealthNav" type="button" data-page="data-health">
+            <span>Data Health</span>
+            <small>覆盖 / 更新</small>
+          </button>
+        </nav>
+
+        <div id="etfSidebarControls" class="sidebar-panel">
+          <section class="control-group">
+            <label for="symbolSelect">ACTIVE INSTRUMENT</label>
+            <select id="symbolSelect"></select>
+          </section>
+
+          <button id="updateBtn" class="primary-button" type="button">Sync Market Data</button>
+        </div>
+      </aside>
+
+      <main class="workspace">
+        <header class="topbar">
+          <div>
+            <h2 id="workspaceTitle">Research Home</h2>
+            <p id="workspaceSubtitle">本地 ETF / 股票策略研究工作台，围绕配置、评分、组合模拟和解释性展开。</p>
+          </div>
+          <div class="global-status">
+            <span id="globalMarketLabel">全市场</span>
+            <span id="globalConfigLabel">配置 etf_rotation_ema20_v1</span>
+            <span class="status-line" id="statusLine">Connecting</span>
+          </div>
+        </header>
+
+        <section id="homePage" class="workbench-page">
+          <div class="global-control-strip">
+            <div><span>ETF 数据日期</span><strong id="homeEtfDate">--</strong></div>
+            <div><span>股票数据状态</span><strong id="homeStockDate">--</strong></div>
+            <div><span>当前市场范围</span><strong id="homeMarketScope">全市场</strong></div>
+            <div><span>数据健康</span><strong id="homeHealthState">--</strong></div>
+          </div>
+
+          <section class="metric-strip" id="metricStrip"></section>
+
+          <section class="quick-actions">
+            <button type="button" data-goto-page="etf-scoring"><span>ETF Scoring</span><small>打开评分拆解</small></button>
+            <button type="button" data-goto-page="etf-portfolio"><span>Portfolio Lab</span><small>运行滚动模拟</small></button>
+            <button type="button" data-goto-page="stock-scoring"><span>Stock Lens</span><small>浏览行业评分</small></button>
+            <button type="button" data-goto-page="data-health"><span>Data Health</span><small>检查覆盖与日志</small></button>
+          </section>
+
+          <section class="grid two-columns">
+            <div class="panel">
+              <div class="panel-header">
+                <h3>资产覆盖</h3>
+                <span id="coverageTotal"></span>
+              </div>
+              <div id="coverageChart" class="bar-chart"></div>
+            </div>
+
+            <div class="panel">
+              <div class="panel-header">
+                <h3>方向热力图</h3>
+                <span id="heatmapDate"></span>
+              </div>
+              <div id="themeHeatmap" class="heatmap-grid"></div>
+            </div>
+          </section>
+
+          <section class="panel">
+            <div class="panel-header">
+              <div>
+                <h3>Top10 观察池</h3>
+                <div id="watchMarketTabs" class="market-tabs"></div>
+              </div>
+              <span id="watchlistDate"></span>
+            </div>
+            <div id="watchlist" class="rank-list compact-rank-list"></div>
+          </section>
+        </section>
+
+        <section id="etfScoringPage" class="workbench-page" hidden>
+          <div class="lab-toolbar">
+            <div>
+              <span>评分配置</span>
+              <strong id="scoringConfigVersion">etf_rotation_ema20_v1</strong>
+            </div>
+            <button type="button" class="ghost-action" id="weightConfigBtn">权重配置</button>
+            <button type="button" class="ghost-action" id="saveExperimentBtn">保存为实验</button>
+            <button type="button" class="ghost-action" id="compareExperimentBtn">与历史实验对比</button>
+          </div>
+
+          <div class="scoring-workbench-grid">
+            <aside class="filter-rail">
+              <h3>ETF 筛选器</h3>
+              <label for="assetClass">资产类别</label>
+              <select id="assetClass"></select>
+              <label for="sortBy">排序</label>
+              <select id="sortBy">
+                <option value="daily_rank">推荐排名</option>
+                <option value="total_score">综合分</option>
+                <option value="return_60d">60日收益</option>
+                <option value="return_20d">20日收益</option>
+                <option value="return_120d">120日收益</option>
+                <option value="amount">成交额</option>
+                <option value="fund_size">基金规模</option>
+              </select>
+              <label for="searchBox">搜索</label>
+              <input id="searchBox" type="search" placeholder="代码或名称" />
+              <div id="leaderboardMarketTabs" class="market-tabs vertical-tabs"></div>
+            </aside>
+
+            <div class="scoring-main">
+              <div id="etfScoringChartSlot">
+                <section id="chartSection" class="grid chart-layout">
+                  <div class="panel chart-panel">
+                    <div class="panel-header">
+                      <h3 id="priceTitle">价格走势</h3>
+                      <div class="chart-header-actions">
+                        <div id="chartPeriodTabs" class="period-tabs" aria-label="图表周期">
+                          <button type="button" class="active" data-period="day">日</button>
+                          <button type="button" data-period="week">周</button>
+                          <button type="button" data-period="month">月</button>
+                        </div>
+                        <span id="priceSubtitle"></span>
+                      </div>
+                    </div>
+                    <div id="priceChart" role="img" aria-label="价格走势图"></div>
+                  </div>
+
+                  <div class="panel stat-panel">
+                    <div class="panel-header">
+                      <h3>标的概览</h3>
+                      <span id="symbolClass"></span>
+                    </div>
+                    <div id="symbolStats" class="stat-grid"></div>
+                  </div>
+                </section>
+              </div>
+
+              <section class="panel">
+                <div class="panel-header table-header">
+                  <div>
+                    <h3>ETF 排名</h3>
+                    <span>点击方向展开成员，点击标的查看评分拆解</span>
+                  </div>
+                  <span id="leaderboardCount"></span>
+                </div>
+                <div class="table-wrap">
+                  <table>
+                    <thead>
+                      <tr>
+                        <th class="num">组合排名</th>
+                        <th>方向</th>
+                        <th>代表标的</th>
+                        <th>市场</th>
+                        <th class="num">综合分</th>
+                        <th class="num">数量</th>
+                        <th class="num">20日</th>
+                        <th class="num">60日</th>
+                        <th class="num">120日</th>
+                        <th class="num">成交额</th>
+                      </tr>
+                    </thead>
+                    <tbody id="leaderboardBody"></tbody>
+                  </table>
+                </div>
+              </section>
+            </div>
+
+            <aside class="detail-rail" id="etfDetailPanel">
+              <div class="detail-empty">选择 ETF 后显示评分拆解、扣分原因和入场条件。</div>
+            </aside>
+          </div>
+        </section>
+
+        <section id="etfPortfolioPage" class="workbench-page" hidden>
+          <div class="portfolio-param-bar">
+            <div>
+              <label for="planDays">模拟区间</label>
+              <select id="planDays">
+                <option value="30" selected>最近 30 天</option>
+                <option value="60">最近 60 天</option>
+                <option value="120">最近 120 天</option>
+                <option value="180">最近 180 天</option>
+                <option value="220">最近 220 天</option>
+                <option value="365">最近 365 天</option>
+                <option value="430">最近 430 天</option>
+                <option value="500">最近 500 天</option>
+                <option value="560">最近 560 天</option>
+                <option value="620">最近 620 天</option>
+                <option value="680">最近 680 天</option>
+              </select>
+            </div>
+            <div id="planMarketTabs" class="market-tabs"></div>
+            <button type="button" id="runPlanBtn" class="primary-button">运行模拟</button>
+          </div>
+
+          <section class="plan-intro">
+            <div>
+              <h3>组合模拟说明</h3>
+              <p>当前滚动持仓模拟复用现有引擎，只改变换仓周期和目标持仓数量。第一版重点把收益、交易点和买卖理由组织成 Portfolio Lab 视图。</p>
+            </div>
+            <div class="plan-rule-grid">
+              <div><strong>5 / 10 日</strong><span>偏进攻，快速替换掉排名下滑基金</span></div>
+              <div><strong>20 / 40 日</strong><span>偏稳健，降低跳仓频率和交易摩擦</span></div>
+              <div><strong>3 / 5 只</strong><span>集中押注，高波动、高差异</span></div>
+              <div><strong>8 / 10 只</strong><span>分散持有，单只基金影响更低</span></div>
+            </div>
+          </section>
+
+          <section class="panel">
+            <div class="panel-header table-header">
+              <div>
+                <h3>滚动仓位策略模拟持仓计划</h3>
+                <span>展开策略后查看历史调仓标的收益与买卖解释</span>
+              </div>
+              <span id="plansCount"></span>
+            </div>
+            <div class="table-wrap plan-table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th class="num">排名</th>
+                    <th>模拟策略</th>
+                    <th class="num">天数</th>
+                    <th class="num">本金收益</th>
+                    <th class="num">最大回撤</th>
+                    <th class="num">日波动</th>
+                    <th class="num">年化波动</th>
+                    <th class="num">胜率</th>
+                    <th class="num">跳仓</th>
+                    <th>当前持仓</th>
+                  </tr>
+                </thead>
+                <tbody id="plansBody"></tbody>
+              </table>
+            </div>
+          </section>
+        </section>
+
+        <section id="stockScoringPage" class="workbench-page" hidden>
+          <section class="panel">
+            <div class="panel-header table-header">
+              <div>
+                <h3>股票评分实验室 · 行业视图</h3>
+                <div id="stockMarketTabs" class="market-tabs"></div>
+              </div>
+              <div class="stock-controls">
+                <label for="stockIndustryLevel">行业层级</label>
+                <select id="stockIndustryLevel">
+                  <option value="level1">一级行业</option>
+                  <option value="level2">二级行业</option>
+                  <option value="level3">三级分类</option>
+                </select>
+                <label for="stockSortBy">排序</label>
+                <select id="stockSortBy">
+                  <option value="group_rank">分类评分</option>
+                  <option value="top_score">龙头评分</option>
+                  <option value="return_60d">60日收益</option>
+                  <option value="return_20d">20日收益</option>
+                  <option value="return_120d">120日收益</option>
+                  <option value="amount">成交额</option>
+                </select>
+                <label for="stockSearchBox">搜索</label>
+                <input id="stockSearchBox" type="search" placeholder="行业、代码或名称" />
+                <span id="stockOverviewCount"></span>
+              </div>
+            </div>
+            <div class="table-wrap stock-table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th class="num">分类排名</th>
+                    <th>行业分类</th>
+                    <th>代表股票</th>
+                    <th class="num">分类分</th>
+                    <th class="num">股票数</th>
+                    <th class="num">20日</th>
+                    <th class="num">60日</th>
+                    <th class="num">120日</th>
+                    <th class="num">成交额</th>
+                  </tr>
+                </thead>
+                <tbody id="stockOverviewBody"></tbody>
+              </table>
+            </div>
+          </section>
+        </section>
+
+        <section id="dataHealthPage" class="workbench-page" hidden>
+          <section class="grid two-columns">
+            <div class="panel">
+              <div class="panel-header">
+                <h3>ETF 数据状态</h3>
+                <span id="healthFreshness"></span>
+              </div>
+              <div id="healthSummary" class="health-grid"></div>
+            </div>
+            <div class="panel">
+              <div class="panel-header">
+                <h3>股票市场覆盖</h3>
+                <span>market_ohlcv</span>
+              </div>
+              <div id="stockHealthSummary" class="health-grid"></div>
+            </div>
+          </section>
+
+          <section class="panel">
+            <div class="panel-header">
+              <h3>最近 ETF 更新日志</h3>
+              <span>provider / rows / failures</span>
+            </div>
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>运行时间</th>
+                    <th>来源</th>
+                    <th>区间</th>
+                    <th class="num">行数</th>
+                    <th class="num">标的</th>
+                    <th class="num">失败</th>
+                    <th>备注</th>
+                  </tr>
+                </thead>
+                <tbody id="updateLogBody"></tbody>
+              </table>
+            </div>
+          </section>
+        </section>
+      </main>
+    </div>
+    <script src="https://cdn.jsdelivr.net/npm/lightweight-charts@4.2.3/dist/lightweight-charts.standalone.production.js"></script>
+    <script src="app.js?v=workbench-visual-20260702c"></script>
+  </body>
+</html>

@@ -1,0 +1,14 @@
+account:
+  initial_cash: 100000
+  currency: CNY
+
+storage:
+  db_path: alphalab/storage/paper_trading.db
+
+execution:
+  slippage_bps: 5
+  commission_bps: 3
+  min_commission_cny: 0
+  lot_size: 100
+  sell_before_buy: true
+

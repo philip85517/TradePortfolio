@@ -1,0 +1,40 @@
+# Free-source market data seed universe for local backtesting data builds.
+#
+# Providers:
+# - a_share / hk / us use AKShare by default.
+# - crypto uses CCXT by default.
+# Expand this file with the individual stocks and symbols needed by a backtest.
+timeframes:
+  - 1mo
+  - 1w
+  - 1d
+  - 1h
+  - 30m
+  - 15m
+  - 5m
+
+symbols:
+  - market: a_share
+    symbol: "000001"
+    name: "Ping An Bank"
+    provider: akshare
+    adjust: qfq
+
+  - market: hk
+    symbol: "00700"
+    name: "Tencent Holdings"
+    provider: akshare
+    adjust: qfq
+
+  - market: us
+    symbol: "AAPL"
+    source_symbol: "105.AAPL"
+    name: "Apple"
+    provider: akshare
+    adjust: qfq
+
+  - market: crypto
+    symbol: "BTC/USDT"
+    name: "Bitcoin / Tether"
+    provider: ccxt
+    exchange: okx

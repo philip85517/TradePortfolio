@@ -1,0 +1,9 @@
+# AlphaLab 模拟交易闭环最小依赖
+pandas>=2.0
+numpy>=1.24
+PyYAML>=6.0
+# 可选：读取 etf_strategy 的 DuckDB 行情（自动发现）
+duckdb>=1.0
+# 测试
+pytest>=8.0
+

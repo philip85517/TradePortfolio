@@ -1,0 +1,15 @@
+asset_classes:
+  - A_SHARE_BROAD
+  - A_SHARE_INDUSTRY
+  - HK_BROAD
+  - HK_TECH
+  - US_BROAD
+  - US_TECH
+  - COMMODITY_GOLD
+  - COMMODITY_OIL
+  - COMMODITY_METAL
+  - BOND
+  - DIVIDEND
+  - LOW_VOL
+  - OTHER
+
