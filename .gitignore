@@ -1,0 +1,15 @@
+.DS_Store
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+*.db
+*.db-wal
+*.db-shm
+*.duckdb
+etf_strategy/data/raw/
+etf_strategy/data/processed/
+alphalab/storage/paper_trading.db
+alphalab/reports/paper/
+alphalab/reports/research/
+alphalab/data/market/*.csv

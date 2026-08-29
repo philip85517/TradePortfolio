@@ -1,0 +1,131 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>alphaLab · 历史截面审阅</title>
+    <link rel="stylesheet" href="/styles.css" />
+    <!-- LightweightCharts is used when the CDN is available; app.js keeps an SVG fallback for offline review. -->
+    <script src="https://cdn.jsdelivr.net/npm/lightweight-charts@4.2.3/dist/lightweight-charts.standalone.production.js"></script>
+    <script src="/app.js" defer></script>
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar">
+        <div class="brand">
+          <div class="brand-mark">αL</div>
+          <div><h1>alphaLab</h1><p>Quant Research Workbench</p></div>
+        </div>
+        <div class="sidebar-context">
+          <span>RESEARCH RUN</span>
+          <strong id="sidebarRun">Loading run…</strong>
+          <small id="sidebarDate">--</small>
+        </div>
+        <nav class="workbench-nav" aria-label="历史研究工作台">
+          <div class="nav-section-label">RESEARCH</div>
+          <a class="active" href="#candidateView"><span>Candidate Review</span><small>排名 / 筛选 / 因子</small></a>
+          <a href="#chartView"><span>Stock Lens</span><small>走势 / 成交量 / 标记</small></a>
+          <a href="#evaluationSummary"><span>Forward Test</span><small>事后评估 / 组合</small></a>
+          <div class="nav-section-label">CONTEXT</div>
+          <a href="#summaryStrip"><span>Experiment Snapshot</span><small>规则 / 数据质量</small></a>
+        </nav>
+        <div class="sidebar-note">
+          <span>READ-ONLY WORKSPACE</span>
+          <p>实验产物已冻结。页面不会编辑规则、重跑实验或写入交易账本。</p>
+        </div>
+      </aside>
+
+      <main class="workspace">
+        <header class="topbar">
+          <div>
+            <p class="breadcrumb">RESEARCH / CANDIDATE REVIEW</p>
+            <h2>历史截面候选池</h2>
+            <p id="subtitle">加载冻结实验…</p>
+          </div>
+          <div class="global-status">
+            <span id="marketLabel">市场 A 股</span><span>规则 <strong id="topRuleVersion">--</strong></span><span class="status-line">只读</span>
+            <div class="mode-switch" role="group" aria-label="审阅模式">
+              <button id="selectionMode" class="mode-button active" type="button">选股审阅</button>
+              <button id="evaluationMode" class="mode-button" type="button">事后评估</button>
+            </div>
+          </div>
+        </header>
+
+        <section id="summaryStrip" class="global-control-strip" aria-label="实验摘要">
+          <div><span>请求日期</span><strong id="requestedDate">--</strong></div>
+          <div><span>有效信号日</span><strong id="signalDate">--</strong></div>
+          <div><span>全量 / 合格 / 入选</span><strong id="funnel">--</strong></div>
+          <div><span>股票池口径</span><strong id="universeMode">--</strong></div>
+          <div><span>研究数据范围</span><strong id="dataRange">--</strong></div>
+          <div><span>数据健康</span><strong id="qualityState">--</strong></div>
+        </section>
+
+        <section class="panel table-header review-toolbar">
+          <div><h3>候选池筛选</h3><span>筛选只改变当前视图，不改变冻结排名</span></div>
+          <div class="table-controls">
+            <label for="search">搜索</label><input id="search" type="search" placeholder="代码、名称或行业" />
+            <label for="status">状态</label><select id="status"><option value="all">全部</option><option value="selected">入选 Top</option><option value="eligible">合格未入选</option><option value="excluded">已剔除</option></select>
+            <label for="industry">行业</label><select id="industry"><option value="all">全部行业</option></select>
+            <label for="reason">原因</label><select id="reason"><option value="all">全部原因</option></select>
+            <span id="resultCount" class="table-count">--</span>
+          </div>
+        </section>
+
+        <section id="candidateView" class="review-grid">
+          <aside class="panel candidate-panel">
+            <div class="panel-header"><div><p class="section-kicker">CANDIDATES</p><h3>候选排名</h3></div><span class="panel-hint">↑ / ↓ 切换</span></div>
+            <div class="table-wrap candidate-table-wrap">
+              <table class="candidate-table">
+                <thead><tr><th>#</th><th>股票</th><th>行业</th><th class="num">20日</th><th class="num">60日</th><th class="num">20日额</th><th class="num">总分</th><th class="num">权重</th><th>状态</th></tr></thead>
+                <tbody id="candidateBody"></tbody>
+              </table>
+            </div>
+            <div id="candidateEmpty" class="tab-empty" hidden>没有符合当前筛选条件的股票。</div>
+          </aside>
+
+          <section class="review-main">
+            <div id="detailEmpty" class="panel detail-empty">
+              <p class="section-kicker">STOCK LENS</p><h3>选择一只股票开始审阅</h3>
+              <p>默认只请求信号日前行情。显式切换到“事后评估”后才会读取未来数据。</p>
+            </div>
+            <div id="detailContent" hidden>
+              <section class="panel detail-header">
+                <div><p id="detailSymbol" class="section-kicker">--</p><h3 id="detailName">--</h3><p id="detailIndustry" class="detail-subtitle">--</p></div>
+                <div class="detail-navigation"><button id="previousButton" class="icon-button" type="button" aria-label="上一只">←</button><span id="detailPosition">--</span><button id="nextButton" class="icon-button" type="button" aria-label="下一只">→</button></div>
+              </section>
+
+              <section id="chartView" class="chart-layout">
+                <div class="panel chart-panel">
+                  <div class="panel-header"><div><p class="section-kicker">PRICE / VOLUME</p><h3>日线走势</h3></div><div id="chartLegend" class="chart-legend"><span><i class="dot signal"></i>信号日</span></div></div>
+                  <div id="chart" class="chart" role="img" aria-label="股票日线蜡烛图和成交量图"></div>
+                  <p id="chartNotice" class="chart-notice">选股审阅模式：后端响应在有效信号日截止。</p>
+                </div>
+                <aside class="panel stat-panel">
+                  <div class="panel-header"><div><p class="section-kicker">FIXED V0 FACTORS</p><h3>因子拆解</h3></div><span id="selectionBadge" class="badge">--</span></div>
+                  <div id="factorGrid" class="factor-grid"></div>
+                  <div class="reason-box"><span>过滤原因</span><strong id="detailReason">--</strong></div>
+                </aside>
+              </section>
+
+              <section id="evaluationSummary" class="panel evaluation-panel" hidden>
+                <div class="panel-header"><div><p class="section-kicker">FORWARD TEST</p><h3>事后评估</h3></div><span class="badge accent">含成本</span></div>
+                <div id="performanceGrid" class="performance-grid"></div>
+              </section>
+              <section id="portfolioSummary" class="panel portfolio-summary" hidden>
+                <div class="panel-header"><div><p class="section-kicker">PORTFOLIO PATH</p><h3>组合路径</h3></div><span id="portfolioStatusBadge" class="badge accent">评估结果</span></div>
+                <div id="portfolioMetricsGrid" class="performance-grid"></div>
+                <div class="portfolio-chart-grid">
+                  <div class="portfolio-chart-card"><div class="chart-card-title"><span>组合净值</span><small>按观察周期</small></div><div id="navChart" class="mini-chart" role="img" aria-label="组合净值曲线"></div></div>
+                  <div class="portfolio-chart-card"><div class="chart-card-title"><span>组合回撤</span><small>按观察周期</small></div><div id="drawdownChart" class="mini-chart" role="img" aria-label="组合回撤曲线"></div></div>
+                </div>
+                <div class="portfolio-holdings-title">当前运行持仓</div>
+                <div id="portfolioGrid" class="performance-grid"></div>
+              </section>
+            </div>
+          </section>
+        </section>
+        <div id="errorBanner" class="error-banner" hidden></div>
+      </main>
+    </div>
+  </body>
+</html>
