@@ -27,6 +27,16 @@ HISTORY_COLUMNS = (
     "snapshot_id",
     "source_recorded_at",
 )
+INDUSTRY_SNAPSHOT_COLUMNS = (
+    "market",
+    "symbol",
+    "industry_level1",
+    "industry_level2",
+    "industry_level3",
+    "source",
+    "snapshot_id",
+    "source_recorded_at",
+)
 REQUIRED_COLUMNS = {
     "market",
     "symbol",
@@ -36,6 +46,7 @@ REQUIRED_COLUMNS = {
     "source",
     "snapshot_id",
 }
+INDUSTRY_REQUIRED_COLUMNS = {"market", "symbol", "source", "snapshot_id"}
 
 
 def normalize_universe_history(
@@ -240,6 +251,149 @@ def load_universe_as_of(
         ).fetch_df()
 
 
+def normalize_industry_snapshot(
+    frame: pd.DataFrame,
+    *,
+    source: str | None,
+    snapshot_id: str | None,
+) -> pd.DataFrame:
+    """标准化当前行业快照，不把它伪装成 PIT 历史区间。"""
+
+    data = frame.copy()
+    if source is not None:
+        data["source"] = source
+    if snapshot_id is not None:
+        data["snapshot_id"] = snapshot_id
+    missing = sorted(INDUSTRY_REQUIRED_COLUMNS - set(data.columns))
+    if missing:
+        raise UniverseHistoryError(f"行业快照缺少必填列: {missing}")
+    for column in INDUSTRY_SNAPSHOT_COLUMNS:
+        if column not in data.columns:
+            data[column] = pd.NA
+    data = data[list(INDUSTRY_SNAPSHOT_COLUMNS)].copy()
+    for column in ["market", "symbol", "industry_level1", "industry_level2", "industry_level3", "source", "snapshot_id"]:
+        data[column] = data[column].astype("string").str.strip()
+    data["source_recorded_at"] = (
+        pd.to_datetime(data["source_recorded_at"], errors="coerce")
+        .dt.tz_localize(None)
+        .fillna(pd.Timestamp.now(tz="UTC").tz_localize(None))
+        .astype("datetime64[ns]")
+    )
+    data = data.dropna(subset=["market", "symbol", "source", "snapshot_id"])
+    data = data[data["symbol"].astype(str).str.strip().ne("")]
+    return data.drop_duplicates(["market", "symbol", "source", "snapshot_id"], keep="last").reset_index(drop=True)
+
+
+def build_baostock_industry_snapshot(
+    raw: pd.DataFrame,
+    *,
+    snapshot_id: str,
+    recorded_at: pd.Timestamp | None = None,
+) -> pd.DataFrame:
+    """标准化既有 BaoStock 行业 updater 的输出。"""
+
+    required = {"market", "symbol", "industry_level1", "industry_level2", "industry_level3"}
+    missing = sorted(required - set(raw.columns))
+    if missing:
+        raise UniverseHistoryError(f"BaoStock 行业资料缺少列: {missing}")
+    data = raw.copy()
+    data["source_recorded_at"] = recorded_at or pd.Timestamp.now(tz="UTC").tz_localize(None)
+    return normalize_industry_snapshot(data, source="baostock", snapshot_id=snapshot_id)
+
+
+def upsert_industry_snapshot(
+    frame: pd.DataFrame,
+    db_path: str | Path,
+    *,
+    source: str | None = None,
+    snapshot_id: str | None = None,
+    replace_snapshot: bool = False,
+) -> dict[str, Any]:
+    """写入当前行业快照；只影响目标数据库中的精确 snapshot。"""
+
+    normalized = normalize_industry_snapshot(frame, source=source, snapshot_id=snapshot_id)
+    try:
+        import duckdb
+    except ImportError as exc:  # pragma: no cover
+        raise UniverseHistoryError("写入行业快照需要安装 duckdb") from exc
+    path = Path(db_path).expanduser()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with duckdb.connect(str(path)) as con:
+        _initialize_industry_snapshot_table(con)
+        if replace_snapshot:
+            pairs = normalized[["source", "snapshot_id"]].drop_duplicates().itertuples(index=False)
+            for pair_source, pair_snapshot in pairs:
+                con.execute(
+                    "DELETE FROM market_industry_snapshot WHERE source = ? AND snapshot_id = ?",
+                    [str(pair_source), str(pair_snapshot)],
+                )
+        con.register("incoming_industry_snapshot", normalized)
+        con.execute(
+            """
+            INSERT INTO market_industry_snapshot
+            SELECT market, symbol, industry_level1, industry_level2, industry_level3,
+                   source, snapshot_id, source_recorded_at
+            FROM incoming_industry_snapshot
+            ON CONFLICT (market, symbol, source, snapshot_id) DO UPDATE SET
+                industry_level1 = EXCLUDED.industry_level1,
+                industry_level2 = EXCLUDED.industry_level2,
+                industry_level3 = EXCLUDED.industry_level3,
+                source_recorded_at = EXCLUDED.source_recorded_at
+            """
+        )
+        con.unregister("incoming_industry_snapshot")
+    return {
+        "rows": int(len(normalized)),
+        "symbols": int(normalized["symbol"].nunique()),
+        "markets": int(normalized["market"].nunique()),
+        "source": sorted(normalized["source"].dropna().unique().tolist()),
+        "snapshot_id": sorted(normalized["snapshot_id"].dropna().unique().tolist()),
+    }
+
+
+def load_industry_snapshot(
+    db_path: str | Path,
+    market: str,
+    symbols: list[str] | tuple[str, ...] | None = None,
+) -> pd.DataFrame:
+    """读取 sidecar 中最新的指定行业快照记录。"""
+
+    try:
+        import duckdb
+    except ImportError as exc:  # pragma: no cover
+        raise UniverseHistoryError("读取行业快照需要安装 duckdb") from exc
+    path = Path(db_path).expanduser()
+    if not path.is_file():
+        return pd.DataFrame(columns=list(INDUSTRY_SNAPSHOT_COLUMNS))
+    symbol_clause = ""
+    params: list[Any] = [market]
+    if symbols:
+        values = [str(value) for value in symbols]
+        symbol_clause = f" AND symbol IN ({', '.join('?' for _ in values)})"
+        params.extend(values)
+    with duckdb.connect(str(path), read_only=True) as con:
+        tables = {str(row[0]) for row in con.execute("SHOW TABLES").fetchall()}
+        if "market_industry_snapshot" not in tables:
+            return pd.DataFrame(columns=list(INDUSTRY_SNAPSHOT_COLUMNS))
+        return con.execute(
+            f"""
+            SELECT market, symbol, industry_level1, industry_level2, industry_level3,
+                   source, snapshot_id, source_recorded_at
+            FROM (
+                SELECT *, row_number() OVER (
+                    PARTITION BY market, symbol
+                    ORDER BY source_recorded_at DESC, snapshot_id DESC
+                ) AS row_number
+                FROM market_industry_snapshot
+                WHERE market = ? {symbol_clause}
+            )
+            WHERE row_number = 1
+            ORDER BY symbol
+            """,
+            params,
+        ).fetch_df()
+
+
 def build_baostock_universe_history(
     raw: pd.DataFrame,
     *,
@@ -340,17 +494,40 @@ def _initialize_history_table(con) -> None:
     )
 
 
+def _initialize_industry_snapshot_table(con) -> None:
+    con.execute(
+        """
+        CREATE TABLE IF NOT EXISTS market_industry_snapshot (
+            market VARCHAR NOT NULL,
+            symbol VARCHAR NOT NULL,
+            industry_level1 VARCHAR,
+            industry_level2 VARCHAR,
+            industry_level3 VARCHAR,
+            source VARCHAR NOT NULL,
+            snapshot_id VARCHAR NOT NULL,
+            source_recorded_at TIMESTAMP NOT NULL,
+            PRIMARY KEY (market, symbol, source, snapshot_id)
+        )
+        """
+    )
+
+
 def _iso(value: object) -> str | None:
     return value.isoformat() if isinstance(value, (date, pd.Timestamp)) else None
 
 
 __all__ = [
     "HISTORY_COLUMNS",
+    "INDUSTRY_SNAPSHOT_COLUMNS",
     "UniverseHistoryError",
+    "build_baostock_industry_snapshot",
     "build_baostock_universe_history",
     "fetch_baostock_universe_history",
+    "load_industry_snapshot",
     "load_universe_as_of",
+    "normalize_industry_snapshot",
     "normalize_universe_history",
+    "upsert_industry_snapshot",
     "upsert_universe_history",
     "validate_universe_history",
 ]

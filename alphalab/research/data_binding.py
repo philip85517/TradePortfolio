@@ -36,6 +36,11 @@ class ResearchDataBinding:
     universe_source: str | None = None
     universe_snapshot_id: str | None = None
     universe_provisioning: str | None = None
+    industry_db_path: Path | None = None
+    industry_source: str | None = None
+    industry_snapshot_id: str | None = None
+    industry_coverage: float | None = None
+    industry_provisioning: str | None = None
     provisioning: str | None = None
 
     def to_dict(self) -> dict[str, object]:
@@ -66,6 +71,11 @@ class ResearchDataBinding:
             "universe_source": self.universe_source,
             "universe_snapshot_id": self.universe_snapshot_id,
             "universe_provisioning": self.universe_provisioning,
+            "industry_source": self.industry_source,
+            "industry_snapshot_id": self.industry_snapshot_id,
+            "industry_coverage": self.industry_coverage,
+            "industry_provisioning": self.industry_provisioning,
+            "industry_db_path": str(self.industry_db_path) if self.industry_db_path else None,
             "provisioning": self.provisioning,
         }
 
@@ -134,6 +144,8 @@ def ensure_research_data(
     require_point_in_time: bool = False,
     universe_cache_path: str | Path | None = None,
     universe_updater: Callable[[Path], None] | None = None,
+    industry_cache_path: str | Path | None = None,
+    industry_updater: Callable[[Path], None] | None = None,
 ) -> ResearchDataBinding:
     """确保研究窗口有行情；缺覆盖时自动调用既有 updater。
 
@@ -156,13 +168,19 @@ def ensure_research_data(
             raise
         binding = None
     if binding is not None and binding.coverage_status == "complete":
-        return _ensure_point_in_time_universe(
+        ensured = _ensure_point_in_time_universe(
             binding,
             market=market,
             as_of=start_date,
             required=require_point_in_time,
             universe_cache_path=universe_cache_path,
             universe_updater=universe_updater,
+        )
+        return _ensure_industry_snapshot(
+            ensured,
+            market=market,
+            industry_cache_path=industry_cache_path,
+            industry_updater=industry_updater,
         )
     if not is_auto:
         path = binding.db_path if binding is not None else Path(db_path).expanduser()
@@ -191,13 +209,19 @@ def ensure_research_data(
             f"自动补数后仍未覆盖研究窗口: {rebound.db_path} "
             f"（实际 {rebound.min_date} → {rebound.max_date}，需要 {start_date} → {end_date}）"
         )
-    return _ensure_point_in_time_universe(
+    ensured = _ensure_point_in_time_universe(
         replace(rebound, provisioning="etf_strategy.update_stock_data"),
         market=market,
         as_of=start_date,
         required=require_point_in_time,
         universe_cache_path=universe_cache_path,
         universe_updater=universe_updater,
+    )
+    return _ensure_industry_snapshot(
+        ensured,
+        market=market,
+        industry_cache_path=industry_cache_path,
+        industry_updater=industry_updater,
     )
 
 
@@ -223,6 +247,12 @@ def default_research_universe_cache_path() -> Path:
     """返回当前项目用于自动补齐 PIT universe 的 sidecar 路径。"""
 
     return default_research_cache_path().with_name("market_universe_history.duckdb")
+
+
+def default_research_industry_cache_path() -> Path:
+    """返回当前项目用于自动补齐行业展示快照的 sidecar 路径。"""
+
+    return default_research_cache_path().with_name("market_industry_snapshot.duckdb")
 
 
 def _candidate_paths(candidate_paths: Sequence[str | Path] | None) -> tuple[Path, ...]:
@@ -278,7 +308,8 @@ def _inspect_database(
             source_counts = _grouped_counts(con, columns, "source", market)
             source_dataset_counts = _grouped_counts(con, columns, "source_dataset_id", market)
             pit = _has_point_in_time_universe(con, tables)
-            pit_industry = _has_point_in_time_industry(con, tables)
+            pit_industry = _has_point_in_time_industry(con, tables, market)
+            industry = _current_industry_metadata(con, tables, market, int(summary[1] or 0))
     except Exception:
         return None
 
@@ -316,6 +347,11 @@ def _inspect_database(
         point_in_time_universe=pit,
         point_in_time_industry=pit_industry,
         universe_db_path=path if pit else None,
+        industry_db_path=path if industry else None,
+        industry_source=industry.get("source") if industry else None,
+        industry_snapshot_id=industry.get("snapshot_id") if industry else None,
+        industry_coverage=industry.get("coverage") if industry else None,
+        industry_provisioning=industry.get("provisioning") if industry else None,
     )
 
 
@@ -328,25 +364,67 @@ def _has_point_in_time_universe(con, tables: Iterable[str]) -> bool:
     return {"effective_from", "effective_to"}.issubset(columns)
 
 
-def _has_point_in_time_industry(con, tables: Iterable[str]) -> bool:
+def _has_point_in_time_industry(con, tables: Iterable[str], market: str | None = None) -> bool:
     table = "market_universe_history" if "market_universe_history" in tables else "market_universe"
     if table not in tables:
         return False
     columns = {str(row[0]) for row in con.execute(f"DESCRIBE {table}").fetchall()}
-    required = {"industry_level1", "industry_level2", "industry_level3"}
+    required = {"effective_from", "industry_level1", "industry_level2", "industry_level3"}
     if not required.issubset(columns):
         return False
+    market_clause = ""
+    params: list[object] = []
+    if market is not None and "market" in columns:
+        market_clause = " AND market = ?"
+        params.append(market)
     return bool(
         con.execute(
             f"""
-            SELECT count(*)
+            SELECT count(*) > 0
+                   AND count(*) = count(
+                       CASE WHEN industry_level1 IS NOT NULL
+                                  AND industry_level2 IS NOT NULL
+                                  AND industry_level3 IS NOT NULL
+                            THEN 1 END
+                   )
             FROM {table}
-            WHERE industry_level1 IS NOT NULL
-              AND industry_level2 IS NOT NULL
-              AND industry_level3 IS NOT NULL
-            """
-        ).fetchone()[0]
+            WHERE effective_from IS NOT NULL {market_clause}
+            """,
+            params,
+        ).fetchone()[0] or False
     )
+
+
+def _current_industry_metadata(
+    con,
+    tables: Iterable[str],
+    market: str,
+    symbol_count: int,
+) -> dict[str, object] | None:
+    if "market_universe" not in tables:
+        return None
+    columns = {str(row[0]) for row in con.execute("DESCRIBE market_universe").fetchall()}
+    if not {"market", "symbol", "industry_level1"}.issubset(columns):
+        return None
+    result = con.execute(
+        """
+        SELECT count(DISTINCT symbol),
+               count(DISTINCT CASE WHEN industry_level1 IS NOT NULL AND trim(industry_level1) <> '' THEN symbol END)
+        FROM market_universe
+        WHERE market = ?
+        """,
+        [market],
+    ).fetchone()
+    available = int(result[1] or 0)
+    if available == 0:
+        return None
+    denominator = symbol_count or int(result[0] or 0)
+    return {
+        "source": "local-market-universe",
+        "snapshot_id": "current-market-universe",
+        "coverage": min(1.0, available / denominator) if denominator else 0.0,
+        "provisioning": "existing-market-universe",
+    }
 
 
 def _ensure_point_in_time_universe(
@@ -392,6 +470,49 @@ def _ensure_point_in_time_universe(
         universe_source="baostock",
         universe_snapshot_id=snapshots[0] if len(snapshots) == 1 else "mixed",
         universe_provisioning="baostock.query_stock_basic",
+    )
+
+
+def _ensure_industry_snapshot(
+    binding: ResearchDataBinding,
+    *,
+    market: str,
+    industry_cache_path: str | Path | None,
+    industry_updater: Callable[[Path], None] | None,
+) -> ResearchDataBinding:
+    """绑定当前行业展示快照；它不改变 PIT 质量声明。"""
+
+    if binding.industry_db_path is not None:
+        return binding
+    target = (
+        Path(industry_cache_path).expanduser().resolve()
+        if industry_cache_path
+        else default_research_industry_cache_path()
+    )
+    from .universe_history import load_industry_snapshot
+
+    try:
+        snapshot = load_industry_snapshot(target, market)
+        if snapshot.empty and industry_updater is not None:
+            industry_updater(target)
+            snapshot = load_industry_snapshot(target, market)
+        if snapshot.empty:
+            return binding
+        snapshot_ids = sorted({str(value) for value in snapshot["snapshot_id"].dropna()})
+        sources = sorted({str(value) for value in snapshot["source"].dropna()})
+        available = int(snapshot["industry_level1"].notna().sum())
+        coverage = min(1.0, available / binding.symbols) if binding.symbols else 0.0
+    except Exception as exc:  # noqa: BLE001 - preserve provider/updater context.
+        if industry_updater is None:
+            return binding
+        raise DataBindingError(f"自动补充行业失败: {exc}") from exc
+    return replace(
+        binding,
+        industry_db_path=target,
+        industry_source=sources[0] if len(sources) == 1 else "mixed",
+        industry_snapshot_id=snapshot_ids[0] if len(snapshot_ids) == 1 else "mixed",
+        industry_coverage=coverage,
+        industry_provisioning="baostock.query_stock_industry",
     )
 
 
@@ -479,6 +600,19 @@ def _run_default_universe_updater(target: Path) -> None:
     fetch_baostock_universe_history(db_path=target)
 
 
+def run_default_industry_updater(target: Path) -> None:
+    from etf_strategy.scripts.update_a_share_industries import fetch_baostock_industries
+
+    from .universe_history import build_baostock_industry_snapshot, upsert_industry_snapshot
+
+    industry = fetch_baostock_industries()
+    if industry.empty:
+        raise RuntimeError("BaoStock 行业查询没有返回记录")
+    snapshot_id = f"baostock-stock-industry-{date.today().isoformat()}"
+    snapshot = build_baostock_industry_snapshot(industry, snapshot_id=snapshot_id)
+    upsert_industry_snapshot(snapshot, target, replace_snapshot=True)
+
+
 def _ranking_key(index: int, binding: ResearchDataBinding, market: str) -> tuple:
     qfq_rows = binding.adjustment_counts.get("qfq", 0)
     qfq_ratio = qfq_rows / binding.rows if binding.rows else 0.0
@@ -510,7 +644,9 @@ __all__ = [
     "ResearchDataBinding",
     "auto_bind_research_db",
     "default_research_cache_path",
+    "default_research_industry_cache_path",
     "default_research_universe_cache_path",
     "default_research_db_candidates",
     "ensure_research_data",
+    "run_default_industry_updater",
 ]

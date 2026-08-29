@@ -12,7 +12,7 @@ from alphalab.research.data_binding import (
     auto_bind_research_db,
     ensure_research_data,
 )
-from alphalab.research.universe_history import upsert_universe_history
+from alphalab.research.universe_history import upsert_industry_snapshot, upsert_universe_history
 
 
 def _write_market_db(path: Path, start: str, end: str, adjustment: str = "qfq") -> None:
@@ -189,3 +189,43 @@ def test_ensure_research_data_builds_pit_sidecar_without_writing_price_database(
     assert binding.point_in_time_industry is False
     assert binding.universe_snapshot_id == "bs-2026-08-29"
     assert binding.to_dict()["point_in_time_quality"] == "listing-only"
+
+
+def test_ensure_research_data_binds_industry_sidecar_when_provider_is_available(tmp_path: Path) -> None:
+    complete = tmp_path / "complete.duckdb"
+    sidecar = tmp_path / "industry.duckdb"
+    _write_market_db(complete, "2021-01-01", "2026-06-25")
+
+    def update_industry(target: Path) -> None:
+        upsert_industry_snapshot(
+            pd.DataFrame(
+                [
+                    {
+                        "market": "a_share",
+                        "symbol": "000001",
+                        "industry_level1": "金融业",
+                        "industry_level2": "J66 货币金融服务",
+                        "industry_level3": "银行",
+                        "source": "baostock",
+                        "snapshot_id": "industry-2026-08-29",
+                    }
+                ]
+            ),
+            target,
+        )
+
+    binding = ensure_research_data(
+        candidate_paths=[complete],
+        market="a_share",
+        start_date=date(2025, 1, 1),
+        end_date=date(2026, 1, 1),
+        industry_cache_path=sidecar,
+        industry_updater=update_industry,
+    )
+
+    assert binding.industry_db_path == sidecar
+    assert binding.industry_source == "baostock"
+    assert binding.industry_snapshot_id == "industry-2026-08-29"
+    assert binding.industry_coverage == pytest.approx(1.0)
+    assert binding.point_in_time_industry is False
+    assert binding.to_dict()["industry_provisioning"] == "baostock.query_stock_industry"

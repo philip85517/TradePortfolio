@@ -42,7 +42,7 @@ def _bars() -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def _state(tmp_path, *, multiple: bool = False) -> ReviewState:
+def _state(tmp_path, *, multiple: bool = False, industry: bool = False) -> ReviewState:
     bars = _bars()
     run_dir = tmp_path / "runs"
     spec = ResearchSpec(requested_date="2025-06-30", top_n=2, horizons=(3, 5))
@@ -67,6 +67,22 @@ def _state(tmp_path, *, multiple: bool = False) -> ReviewState:
     )
     con.register("bars", bars)
     con.execute("INSERT INTO market_ohlcv SELECT * FROM bars")
+    if industry:
+        con.execute(
+            """
+            CREATE TABLE market_universe (
+                market VARCHAR, symbol VARCHAR, name VARCHAR,
+                industry_level1 VARCHAR, industry_level2 VARCHAR, industry_level3 VARCHAR
+            )
+            """
+        )
+        con.execute(
+            """
+            INSERT INTO market_universe VALUES
+                ('a_share', '002104', '恒宝股份', '制造业', 'C39 计算机、通信和其他电子设备制造业', '电子'),
+                ('a_share', '300468', '四方精创', '信息传输、软件和信息技术服务业', 'I65 软件和信息技术服务业', '软件')
+            """
+        )
     con.close()
     return ReviewState(load_review_run(run_dir, report.run_id), db_path)
 
@@ -103,6 +119,38 @@ def test_review_api_hides_future_bars_until_explicit_evaluation(tmp_path):
     assert evaluation["markers"]["entry_date"]
     assert evaluation["performance"]["3"]["stock_return"] is not None
     assert evaluation["portfolio_performance"]["3"]["total_return"] is not None
+
+
+def test_review_stock_payload_exposes_derived_timeframes_and_ema(tmp_path):
+    state = _state(tmp_path)
+
+    daily = state.stock_detail("300468", timeframe="1d")
+    weekly = state.stock_detail("300468", timeframe="1w")
+
+    assert daily["chart"]["timeframe"] == "1d"
+    assert daily["chart"]["available_timeframes"] == ["1d", "1w", "1mo"]
+    assert daily["chart"]["ema_periods"] == [5, 20, 60]
+    assert len(weekly["chart"]["rows"]) < len(daily["rows"])
+    assert {"ema_5", "ema_20", "ema_60"}.issubset(weekly["chart"]["rows"][0])
+
+
+def test_review_rejects_unsupported_chart_timeframe(tmp_path):
+    state = _state(tmp_path)
+
+    with pytest.raises(ValueError, match="timeframe"):
+        state.stock_detail("300468", timeframe="5m")
+
+
+def test_review_supplements_industry_from_existing_local_universe(tmp_path):
+    state = _state(tmp_path, industry=True)
+
+    summary = state.summary()
+    detail = state.stock_detail("300468")
+
+    assert summary["industry_info"]["quality"] == "current-snapshot"
+    assert summary["industry_info"]["coverage"] == pytest.approx(1.0)
+    assert detail["candidate"]["industry"] == "信息传输、软件和信息技术服务业"
+    assert detail["candidate"]["industry_level3"] == "软件"
 
 
 def test_review_portfolio_payload_exposes_nav_and_holdings(tmp_path):
@@ -223,6 +271,9 @@ def test_review_page_and_summary_are_read_only_and_explain_run(tmp_path):
         assert "class=\"chart-layout\"" in body
         assert "组合净值" in body
         assert "组合回撤" in body
+        assert "sidebarToggle" in body
+        assert "timeframeSwitch" in body
+        assert "data-ema=\"20\"" in body
     finally:
         server.shutdown()
         thread.join(timeout=2)

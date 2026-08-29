@@ -31,6 +31,7 @@ from ..research import (
     ResearchSpec,
     auto_bind_research_db,
     ensure_research_data,
+    run_default_industry_updater,
 )
 from ..research.review import serve_review
 from ..storage import PaperDatabase
@@ -406,7 +407,7 @@ def cmd_research_run(args) -> int:
         end_date,
         require_point_in_time=args.universe_mode == "point-in-time",
     )
-    adapter = DuckDBMarketDataAdapter(binding.db_path, binding.universe_db_path)
+    adapter = DuckDBMarketDataAdapter(binding.db_path, binding.universe_db_path, binding.industry_db_path)
     lab = HistoricalResearchLab(adapter, args.runs_dir, data_binding=binding)
     spec = ResearchSpec(
         requested_date=args.as_of,
@@ -534,6 +535,7 @@ def _bind_research_data(
             start_date=start_date,
             end_date=end_date,
             require_point_in_time=require_point_in_time,
+            industry_updater=run_default_industry_updater,
         )
     if require_point_in_time:
         return ensure_research_data(
@@ -542,7 +544,10 @@ def _bind_research_data(
             start_date=start_date,
             end_date=end_date,
             require_point_in_time=True,
+            industry_updater=run_default_industry_updater,
         )
+    # An explicitly selected database remains a read-only source even when
+    # its range is shorter than a research window used by a caller/test.
     return auto_bind_research_db(db_path=db_path, market=market)
 
 
@@ -558,7 +563,7 @@ def cmd_research_study(args) -> int:
         end_date,
         require_point_in_time=args.universe_mode == "point-in-time",
     )
-    adapter = DuckDBMarketDataAdapter(binding.db_path, binding.universe_db_path)
+    adapter = DuckDBMarketDataAdapter(binding.db_path, binding.universe_db_path, binding.industry_db_path)
     lab = HistoricalResearchLab(adapter, args.runs_dir, data_binding=binding)
     specs = tuple(
         ResearchSpec(

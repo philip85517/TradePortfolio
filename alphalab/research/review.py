@@ -20,6 +20,7 @@ import numpy as np
 import pandas as pd
 
 from .engine import DuckDBMarketDataAdapter
+from .chart_data import DEFAULT_EMA_PERIODS, SUPPORTED_TIMEFRAMES, normalize_timeframe, prepare_chart_data
 
 STATIC_ROOT = Path(__file__).resolve().parent / "static"
 REQUIRED_ARTIFACTS = (
@@ -119,6 +120,11 @@ class ReviewState:
         self.signal_date = date.fromisoformat(str(run.manifest["signal_date"]))
         horizons = run.manifest.get("spec", {}).get("horizons", [21, 42])
         self.horizons = tuple(sorted({int(h) for h in horizons})) or (21, 42)
+        data_source = run.manifest.get("diagnostics", {}).get("data_source", {})
+        industry_path = data_source.get("industry_db_path") if isinstance(data_source, dict) else None
+        self.industry_db_path = Path(industry_path).expanduser() if industry_path and Path(industry_path).is_file() else None
+        self.candidates_frame = run.candidates_frame.copy()
+        self._enrich_candidate_metadata()
 
     def summary(self) -> dict[str, Any]:
         candidates = self.run.candidates_frame
@@ -143,6 +149,7 @@ class ReviewState:
             "data_range": diagnostics.get("data_range"),
             "data_quality": diagnostics.get("data_quality", {}),
             "industries": self.industries(),
+            "industry_info": self.industry_info(),
             "portfolio_ids": self.portfolio_ids(),
             "portfolios": self._portfolio_summaries(),
         }
@@ -232,10 +239,34 @@ class ReviewState:
         return all_performance.get(portfolio_id, {})
 
     def industries(self) -> list[str]:
-        if "industry" not in self.run.candidates_frame.columns:
+        if "industry" not in self.candidates_frame.columns:
             return []
-        values = self.run.candidates_frame["industry"].dropna().astype(str).str.strip()
+        values = self.candidates_frame["industry"].dropna().astype(str).str.strip()
         return sorted({value for value in values if value and value.lower() != "nan"})
+
+    def industry_info(self) -> dict[str, Any]:
+        """返回行业上下文和覆盖质量，不把当前快照声明为 PIT。"""
+
+        source = self.run.manifest.get("diagnostics", {}).get("data_source", {})
+        source = source if isinstance(source, dict) else {}
+        values = self.candidates_frame.get("industry", pd.Series(dtype=str)).fillna("UNKNOWN").astype(str)
+        known = int((values.str.strip().ne("") & values.str.upper().ne("UNKNOWN")).sum())
+        count = int(len(self.candidates_frame))
+        if source.get("point_in_time_industry"):
+            quality = "point-in-time"
+        elif source.get("industry_snapshot_id") or source.get("industry_source") or known:
+            quality = "current-snapshot"
+        else:
+            quality = "unavailable"
+        return {
+            "quality": quality,
+            "source": source.get("industry_source") or ("local-market-universe" if known else None),
+            "snapshot_id": source.get("industry_snapshot_id"),
+            "coverage": known / count if count else 0.0,
+            "known_symbols": known,
+            "candidate_symbols": count,
+            "levels": sorted({value for value in values if value.strip() and value.upper() != "UNKNOWN"}),
+        }
 
     def reasons(self) -> list[str]:
         if "reason" not in self.run.candidates_frame.columns:
@@ -291,7 +322,7 @@ class ReviewState:
         industry: str = "all",
         reason: str = "all",
     ) -> list[dict[str, Any]]:
-        frame = self.run.candidates_frame.copy()
+        frame = self.candidates_frame.copy()
         selected = frame["selected"].fillna(False).astype(bool)
         eligible = frame.get("eligible", pd.Series(False, index=frame.index)).fillna(False).astype(bool)
         status = status.strip().lower() or "all"
@@ -326,13 +357,15 @@ class ReviewState:
         symbol: str,
         mode: str = "selection",
         portfolio_id: str | None = None,
+        timeframe: str = "1d",
     ) -> dict[str, Any]:
         symbol = str(symbol).strip()
         mode = str(mode).strip().lower() or "selection"
         if mode not in {"selection", "evaluation"}:
             raise ValueError("mode 必须是 selection 或 evaluation")
+        timeframe = normalize_timeframe(timeframe)
         selected_portfolio_id = self._resolve_portfolio_id(portfolio_id)
-        rows = self.run.candidates_frame[self.run.candidates_frame["symbol"].astype(str) == symbol]
+        rows = self.candidates_frame[self.candidates_frame["symbol"].astype(str) == symbol]
         if rows.empty:
             raise KeyError(f"候选股票不存在: {symbol}")
         candidate = _records(rows.iloc[[0]])[0]
@@ -349,6 +382,12 @@ class ReviewState:
                 "markers": {"signal_date": self.signal_date.isoformat()},
                 "performance": {},
                 "portfolio_performance": {},
+                "chart": {
+                    "timeframe": timeframe,
+                    "available_timeframes": list(SUPPORTED_TIMEFRAMES),
+                    "ema_periods": list(DEFAULT_EMA_PERIODS),
+                    "rows": [],
+                },
             }
 
         bars = bars.sort_values("date").reset_index(drop=True)
@@ -359,6 +398,7 @@ class ReviewState:
             bars = bars[bars["date"] <= pd.Timestamp(end_date)].copy()
         if not bars.empty:
             bars["date"] = pd.to_datetime(bars["date"]).dt.date
+        chart_rows = prepare_chart_data(bars, timeframe=timeframe)
         portfolio_frame = self._portfolio_frame(selected_portfolio_id)
         portfolio_rows = portfolio_frame[portfolio_frame.get("symbol", pd.Series(dtype=str)).astype(str) == symbol]
         markers: dict[str, Any] = {"signal_date": self.signal_date.isoformat()}
@@ -410,13 +450,19 @@ class ReviewState:
             "candidate": candidate,
             "portfolio": portfolio_payload,
             "rows": _records(bars),
+            "chart": {
+                "timeframe": timeframe,
+                "available_timeframes": list(SUPPORTED_TIMEFRAMES),
+                "ema_periods": list(DEFAULT_EMA_PERIODS),
+                "rows": _records(chart_rows),
+            },
             "markers": markers,
             "performance": performance,
             "portfolio_performance": portfolio_performance,
         }
 
     def _load_bars(self, symbol: str) -> pd.DataFrame:
-        adapter = DuckDBMarketDataAdapter(self.db_path)
+        adapter = DuckDBMarketDataAdapter(self.db_path, industry_db_path=self.industry_db_path)
         start = self.signal_date - timedelta(days=450)
         end = self.signal_date + timedelta(days=max(self.horizons) * 3 + 15)
         bars = adapter.load(start, end, market=self.market, symbols=[symbol])
@@ -428,6 +474,40 @@ class ReviewState:
             if column not in bars.columns:
                 bars[column] = np.nan
         return bars[columns]
+
+    def _enrich_candidate_metadata(self) -> None:
+        """从绑定的只读行情/行业源补充冻结候选缺失的展示元数据。"""
+
+        symbols = self.candidates_frame.get("symbol", pd.Series(dtype=str)).astype(str).dropna().unique().tolist()
+        if not symbols or not self.db_path.is_file():
+            return
+        try:
+            adapter = DuckDBMarketDataAdapter(self.db_path, industry_db_path=self.industry_db_path)
+            metadata = adapter.load(self.signal_date, self.signal_date, market=self.market, symbols=symbols)
+        except Exception:
+            return
+        if metadata.empty:
+            return
+        metadata = metadata.sort_values(["symbol", "date"], kind="mergesort").drop_duplicates("symbol", keep="last")
+        indexed = metadata.set_index(metadata["symbol"].astype(str))
+        for column in ["name", "industry_level1", "industry_level2", "industry_level3"]:
+            if column not in indexed.columns:
+                continue
+            values = self.candidates_frame["symbol"].astype(str).map(indexed[column])
+            if column == "name":
+                target = self.candidates_frame.get("name", pd.Series(index=self.candidates_frame.index, dtype=object))
+                self.candidates_frame["name"] = target.where(target.notna() & target.astype(str).str.strip().ne(""), values)
+            elif column == "industry_level1":
+                current = self.candidates_frame.get("industry", pd.Series(index=self.candidates_frame.index, dtype=object))
+                missing = current.isna() | current.astype(str).str.strip().eq("") | current.astype(str).str.upper().eq("UNKNOWN")
+                self.candidates_frame.loc[missing, "industry"] = values.loc[missing]
+                self.candidates_frame["industry"] = self.candidates_frame["industry"].fillna("UNKNOWN")
+            if column not in self.candidates_frame:
+                self.candidates_frame[column] = values
+            else:
+                self.candidates_frame[column] = self.candidates_frame[column].where(
+                    self.candidates_frame[column].notna(), values
+                )
 
 
 class ReviewRequestHandler(BaseHTTPRequestHandler):
@@ -471,6 +551,7 @@ class ReviewRequestHandler(BaseHTTPRequestHandler):
                         symbol,
                         _first(params, "mode", "selection"),
                         _first(params, "portfolio_id"),
+                        _first(params, "timeframe", "1d"),
                     )
                 )
             else:
