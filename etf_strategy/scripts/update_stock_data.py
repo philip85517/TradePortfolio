@@ -11,6 +11,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from src.market_data_backfill import CoverageWindow, build_coverage_requests, inspect_coverage
 from src.market_data_store import DEFAULT_MARKET_DB_PATH, connect_market_db, load_universe_from_db, upsert_universe
 from src.market_data_updater import Instrument, build_requests, update_market_data
 from src.market_universe import discover_universe
@@ -27,8 +28,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--start-date", default=None)
     parser.add_argument("--end-date", default=None)
     parser.add_argument("--incremental", action="store_true", help="Start each symbol/timeframe after the latest stored bar.")
-    parser.add_argument("--chunk-days", type=int, default=1, help="Fetch in N-day chunks; 1 gives day-by-day updates.")
+    parser.add_argument("--coverage-mode", choices=["none", "edges"], default="none", help="Plan missing leading/trailing date ranges instead of only using the latest bar.")
+    parser.add_argument("--coverage-only", action="store_true", help="Only write the coverage report; do not fetch bars.")
+    parser.add_argument("--coverage-report", default=None, help="Write a CSV coverage audit to this path.")
+    parser.add_argument("--target", choices=["existing-price", "universe"], default="existing-price", help="Target current priced symbols or the full active universe.")
+    parser.add_argument("--chunk-days", type=int, default=0, help="Fetch in N-day chunks; 0 sends one request per range.")
     parser.add_argument("--sleep", type=float, default=0.05)
+    parser.add_argument("--retries", type=int, default=2, help="Retries per provider range after a transient failure.")
+    parser.add_argument("--retry-delay", type=float, default=1.0, help="Initial retry delay in seconds; subsequent delays double.")
     parser.add_argument("--adjust", default="qfq", choices=["qfq", "hfq", "none"])
     parser.add_argument("--refresh-universe", action="store_true", help="Refresh the local stock universe before downloading.")
     parser.add_argument("--universe-csv", default="data/processed/stock_universe.csv")
@@ -48,8 +55,12 @@ def main() -> None:
     timeframes = [item.strip() for item in args.timeframes.split(",") if item.strip()]
     if not timeframes:
         raise SystemExit("At least one timeframe is required.")
-    if not args.all and args.max_symbols is None and args.symbols is None and not args.dry_run:
+    if not args.all and args.max_symbols is None and args.symbols is None and not args.dry_run and not args.coverage_only:
         raise SystemExit("Refusing an unbounded stock download. Pass --max-symbols N for a batch or --all explicitly.")
+    if args.incremental and args.coverage_mode != "none":
+        raise SystemExit("Choose either --incremental or --coverage-mode edges, not both.")
+    if args.coverage_only and not args.coverage_report:
+        raise SystemExit("--coverage-only requires --coverage-report so the audit has a durable output.")
 
     db_path = Path(args.db)
     if args.dry_run and not db_path.exists():
@@ -78,7 +89,9 @@ def main() -> None:
     if args.symbols:
         selected = parse_symbol_filters(args.symbols)
         universe = universe[universe.apply(lambda row: (row["market"], str(row["symbol"])) in selected, axis=1)].reset_index(drop=True)
-    if args.only_missing:
+    if args.target == "existing-price":
+        universe = filter_to_existing_price_symbols(universe, db_path, timeframes)
+    if args.only_missing and args.coverage_mode == "none":
         universe = filter_missing_timeframes(universe, db_path, timeframes)
     if args.offset:
         universe = universe.iloc[args.offset :].reset_index(drop=True)
@@ -88,7 +101,14 @@ def main() -> None:
     end = pd.to_datetime(args.end_date).normalize() if args.end_date else pd.Timestamp(date.today())
     start = pd.to_datetime(args.start_date).normalize() if args.start_date else end - timedelta(days=365 * args.years + 2)
     instruments = build_stock_instruments(universe, adjust=args.adjust)
-    requests = build_requests(instruments, timeframes, start, end, db_path, incremental=args.incremental)
+    if args.coverage_mode == "edges":
+        requests = build_coverage_requests(instruments, timeframes, start, end, db_path)
+    else:
+        requests = build_requests(instruments, timeframes, start, end, db_path, incremental=args.incremental)
+
+    coverage = inspect_coverage(db_path, instruments, timeframes, CoverageWindow(start=start, end=end))
+    if args.coverage_report:
+        write_coverage_report(coverage, args.coverage_report)
 
     print(
         f"Prepared {len(requests):,} requests for {len(instruments):,} stock symbols, "
@@ -106,12 +126,18 @@ def main() -> None:
             print(f"... {len(requests) - 20:,} more requests")
         return
 
+    if args.coverage_only:
+        print(f"Coverage report written to {args.coverage_report}")
+        return
+
     result = update_market_data(
         requests,
         db_path=db_path,
         provider_name=args.provider,
         chunk_days=args.chunk_days,
         sleep_seconds=args.sleep,
+        retries=args.retries,
+        retry_delay_seconds=args.retry_delay,
     )
     summary = result["db_summary"]
     print(
@@ -124,12 +150,49 @@ def main() -> None:
         f"{summary['start_ts']} to {summary['end_ts']}",
         flush=True,
     )
+    if args.coverage_report:
+        coverage = inspect_coverage(db_path, instruments, timeframes, CoverageWindow(start=start, end=end))
+        write_coverage_report(coverage, args.coverage_report)
+        print(f"Coverage after update: complete={int(coverage['coverage_ok'].sum())}/{len(coverage)}; report={args.coverage_report}")
     if result["failures"]:
         print("Failures:")
         for failure in result["failures"][:100]:
             print(f"- {failure['market']}:{failure['symbol']} {failure['timeframe']}: {failure['reason']}")
         if len(result["failures"]) > 100:
             print(f"... {len(result['failures']) - 100:,} more failures")
+
+
+def filter_to_existing_price_symbols(
+    universe: pd.DataFrame,
+    db_path: str | Path,
+    timeframes: list[str],
+) -> pd.DataFrame:
+    """Restrict a discovered universe to symbols already used by the data set.
+
+    On a fresh database there is no existing target set, so the active discovered
+    universe is returned unchanged and a first bootstrap remains possible.
+    """
+
+    if universe.empty:
+        return universe
+    with connect_market_db(db_path) as con:
+        actual = con.execute(
+            """
+            SELECT DISTINCT market, symbol
+            FROM market_ohlcv
+            WHERE timeframe IN (SELECT unnest(?::VARCHAR[]))
+            """,
+            [timeframes],
+        ).fetch_df()
+    if actual.empty:
+        return universe
+    return universe.merge(actual, how="inner", on=["market", "symbol"])
+
+
+def write_coverage_report(coverage: pd.DataFrame, path: str | Path) -> None:
+    output = Path(path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    coverage.to_csv(output, index=False)
 
 
 def build_stock_instruments(universe: pd.DataFrame, adjust: str = "qfq") -> list[Instrument]:
