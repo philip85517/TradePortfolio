@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pandas as pd
 
-from scripts.update_stock_data import build_stock_instruments, filter_missing_timeframes
+from scripts.update_stock_data import build_stock_instruments, filter_missing_timeframes, filter_to_existing_price_symbols
 from src.market_data_store import upsert_bars
 from src.market_universe import parse_nasdaq_trader_universe
 
@@ -83,3 +83,34 @@ def test_filter_missing_timeframes_keeps_symbols_with_incomplete_daily_data(tmp_
     missing = filter_missing_timeframes(universe, db, ["1d"])
 
     assert missing["symbol"].tolist() == ["MSFT"]
+
+
+def test_filter_to_existing_price_symbols_keeps_current_research_target_set(tmp_path):
+    db = tmp_path / "market.duckdb"
+    upsert_bars(
+        pd.DataFrame(
+            {
+                "market": ["a_share"],
+                "symbol": ["000001"],
+                "timeframe": ["1d"],
+                "ts": ["2024-01-01"],
+                "open": [1],
+                "high": [2],
+                "low": [1],
+                "close": [1.5],
+                "volume": [100],
+            }
+        ),
+        db_path=db,
+    )
+    universe = pd.DataFrame(
+        {
+            "market": ["a_share", "a_share"],
+            "symbol": ["000001", "000002"],
+            "status": ["active_or_recent", "active_or_recent"],
+        }
+    )
+
+    result = filter_to_existing_price_symbols(universe, db, ["1d"])
+
+    assert result["symbol"].tolist() == ["000001"]
