@@ -8,9 +8,12 @@ import pytest
 
 from alphalab.research.universe_history import (
     UniverseHistoryError,
+    build_baostock_industry_snapshot,
     build_baostock_universe_history,
+    load_industry_snapshot,
     load_universe_as_of,
     normalize_universe_history,
+    upsert_industry_snapshot,
     upsert_universe_history,
     validate_universe_history,
 )
@@ -146,3 +149,25 @@ def test_baostock_basic_rows_become_pit_listing_intervals() -> None:
     assert delisted["effective_to"].date() == date(2022, 1, 1)
     assert delisted["status"] == "active"
     assert set(history["source"]) == {"baostock"}
+
+
+def test_baostock_industry_snapshot_is_readable_without_becoming_pit_history(tmp_path: Path) -> None:
+    raw = pd.DataFrame(
+        [
+            {
+                "market": "a_share",
+                "symbol": "600000",
+                "industry_level1": "金融业",
+                "industry_level2": "J66 货币金融服务",
+                "industry_level3": "银行",
+            }
+        ]
+    )
+    snapshot = build_baostock_industry_snapshot(raw, snapshot_id="industry-2026-08-29")
+
+    result = upsert_industry_snapshot(snapshot, tmp_path / "industry.duckdb")
+    loaded = load_industry_snapshot(tmp_path / "industry.duckdb", "a_share")
+
+    assert result["rows"] == 1
+    assert loaded.loc[0, "industry_level1"] == "金融业"
+    assert loaded.loc[0, "snapshot_id"] == "industry-2026-08-29"

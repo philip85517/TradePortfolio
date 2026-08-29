@@ -154,9 +154,15 @@ class InMemoryMarketDataAdapter:
 class DuckDBMarketDataAdapter:
     """生产只读 DuckDB adapter，默认仅读取单市场日线。"""
 
-    def __init__(self, db_path: str | Path, universe_db_path: str | Path | None = None):
+    def __init__(
+        self,
+        db_path: str | Path,
+        universe_db_path: str | Path | None = None,
+        industry_db_path: str | Path | None = None,
+    ):
         self.db_path = Path(db_path).expanduser()
         self.universe_db_path = Path(universe_db_path).expanduser() if universe_db_path else None
+        self.industry_db_path = Path(industry_db_path).expanduser() if industry_db_path else None
 
     def load(
         self,
@@ -206,6 +212,8 @@ class DuckDBMarketDataAdapter:
                     "symbol",
                     "name",
                     "industry_level1",
+                    "industry_level2",
+                    "industry_level3",
                     "listed_date",
                     "list_date",
                     "上市日期",
@@ -236,6 +244,20 @@ class DuckDBMarketDataAdapter:
                     ).fetch_df()
                 if not metadata.empty:
                     data = data.merge(metadata, on=["market", "symbol"], how="left")
+            if self.industry_db_path and not data.empty:
+                from .universe_history import load_industry_snapshot
+
+                industry = load_industry_snapshot(
+                    self.industry_db_path,
+                    market,
+                    tuple(data["symbol"].astype(str).unique()),
+                )
+                if not industry.empty:
+                    industry = industry.drop(columns=["source", "snapshot_id", "source_recorded_at"], errors="ignore")
+                    data = data.drop(
+                        columns=[column for column in industry.columns if column != "symbol" and column in data.columns],
+                        errors="ignore",
+                    ).merge(industry, on=["market", "symbol"], how="left")
         finally:
             con.close()
         return _normalise_dates(data)
@@ -1018,6 +1040,9 @@ def _prepare_plugin_candidates(
         output["industry"] = output["symbol"].map(
             metadata.get("industry_level1", pd.Series(dtype=str))
         )
+    for column in ["industry_level1", "industry_level2", "industry_level3"]:
+        if column not in output.columns:
+            output[column] = output["symbol"].map(metadata.get(column, pd.Series(dtype=str)))
     output["name"] = output["name"].fillna(output["symbol"])
     output["industry"] = output["industry"].fillna("UNKNOWN")
     if "reason" not in output.columns:

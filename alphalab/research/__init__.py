@@ -15,7 +15,9 @@ from .data_binding import (
     ResearchDataBinding,
     auto_bind_research_db,
     default_research_db_candidates,
+    default_research_industry_cache_path,
     ensure_research_data,
+    run_default_industry_updater,
 )
 from .review import ReviewRun, ReviewState, create_review_server, load_review_run, serve_review
 from .plugins import (
@@ -44,7 +46,9 @@ __all__ = [
     "ResearchDataBinding",
     "auto_bind_research_db",
     "default_research_db_candidates",
+    "default_research_industry_cache_path",
     "ensure_research_data",
+    "run_default_industry_updater",
     "HISTORY_COLUMNS",
     "UniverseHistoryError",
     "build_baostock_universe_history",

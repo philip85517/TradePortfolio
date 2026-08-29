@@ -14,7 +14,8 @@
       <aside class="sidebar">
         <div class="brand">
           <div class="brand-mark">αL</div>
-          <div><h1>alphaLab</h1><p>Quant Research Workbench</p></div>
+          <div class="brand-copy"><h1>alphaLab</h1><p>Quant Research Workbench</p></div>
+          <button id="sidebarToggle" class="sidebar-toggle" type="button" aria-label="收起目录" aria-expanded="true">‹</button>
         </div>
         <div class="sidebar-context">
           <span>RESEARCH RUN</span>
@@ -58,6 +59,7 @@
           <div><span>股票池口径</span><strong id="universeMode">--</strong></div>
           <div><span>研究数据范围</span><strong id="dataRange">--</strong></div>
           <div><span>数据健康</span><strong id="qualityState">--</strong></div>
+          <div><span>行业数据</span><strong id="industryQuality">--</strong></div>
         </section>
 
         <section class="panel table-header review-toolbar">
@@ -96,7 +98,13 @@
 
               <section id="chartView" class="chart-layout">
                 <div class="panel chart-panel">
-                  <div class="panel-header"><div><p class="section-kicker">PRICE / VOLUME</p><h3>日线走势</h3></div><div id="chartLegend" class="chart-legend"><span><i class="dot signal"></i>信号日</span></div></div>
+                  <div class="panel-header chart-header"><div><p class="section-kicker">PRICE / VOLUME</p><h3>技术分析</h3></div><div class="chart-header-right"><div id="chartLegend" class="chart-legend"><span><i class="dot signal"></i>信号日</span></div><div class="chart-tools" role="group" aria-label="图表设置">
+                    <div id="timeframeSwitch" class="timeframe-switch" role="group" aria-label="时间周期"><button type="button" data-timeframe="1d">1D</button><button type="button" data-timeframe="1w">1W</button><button type="button" data-timeframe="1mo">1M</button></div>
+                    <label class="chart-check"><input id="volumeToggle" type="checkbox" checked />成交量</label>
+                    <label class="chart-check"><input type="checkbox" data-ema="5" />EMA5</label>
+                    <label class="chart-check"><input type="checkbox" data-ema="20" checked />EMA20</label>
+                    <label class="chart-check"><input type="checkbox" data-ema="60" checked />EMA60</label>
+                  </div></div></div>
                   <div id="chart" class="chart" role="img" aria-label="股票日线蜡烛图和成交量图"></div>
                   <p id="chartNotice" class="chart-notice">选股审阅模式：后端响应在有效信号日截止。</p>
                 </div>

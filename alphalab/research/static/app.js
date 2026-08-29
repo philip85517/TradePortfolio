@@ -1,7 +1,11 @@
 (() => {
   "use strict";
 
-  const state = { mode: "selection", summary: null, candidates: [], visible: [], selectedSymbol: null, detail: null, portfolio: null, portfolioId: null, portfolioIds: [], chart: null };
+  const state = {
+    mode: "selection", summary: null, candidates: [], visible: [], selectedSymbol: null,
+    detail: null, portfolio: null, portfolioId: null, portfolioIds: [], chart: null,
+    chartSettings: { timeframe: localStorage.getItem("alphalab.chart.timeframe") || "1d", volume: true, ema: { 5: false, 20: true, 60: true } },
+  };
   const $ = (id) => document.getElementById(id);
 
   function escapeHtml(value) {
@@ -52,8 +56,15 @@
     const quality = summary.data_quality || {};
     const warnings = Number(quality.invalid_ohlc_rows || 0) + Number(quality.duplicate_groups || 0) + Number(quality.unknown_adjustment_rows || 0);
     $("qualityState").textContent = warnings ? `${warnings.toLocaleString()} 条警告` : "无明显警告";
+    const industryInfo = summary.industry_info || {};
+    $("industryQuality").textContent = industryInfo.quality === "point-in-time"
+      ? `PIT ${percent(industryInfo.coverage)}`
+      : industryInfo.quality === "current-snapshot"
+        ? `快照 ${percent(industryInfo.coverage)}`
+        : "未绑定";
     $("subtitle").textContent = `运行 ${summary.run_id} · 固定 ${summary.rule_version || "V0"} · 只读审阅`;
     const industry = $("industry");
+    industry.innerHTML = '<option value="all">全部行业</option>';
     for (const value of summary.industries || []) {
       const option = document.createElement("option");
       option.value = value;
@@ -244,11 +255,14 @@
     const candidate = detail.candidate || {};
     $("detailSymbol").textContent = candidate.symbol || detail.symbol;
     $("detailName").textContent = candidate.name || detail.symbol;
-    $("detailIndustry").textContent = `${candidate.industry || "UNKNOWN"} · 信号日 ${detail.signal_date}`;
+    const industryPath = [candidate.industry_level1, candidate.industry_level2, candidate.industry_level3]
+      .filter((value, index, values) => value && values.indexOf(value) === index);
+    $("detailIndustry").textContent = `${industryPath.join(" / ") || candidate.industry || "UNKNOWN"} · 信号日 ${detail.signal_date}`;
     const index = state.visible.findIndex((row) => String(row.symbol) === String(detail.symbol));
     $("detailPosition").textContent = index < 0 ? "--" : `${index + 1} / ${state.visible.length}`;
     $("previousButton").disabled = index <= 0;
     $("nextButton").disabled = index < 0 || index >= state.visible.length - 1;
+    renderChartControls(detail);
     renderFactors(candidate);
     renderPerformance(detail);
     renderChart(detail);
@@ -259,6 +273,7 @@
     state.selectedSymbol = symbol;
     renderCandidates(state.visible);
     const params = { symbol, mode: state.mode };
+    params.timeframe = state.chartSettings.timeframe;
     if (state.portfolioId) params.portfolio_id = state.portfolioId;
     api(`/api/stock?${new URLSearchParams(params)}`).then(renderDetail).catch(showError);
   }
@@ -269,9 +284,7 @@
     $("selectionMode").classList.toggle("active", mode === "selection");
     $("evaluationMode").classList.toggle("active", mode === "evaluation");
     $("chartNotice").textContent = mode === "selection" ? "选股审阅模式：后端响应在有效信号日截止。" : "事后评估模式：显示建仓点、未来走势和观察周期终点。";
-    $("chartLegend").innerHTML = mode === "selection"
-      ? '<span><i class="dot signal"></i>信号日</span>'
-      : '<span><i class="dot signal"></i>信号日</span><span><i class="dot entry"></i>建仓</span><span><i class="dot horizon"></i>观察终点</span>';
+    renderLegend();
     if (mode === "evaluation") {
       if (state.portfolio) renderPortfolio(state.portfolio); else loadPortfolio().catch(showError);
     } else {
@@ -284,42 +297,82 @@
     const container = $("chart");
     if (state.chart) { state.chart.remove(); state.chart = null; }
     container.innerHTML = "";
-    if (!detail.rows?.length) { container.innerHTML = `<div class="empty-state">${detail.status === "NO_CHART_DATA" ? "该股票缺少图表行情。" : "信号日前没有可用行情。"}</div>`; return; }
+    const rows = detail.chart?.rows || detail.rows;
+    if (!rows?.length) { container.innerHTML = `<div class="empty-state">${detail.status === "NO_CHART_DATA" ? "该股票缺少图表行情。" : "信号日前没有可用行情。"}</div>`; return; }
     if (window.LightweightCharts) {
-      try { renderLightweightChart(container, detail); return; } catch (error) { console.warn("Lightweight Charts fallback", error); }
+      try { renderLightweightChart(container, detail, rows); return; } catch (error) { console.warn("Lightweight Charts fallback", error); }
     }
-    renderSvgChart(container, detail);
+    renderSvgChart(container, detail, rows);
   }
 
-  function renderLightweightChart(container, detail) {
+  function renderLightweightChart(container, detail, rows) {
     const chart = LightweightCharts.createChart(container, { width: container.clientWidth || 800, height: 390, layout: { background: { color: "#ffffff" }, textColor: "#738092" }, grid: { vertLines: { color: "#eef1f5" }, horzLines: { color: "#eef1f5" } }, rightPriceScale: { borderColor: "#dfe5ec" }, timeScale: { borderColor: "#dfe5ec", timeVisible: true } });
     const candles = chart.addCandlestickSeries({ upColor: "#138a61", downColor: "#c94c53", borderVisible: false, wickUpColor: "#138a61", wickDownColor: "#c94c53" });
-    const volumes = chart.addHistogramSeries({ priceFormat: { type: "volume" }, priceScaleId: "", scaleMargins: { top: 0.78, bottom: 0 } });
-    candles.setData(detail.rows.map((row) => ({ time: row.date, open: Number(row.open), high: Number(row.high), low: Number(row.low), close: Number(row.close) })));
-    volumes.setData(detail.rows.map((row) => ({ time: row.date, value: Number(row.volume || 0), color: Number(row.close) >= Number(row.open) ? "#b6e4d2" : "#f3c3c6" })));
-    const markers = [{ time: detail.markers.signal_date, position: "aboveBar", color: "#f0a449", shape: "arrowDown", text: "信号" }];
+    if (state.chartSettings.volume) {
+      const volumes = chart.addHistogramSeries({ priceFormat: { type: "volume" }, priceScaleId: "", scaleMargins: { top: 0.78, bottom: 0 } });
+      volumes.setData(rows.map((row) => ({ time: row.date, value: Number(row.volume || 0), color: Number(row.close) >= Number(row.open) ? "#b6e4d2" : "#f3c3c6" })));
+    }
+    candles.setData(rows.map((row) => ({ time: row.date, open: Number(row.open), high: Number(row.high), low: Number(row.low), close: Number(row.close) })));
+    const emaColors = { 5: "#b45309", 20: "#2563eb", 60: "#7c3aed" };
+    Object.entries(state.chartSettings.ema).filter(([period, enabled]) => enabled && rows.some((row) => isFiniteNumber(row[`ema_${period}`]))).forEach(([period]) => {
+      const line = chart.addLineSeries({ color: emaColors[period], lineWidth: 1.5, priceLineVisible: false, lastValueVisible: false });
+      line.setData(rows.filter((row) => isFiniteNumber(row[`ema_${period}`])).map((row) => ({ time: row.date, value: Number(row[`ema_${period}`]) })));
+    });
+    const markerTime = (value) => nearestChartDate(value, rows);
+    const markers = [{ time: markerTime(detail.markers.signal_date), position: "aboveBar", color: "#f0a449", shape: "arrowDown", text: "信号" }];
     if (state.mode === "evaluation") {
-      if (detail.markers.entry_date) markers.push({ time: detail.markers.entry_date, position: "belowBar", color: "#1f6feb", shape: "arrowUp", text: "建仓" });
-      Object.entries(detail.markers).filter(([key]) => key.startsWith("horizon_")).forEach(([key, value]) => markers.push({ time: value, position: "aboveBar", color: "#138a61", shape: "circle", text: key.replace("horizon_", "") }));
+      if (detail.markers.entry_date) markers.push({ time: markerTime(detail.markers.entry_date), position: "belowBar", color: "#1f6feb", shape: "arrowUp", text: "建仓" });
+      Object.entries(detail.markers).filter(([key]) => key.startsWith("horizon_")).forEach(([key, value]) => markers.push({ time: markerTime(value), position: "aboveBar", color: "#138a61", shape: "circle", text: key.replace("horizon_", "") }));
     }
     candles.setMarkers(markers.sort((left, right) => String(left.time).localeCompare(String(right.time))));
     chart.timeScale().fitContent();
     state.chart = chart;
   }
 
-  function renderSvgChart(container, detail) {
-    const rows = detail.rows;
-    const width = Math.max(container.clientWidth || 760, 540); const height = 390; const left = 45; const right = 12; const top = 15; const priceBottom = 260; const volumeBottom = 360;
+  function renderSvgChart(container, detail, rows) {
+    const width = Math.max(container.clientWidth || 760, 540); const height = 390; const left = 45; const right = 12; const top = 15; const priceBottom = state.chartSettings.volume ? 260 : 340; const volumeBottom = 360;
     const prices = rows.flatMap((row) => [Number(row.high), Number(row.low)]).filter(Number.isFinite); const min = Math.min(...prices); const max = Math.max(...prices); const range = max - min || 1; const plotWidth = width - left - right; const step = plotWidth / Math.max(rows.length - 1, 1); const x = (index) => left + index * step; const y = (value) => top + (max - value) / range * (priceBottom - top); const maxVolume = Math.max(...rows.map((row) => Number(row.volume || 0)), 1);
     const line = (x1, y1, x2, y2, color, widthValue = 1, dash = "") => `<line x1="${x1}" y1="${y1}" x2="${x2}" y2="${y2}" stroke="${color}" stroke-width="${widthValue}" ${dash ? `stroke-dasharray="${dash}"` : ""}/>`;
     let svg = `<svg viewBox="0 0 ${width} ${height}" preserveAspectRatio="none"><rect width="100%" height="100%" fill="#fff"/>`;
-    [top, 95, 175, priceBottom, volumeBottom].forEach((gridY) => { svg += line(left, gridY, width - right, gridY, "#eef1f5"); });
+    [top, top + (priceBottom - top) / 3, top + (priceBottom - top) * 2 / 3, priceBottom, ...(state.chartSettings.volume ? [volumeBottom] : [])].forEach((gridY) => { svg += line(left, gridY, width - right, gridY, "#eef1f5"); });
     const markerIndex = (date) => rows.findIndex((row) => row.date === date);
     const markers = [[detail.markers.signal_date, "#f0a449", "信号"]]; if (state.mode === "evaluation") { if (detail.markers.entry_date) markers.push([detail.markers.entry_date, "#1f6feb", "建仓"]); Object.entries(detail.markers).filter(([key]) => key.startsWith("horizon_")).forEach(([key, value]) => markers.push([value, "#138a61", key.replace("horizon_", "")])); }
-    markers.forEach(([date, color, label]) => { const index = markerIndex(date); if (index >= 0) { const markerX = x(index); svg += line(markerX, top, markerX, volumeBottom, color, 1.5, "4 4"); svg += `<text x="${markerX + 4}" y="${top + 12}" fill="${color}" font-size="10">${label}</text>`; } });
-    rows.forEach((row, index) => { const open = Number(row.open); const close = Number(row.close); const high = Number(row.high); const low = Number(row.low); const color = close >= open ? "#138a61" : "#c94c53"; const barWidth = Math.max(2, Math.min(10, step * .55)); const candleX = x(index); svg += line(candleX, y(high), candleX, y(low), color, 1); svg += `<rect x="${candleX - barWidth / 2}" y="${Math.min(y(open), y(close))}" width="${barWidth}" height="${Math.max(1, Math.abs(y(open) - y(close)))}" fill="${color}" opacity=".88"/>`; const volumeHeight = Number(row.volume || 0) / maxVolume * 78; svg += `<rect x="${candleX - barWidth / 2}" y="${volumeBottom - volumeHeight}" width="${barWidth}" height="${volumeHeight}" fill="${color}" opacity=".32"/>`; });
-    svg += `<text x="${left}" y="${volumeBottom + 20}" fill="#738092" font-size="10">${rows[0].date}</text><text x="${width - right}" y="${volumeBottom + 20}" fill="#738092" font-size="10" text-anchor="end">${rows[rows.length - 1].date}</text><text x="8" y="${top + 5}" fill="#738092" font-size="10">${number(max)}</text><text x="8" y="${priceBottom}" fill="#738092" font-size="10">${number(min)}</text><text x="${left}" y="${volumeBottom + 36}" fill="#738092" font-size="10">成交量</text></svg>`;
+    markers.forEach(([date, color, label]) => { const index = rows.findIndex((row) => row.date === nearestChartDate(date, rows)); if (index >= 0) { const markerX = x(index); svg += line(markerX, top, markerX, state.chartSettings.volume ? volumeBottom : priceBottom, color, 1.5, "4 4"); svg += `<text x="${markerX + 4}" y="${top + 12}" fill="${color}" font-size="10">${label}</text>`; } });
+    rows.forEach((row, index) => { const open = Number(row.open); const close = Number(row.close); const high = Number(row.high); const low = Number(row.low); const color = close >= open ? "#138a61" : "#c94c53"; const barWidth = Math.max(2, Math.min(10, step * .55)); const candleX = x(index); svg += line(candleX, y(high), candleX, y(low), color, 1); svg += `<rect x="${candleX - barWidth / 2}" y="${Math.min(y(open), y(close))}" width="${barWidth}" height="${Math.max(1, Math.abs(y(open) - y(close)))}" fill="${color}" opacity=".88"/>`; if (state.chartSettings.volume) { const volumeHeight = Number(row.volume || 0) / maxVolume * 78; svg += `<rect x="${candleX - barWidth / 2}" y="${volumeBottom - volumeHeight}" width="${barWidth}" height="${volumeHeight}" fill="${color}" opacity=".32"/>`; } });
+    const emaColors = { 5: "#b45309", 20: "#2563eb", 60: "#7c3aed" };
+    Object.entries(state.chartSettings.ema).filter(([period, enabled]) => enabled).forEach(([period]) => { const points = rows.map((row, index) => isFiniteNumber(row[`ema_${period}`]) ? `${x(index)},${y(Number(row[`ema_${period}`]))}` : null).filter(Boolean).join(" "); if (points) svg += `<polyline points="${points}" fill="none" stroke="${emaColors[period]}" stroke-width="1.5" stroke-linejoin="round" stroke-linecap="round"/>`; });
+    svg += `<text x="${left}" y="${volumeBottom + 20}" fill="#738092" font-size="10">${rows[0].date}</text><text x="${width - right}" y="${volumeBottom + 20}" fill="#738092" font-size="10" text-anchor="end">${rows[rows.length - 1].date}</text><text x="8" y="${top + 5}" fill="#738092" font-size="10">${number(max)}</text><text x="8" y="${priceBottom}" fill="#738092" font-size="10">${number(min)}</text>${state.chartSettings.volume ? `<text x="${left}" y="${volumeBottom + 36}" fill="#738092" font-size="10">成交量</text>` : ""}</svg>`;
     container.innerHTML = svg;
+  }
+
+  function renderChartControls(detail) {
+    const timeframe = detail.chart?.timeframe || state.chartSettings.timeframe;
+    state.chartSettings.timeframe = timeframe;
+    $("timeframeSwitch").querySelectorAll("button").forEach((button) => button.classList.toggle("active", button.dataset.timeframe === timeframe));
+    $("volumeToggle").checked = state.chartSettings.volume;
+    document.querySelectorAll("[data-ema]").forEach((input) => { input.checked = Boolean(state.chartSettings.ema[input.dataset.ema]); });
+    renderLegend();
+  }
+
+  function renderLegend() {
+    const markerHtml = state.mode === "selection"
+      ? '<span><i class="dot signal"></i>信号日</span>'
+      : '<span><i class="dot signal"></i>信号日</span><span><i class="dot entry"></i>建仓</span><span><i class="dot horizon"></i>观察终点</span>';
+    const emaColors = { 5: "#b45309", 20: "#2563eb", 60: "#7c3aed" };
+    const emaHtml = Object.entries(state.chartSettings.ema).filter(([, enabled]) => enabled).map(([period]) => `<span><i class="indicator-line" style="background:${emaColors[period]}"></i>EMA${period}</span>`).join("");
+    $("chartLegend").innerHTML = markerHtml + emaHtml;
+  }
+
+  function nearestChartDate(value, rows) {
+    if (!rows.length) return value;
+    const exact = rows.find((row) => row.date === value);
+    if (exact) return exact.date;
+    const earlier = rows.filter((row) => row.date <= value).at(-1);
+    return earlier?.date || rows[0].date;
+  }
+
+  function isFiniteNumber(value) {
+    return value !== null && value !== undefined && value !== "" && Number.isFinite(Number(value));
   }
 
   function move(delta) { const index = state.visible.findIndex((row) => String(row.symbol) === String(state.selectedSymbol)); const next = state.visible[index + delta]; if (next) selectSymbol(next.symbol); }
@@ -339,6 +392,26 @@
   $("evaluationMode").addEventListener("click", () => switchMode("evaluation"));
   $("previousButton").addEventListener("click", () => move(-1));
   $("nextButton").addEventListener("click", () => move(1));
+  $("sidebarToggle").addEventListener("click", () => {
+    const collapsed = document.querySelector(".app-shell").classList.toggle("sidebar-collapsed");
+    localStorage.setItem("alphalab.sidebar.collapsed", collapsed ? "1" : "0");
+    $("sidebarToggle").setAttribute("aria-expanded", String(!collapsed));
+    $("sidebarToggle").setAttribute("aria-label", collapsed ? "展开目录" : "收起目录");
+  });
+  if (localStorage.getItem("alphalab.sidebar.collapsed") === "1") {
+    document.querySelector(".app-shell").classList.add("sidebar-collapsed");
+    $("sidebarToggle").setAttribute("aria-expanded", "false");
+    $("sidebarToggle").setAttribute("aria-label", "展开目录");
+  }
+  $("timeframeSwitch").addEventListener("click", (event) => {
+    const button = event.target.closest("button[data-timeframe]");
+    if (!button) return;
+    state.chartSettings.timeframe = button.dataset.timeframe;
+    localStorage.setItem("alphalab.chart.timeframe", state.chartSettings.timeframe);
+    if (state.selectedSymbol) selectSymbol(state.selectedSymbol);
+  });
+  $("volumeToggle").addEventListener("change", (event) => { state.chartSettings.volume = event.target.checked; if (state.detail) renderChart(state.detail); });
+  document.querySelectorAll("[data-ema]").forEach((input) => input.addEventListener("change", (event) => { state.chartSettings.ema[event.target.dataset.ema] = event.target.checked; renderLegend(); if (state.detail) renderChart(state.detail); }));
   document.addEventListener("keydown", (event) => { if (["INPUT", "SELECT", "TEXTAREA"].includes(document.activeElement?.tagName)) return; if (event.key === "ArrowUp") { event.preventDefault(); move(-1); } if (event.key === "ArrowDown") { event.preventDefault(); move(1); } });
 
   api("/api/summary").then((summary) => { state.summary = summary; renderSummary(summary); return loadCandidates(); }).catch(showError);
