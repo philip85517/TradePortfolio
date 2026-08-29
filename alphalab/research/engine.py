@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import dataclass, field, replace
+from dataclasses import asdict, dataclass, field, is_dataclass, replace
 from datetime import date, timedelta
 from pathlib import Path
 from typing import Any, Protocol, Sequence
@@ -17,7 +17,7 @@ import numpy as np
 import pandas as pd
 
 from ..utils import code_commit, json_hash, parse_date
-from .plugins import ResearchFactorPlugin, resolve_plugin
+from .plugins import ResearchFactorPlugin, factor_definition, resolve_plugin, validate_plugin_output
 
 
 class ResearchDataAdapter(Protocol):
@@ -46,6 +46,28 @@ class ResearchSpec:
     max_industry_weight: float | None = None
     min_holdings: int = 0
     universe_mode: str = "observed-history"
+    lot_size: int = 100
+    data_quality_mode: str = "exploratory"
+    factor_params: dict[str, Any] = field(default_factory=dict)
+    portfolios: tuple["PortfolioSpec", ...] = ()
+
+
+@dataclass(frozen=True)
+class PortfolioSpec:
+    """一个实验内独立组合的资金和约束配置。
+
+    ``None`` 表示继承 ``ResearchSpec`` 的兼容默认值；这样旧的单组合
+    调用方式仍然有效，而多个组合可以只覆盖自己需要的配置。
+    """
+
+    portfolio_id: str
+    name: str | None = None
+    initial_cash: float | None = None
+    portfolio_weighting: str | None = None
+    max_single_weight: float | None = None
+    max_industry_weight: float | None = None
+    min_holdings: int | None = None
+    lot_size: int | None = None
 
 
 @dataclass(frozen=True)
@@ -60,6 +82,17 @@ class HorizonPerformance:
     holding_win_rate: float | None = None
     stock_returns: dict[str, float] | None = None
     stock_contributions: dict[str, float] | None = None
+    initial_cash: float | None = None
+    ending_equity: float | None = None
+    profit_loss: float | None = None
+    max_drawdown_amount: float | None = None
+    daily_volatility: float | None = None
+    annualized_return: float | None = None
+    annualized_volatility: float | None = None
+    sharpe: float | None = None
+    commission_paid: float | None = None
+    slippage_paid: float | None = None
+    cash_residual: float | None = None
 
 
 @dataclass
@@ -75,6 +108,12 @@ class ResearchReport:
     artifact_dir: Path
     benchmark_performance: dict[int, HorizonPerformance] = field(default_factory=dict)
     benchmark_nav: pd.DataFrame = field(default_factory=pd.DataFrame)
+    portfolios: dict[str, pd.DataFrame] = field(default_factory=dict)
+    portfolio_performance: dict[str, dict[int, HorizonPerformance]] = field(default_factory=dict)
+    portfolio_nav: dict[str, pd.DataFrame] = field(default_factory=dict)
+    benchmarks: dict[str, pd.DataFrame] = field(default_factory=dict)
+    benchmark_performance_by_portfolio: dict[str, dict[int, HorizonPerformance]] = field(default_factory=dict)
+    benchmark_nav_by_portfolio: dict[str, pd.DataFrame] = field(default_factory=dict)
 
 
 @dataclass
@@ -86,6 +125,7 @@ class ResearchStudyReport:
     summary: pd.DataFrame
     diagnostics: dict[str, Any]
     artifact_dir: Path
+    portfolio_summary: pd.DataFrame = field(default_factory=pd.DataFrame)
 
 
 class InMemoryMarketDataAdapter:
@@ -114,8 +154,9 @@ class InMemoryMarketDataAdapter:
 class DuckDBMarketDataAdapter:
     """生产只读 DuckDB adapter，默认仅读取单市场日线。"""
 
-    def __init__(self, db_path: str | Path):
+    def __init__(self, db_path: str | Path, universe_db_path: str | Path | None = None):
         self.db_path = Path(db_path).expanduser()
+        self.universe_db_path = Path(universe_db_path).expanduser() if universe_db_path else None
 
     def load(
         self,
@@ -199,6 +240,23 @@ class DuckDBMarketDataAdapter:
             con.close()
         return _normalise_dates(data)
 
+    def load_universe_as_of(
+        self,
+        as_of: date,
+        market: str = "a_share",
+        symbols: Sequence[str] | None = None,
+    ) -> pd.DataFrame:
+        """从历史 universe 表读取信号日生效的标的元数据。"""
+
+        from .universe_history import load_universe_as_of as load_history
+
+        return load_history(
+            self.universe_db_path or self.db_path,
+            as_of,
+            market,
+            tuple(symbols) if symbols else None,
+        )
+
 
 class HistoricalResearchLab:
     def __init__(
@@ -206,19 +264,44 @@ class HistoricalResearchLab:
         adapter: ResearchDataAdapter,
         runs_dir: str | Path,
         plugins: dict[str, ResearchFactorPlugin] | None = None,
+        data_binding: Any | None = None,
     ):
         self.adapter = adapter
         self.runs_dir = Path(runs_dir)
         self.plugins = plugins
+        self.data_binding = data_binding
 
     def run(self, spec: ResearchSpec) -> ResearchReport:
+        context: dict[str, Any] = {"requested": None, "signal_date": None, "diagnostics": {}}
+        try:
+            return self._run(spec, context)
+        except Exception as exc:
+            try:
+                self._write_failure_artifact(
+                    spec,
+                    requested=context.get("requested"),
+                    signal_date=context.get("signal_date"),
+                    diagnostics=context.get("diagnostics") or {},
+                    error=str(exc),
+                )
+            except Exception:
+                # Never hide the original research error if diagnostics cannot be written.
+                pass
+            raise
+
+    def _run(self, spec: ResearchSpec, context: dict[str, Any]) -> ResearchReport:
         requested = parse_date(spec.requested_date)
+        context["requested"] = requested
         if spec.top_n <= 0:
             raise ValueError("top_n 必须为正数")
         horizons = tuple(sorted({int(h) for h in spec.horizons}))
         if not horizons or any(h <= 0 for h in horizons):
             raise ValueError("horizons 必须包含正整数")
         plugin = resolve_plugin(spec.rule_version, self.plugins)
+        factor = factor_definition(plugin)
+        _validate_factor_parameters(factor, spec.factor_params)
+        if spec.market not in factor["supported_markets"]:
+            raise ValueError(f"因子插件 {factor['plugin_id']} 不支持市场: {spec.market}")
 
         start = requested - timedelta(days=450)
         end = requested + timedelta(days=max(horizons) * 3 + 15)
@@ -229,12 +312,44 @@ class HistoricalResearchLab:
         _validate_columns(data)
 
         signal_date = _resolve_signal_date(data, requested)
-        data, universe_diagnostics = _apply_universe_mode(data, signal_date, spec.universe_mode)
+        context["signal_date"] = signal_date
+        history_snapshot = None
+        if str(spec.universe_mode).strip().lower() == "point-in-time":
+            loader = getattr(self.adapter, "load_universe_as_of", None)
+            if loader is not None:
+                history_snapshot = loader(signal_date, spec.market, tuple(data["symbol"].astype(str).unique()))
+        data, universe_diagnostics = _apply_universe_mode(
+            data,
+            signal_date,
+            spec.universe_mode,
+            history_snapshot=history_snapshot if history_snapshot is not None and not history_snapshot.empty else None,
+        )
+        context["diagnostics"] = {"universe": universe_diagnostics}
         if data.empty:
             raise ValueError("指定 universe 模式下没有可用股票")
+        _validate_universe_quality(universe_diagnostics, spec.data_quality_mode)
+        data_quality = _quality_summary(data, signal_date)
+        context["diagnostics"]["data_quality"] = data_quality
+        _validate_quality_mode(data_quality, spec.data_quality_mode)
         before = data[data["date"] <= pd.Timestamp(signal_date)].copy()
         after = data[data["date"] > pd.Timestamp(signal_date)].copy()
-        candidates, funnel = plugin.score(before)
+        missing_factor_fields = sorted(set(factor["required_fields"]) - set(before.columns))
+        if missing_factor_fields:
+            raise ValueError(f"因子插件 {factor['plugin_id']} 输入缺少字段: {missing_factor_fields}")
+        if spec.factor_params:
+            scorer = getattr(plugin, "score_with_params", None)
+            if not callable(scorer):
+                raise ValueError(f"因子插件 {factor['plugin_id']} 未声明 score_with_params，不能接收 factor_params")
+            candidates, funnel = scorer(before.copy(deep=True), dict(spec.factor_params))
+        else:
+            candidates, funnel = plugin.score(before.copy(deep=True))
+        candidates = validate_plugin_output(
+            candidates,
+            before,
+            plugin_id=factor["plugin_id"],
+            min_history_days=factor["min_history_days"],
+        )
+        candidates, funnel = _prepare_plugin_candidates(candidates, funnel, before, factor)
         selected = candidates[candidates["eligible"]].sort_values(
             ["total_score", "symbol"], ascending=[False, True], kind="mergesort"
         ).head(spec.top_n)
@@ -243,34 +358,79 @@ class HistoricalResearchLab:
             candidates.loc[candidates["symbol"].isin(selected["symbol"]), "selected"] = True
 
         entry_date = _next_market_date(after)
-        portfolio, portfolio_status, portfolio_reasons = _build_portfolio(selected, after, entry_date, spec)
-        candidates["portfolio_selected"] = candidates["symbol"].isin(set(portfolio.get("symbol", [])))
-        candidates["portfolio_reason"] = candidates["symbol"].map(portfolio_reasons).fillna("")
-        performance, nav = _evaluate_forward(portfolio, after, entry_date, horizons, spec)
-        benchmark = _build_benchmark(candidates, after, entry_date, spec)
-        benchmark_performance, benchmark_nav = _evaluate_forward(
-            benchmark,
-            after,
-            entry_date,
-            horizons,
-            replace(spec, portfolio_weighting="equal", max_single_weight=None, max_industry_weight=None),
-            include_stock_details=False,
-            allow_partial=True,
-        )
+        portfolio_specs = _resolve_portfolio_specs(spec)
+        portfolios: dict[str, pd.DataFrame] = {}
+        portfolio_performance: dict[str, dict[int, HorizonPerformance]] = {}
+        portfolio_nav: dict[str, pd.DataFrame] = {}
+        benchmarks: dict[str, pd.DataFrame] = {}
+        benchmark_performance_by_portfolio: dict[str, dict[int, HorizonPerformance]] = {}
+        benchmark_nav_by_portfolio: dict[str, pd.DataFrame] = {}
+        portfolio_diagnostics: dict[str, dict[str, Any]] = {}
+        for index, portfolio_spec in enumerate(portfolio_specs):
+            effective_spec = _effective_portfolio_research_spec(spec, portfolio_spec)
+            portfolio, portfolio_status, portfolio_reasons = _build_portfolio(
+                selected,
+                after,
+                entry_date,
+                effective_spec,
+            )
+            portfolio = _annotate_portfolio(portfolio, portfolio_spec)
+            performance, nav = _evaluate_forward(portfolio, after, entry_date, horizons, effective_spec)
+            benchmark = _build_benchmark(candidates, after, entry_date, effective_spec)
+            benchmark_performance, benchmark_nav = _evaluate_forward(
+                benchmark,
+                after,
+                entry_date,
+                horizons,
+                replace(effective_spec, portfolio_weighting="equal", max_single_weight=None, max_industry_weight=None),
+                include_stock_details=False,
+                allow_partial=True,
+            )
+            portfolio_id = portfolio_spec.portfolio_id
+            portfolios[portfolio_id] = portfolio
+            portfolio_performance[portfolio_id] = performance
+            portfolio_nav[portfolio_id] = nav
+            benchmarks[portfolio_id] = _annotate_portfolio(benchmark, portfolio_spec)
+            benchmark_performance_by_portfolio[portfolio_id] = benchmark_performance
+            benchmark_nav_by_portfolio[portfolio_id] = benchmark_nav
+            portfolio_diagnostics[portfolio_id] = {
+                "name": portfolio_spec.name or portfolio_id,
+                "initial_cash": effective_spec.initial_cash,
+                "status": portfolio_status,
+                "selected_count": int(len(portfolio)),
+                "reasons": portfolio_reasons,
+            }
+            selected_column = "portfolio_selected" if index == 0 else f"portfolio_{_safe_id(portfolio_id)}_selected"
+            reason_column = "portfolio_reason" if index == 0 else f"portfolio_{_safe_id(portfolio_id)}_reason"
+            candidates[selected_column] = candidates["symbol"].isin(set(portfolio.get("symbol", [])))
+            candidates[reason_column] = candidates["symbol"].map(portfolio_reasons).fillna("")
+
+        primary_id = portfolio_specs[0].portfolio_id
+        portfolio = portfolios[primary_id]
+        performance = portfolio_performance[primary_id]
+        nav = portfolio_nav[primary_id]
+        benchmark = benchmarks[primary_id]
+        benchmark_performance = benchmark_performance_by_portfolio[primary_id]
+        benchmark_nav = benchmark_nav_by_portfolio[primary_id]
+        portfolio_status = portfolio_diagnostics[primary_id]["status"]
 
         diagnostics = {
             "market": spec.market,
             "universe_mode": spec.universe_mode,
             "selection_rule": "amount_20d >= 30000000 and close > ma60; score = pct(return_60d)*0.6 + pct(return_20d)*0.3 + pct(amount_20d)*0.1",
+            "factor": factor,
             "funnel": funnel,
             "entry_date": entry_date,
             "portfolio_status": portfolio_status,
             "benchmark_status": "OK" if not benchmark.empty else "EMPTY_UNIVERSE",
+            "portfolios": portfolio_diagnostics,
             "universe": universe_diagnostics,
             "data_range": [data["date"].min().date(), data["date"].max().date()],
-            "data_quality": _quality_summary(data, signal_date),
+            "data_quality": data_quality,
         }
-        run_id = _new_run_id(spec, signal_date, candidates, portfolio)
+        if self.data_binding is not None:
+            diagnostics["data_source"] = _data_binding_metadata(self.data_binding)
+        run_id = _new_run_id(spec, signal_date, candidates, portfolios)
         artifact_dir = self._write_artifacts(
             run_id,
             spec,
@@ -282,8 +442,16 @@ class HistoricalResearchLab:
             diagnostics,
             rule_version=plugin.plugin_id,
             rule_source_hash=plugin.source_hash(),
+            factor_definition=factor,
             benchmark_performance=benchmark_performance,
             benchmark_nav=benchmark_nav,
+            portfolios=portfolios,
+            portfolio_performance=portfolio_performance,
+            portfolio_nav=portfolio_nav,
+            benchmarks=benchmarks,
+            benchmark_performance_by_portfolio=benchmark_performance_by_portfolio,
+            benchmark_nav_by_portfolio=benchmark_nav_by_portfolio,
+            portfolio_specs=portfolio_specs,
         )
         return ResearchReport(
             run_id=run_id,
@@ -297,6 +465,12 @@ class HistoricalResearchLab:
             artifact_dir=artifact_dir,
             benchmark_performance=benchmark_performance,
             benchmark_nav=benchmark_nav,
+            portfolios=portfolios,
+            portfolio_performance=portfolio_performance,
+            portfolio_nav=portfolio_nav,
+            benchmarks=benchmarks,
+            benchmark_performance_by_portfolio=benchmark_performance_by_portfolio,
+            benchmark_nav_by_portfolio=benchmark_nav_by_portfolio,
         )
 
     def run_study(
@@ -376,31 +550,87 @@ class HistoricalResearchLab:
                 }
             )
         summary = pd.DataFrame(summary_rows)
+        portfolio_ids = sorted(
+            {
+                portfolio_id
+                for report in reports
+                for portfolio_id in (report.portfolio_performance or {"strategy": report.performance})
+            }
+        )
+        primary_portfolio_id = (
+            next(iter(reports[0].portfolio_performance), "strategy")
+            if reports and reports[0].portfolio_performance
+            else "strategy"
+        )
+        portfolio_summary_frames = []
+        primary_summary = summary.copy()
+        primary_summary.insert(0, "portfolio_id", primary_portfolio_id)
+        portfolio_summary_frames.append(primary_summary)
+        for portfolio_id in portfolio_ids:
+            if portfolio_id == primary_portfolio_id:
+                continue
+            rows = [
+                _study_summary_row(
+                    reports,
+                    horizon,
+                    portfolio_id,
+                    bootstrap_seed=bootstrap_seed,
+                    bootstrap_samples=bootstrap_samples,
+                )
+                for horizon in horizons
+            ]
+            portfolio_frame = pd.DataFrame(rows)
+            portfolio_frame.insert(0, "portfolio_id", portfolio_id)
+            portfolio_summary_frames.append(portfolio_frame)
+        portfolio_summary = (
+            pd.concat(portfolio_summary_frames, ignore_index=True, sort=False)
+            if portfolio_summary_frames
+            else pd.DataFrame()
+        )
         overlap_pairs = _overlap_pairs(reports, max(horizons) if horizons else 0)
+        overlap_pairs_by_portfolio = {
+            portfolio_id: _overlap_pairs(
+                reports,
+                max(horizons) if horizons else 0,
+                portfolio_id=portfolio_id,
+            )
+            for portfolio_id in portfolio_ids
+        }
         diagnostics = {
             "universe_modes": sorted({str(report.diagnostics.get("universe_mode", "unknown")) for report in reports}),
             "overlap_pairs": overlap_pairs,
+            "overlap_pairs_by_portfolio": overlap_pairs_by_portfolio,
             "bootstrap_seed": bootstrap_seed,
             "bootstrap_samples": bootstrap_samples,
+            "portfolio_ids": portfolio_ids,
             "note": "当前 observed-history 结果仅作描述性研究，不输出统计显著优势结论。",
         }
+        if self.data_binding is not None:
+            diagnostics["data_source"] = _data_binding_metadata(self.data_binding)
         study_id = f"study-{pd.Timestamp.now(tz='UTC').strftime('%Y%m%dT%H%M%S%fZ')}-{json_hash({'runs': [report.run_id for report in reports]})[:10]}"
         artifact_dir = self.runs_dir / "studies" / study_id
         artifact_dir.mkdir(parents=True, exist_ok=False)
         summary.to_csv(artifact_dir / "summary.csv", index=False)
+        portfolio_summary.to_csv(artifact_dir / "portfolio_summary.csv", index=False)
+        study_artifacts = ["summary.csv", "portfolio_summary.csv"]
         manifest = {
             "study_id": study_id,
             "run_ids": [report.run_id for report in reports],
             "specs": [_jsonable(spec.__dict__) for spec in requested_specs],
+            "spec_hash": json_hash([_jsonable(spec.__dict__) for spec in requested_specs]),
             "summary": _jsonable(summary.to_dict("records")),
+            "portfolio_summary": _jsonable(portfolio_summary.to_dict("records")),
             "diagnostics": _jsonable(diagnostics),
-            "artifacts": ["summary.csv", "manifest.json"],
+            "status": "COMPLETE",
+            "artifacts": [*study_artifacts, "manifest.json"],
+            "artifact_hashes": _artifact_hashes(artifact_dir, study_artifacts),
         }
+        manifest["artifact_content_hash"] = json_hash(manifest["artifact_hashes"])
         (artifact_dir / "manifest.json").write_text(
             json.dumps(_jsonable(manifest), ensure_ascii=False, indent=2, sort_keys=True),
             encoding="utf-8",
         )
-        return ResearchStudyReport(study_id, reports, summary, diagnostics, artifact_dir)
+        return ResearchStudyReport(study_id, reports, summary, diagnostics, artifact_dir, portfolio_summary)
 
     def _write_artifacts(
         self,
@@ -415,62 +645,109 @@ class HistoricalResearchLab:
         *,
         rule_version: str,
         rule_source_hash: str,
+        factor_definition: dict[str, Any] | None = None,
         benchmark_performance: dict[int, HorizonPerformance] | None = None,
         benchmark_nav: pd.DataFrame | None = None,
+        portfolios: dict[str, pd.DataFrame] | None = None,
+        portfolio_performance: dict[str, dict[int, HorizonPerformance]] | None = None,
+        portfolio_nav: dict[str, pd.DataFrame] | None = None,
+        benchmarks: dict[str, pd.DataFrame] | None = None,
+        benchmark_performance_by_portfolio: dict[str, dict[int, HorizonPerformance]] | None = None,
+        benchmark_nav_by_portfolio: dict[str, pd.DataFrame] | None = None,
+        portfolio_specs: Sequence[PortfolioSpec] = (),
     ) -> Path:
         artifact_dir = self.runs_dir / run_id
         artifact_dir.mkdir(parents=True, exist_ok=False)
-        candidates.to_csv(artifact_dir / "candidates.csv", index=False)
-        portfolio.to_csv(artifact_dir / "portfolio.csv", index=False)
-        nav.to_csv(artifact_dir / "nav.csv", index=False)
-        (benchmark_nav if benchmark_nav is not None else pd.DataFrame()).to_csv(
+        portfolios = portfolios or {"strategy": portfolio}
+        portfolio_performance = portfolio_performance or {"strategy": performance}
+        portfolio_nav = portfolio_nav or {"strategy": nav}
+        benchmarks = benchmarks or {"strategy": pd.DataFrame()}
+        benchmark_performance_by_portfolio = benchmark_performance_by_portfolio or {
+            "strategy": benchmark_performance or {}
+        }
+        benchmark_nav_by_portfolio = benchmark_nav_by_portfolio or {"strategy": benchmark_nav or pd.DataFrame()}
+        candidate_artifact = candidates.copy()
+        candidate_artifact.insert(0, "run_id", run_id)
+        portfolio_artifact = portfolio.copy()
+        if "run_id" not in portfolio_artifact.columns:
+            portfolio_artifact.insert(0, "run_id", run_id)
+        nav_artifact = nav.copy()
+        if "portfolio_id" not in nav_artifact.columns:
+            nav_artifact.insert(0, "portfolio_id", next(iter(portfolios)))
+        nav_artifact.insert(0, "run_id", run_id)
+        benchmark_nav_artifact = (benchmark_nav if benchmark_nav is not None else pd.DataFrame()).copy()
+        if "portfolio_id" not in benchmark_nav_artifact.columns:
+            benchmark_nav_artifact.insert(0, "portfolio_id", next(iter(portfolios)))
+        benchmark_nav_artifact.insert(0, "run_id", run_id)
+        candidate_artifact.to_csv(artifact_dir / "candidates.csv", index=False)
+        portfolio_artifact.to_csv(artifact_dir / "portfolio.csv", index=False)
+        nav_artifact.to_csv(artifact_dir / "nav.csv", index=False)
+        benchmark_nav_artifact.to_csv(
             artifact_dir / "benchmark_nav.csv", index=False
         )
+        all_portfolios = _concat_portfolio_frames(portfolios)
+        all_portfolio_nav = _concat_nav_frames(portfolio_nav)
+        all_benchmark_nav = _concat_nav_frames(benchmark_nav_by_portfolio)
+        all_portfolios.insert(0, "run_id", run_id)
+        all_portfolio_nav.insert(0, "run_id", run_id)
+        all_benchmark_nav.insert(0, "run_id", run_id)
+        all_portfolios.to_csv(artifact_dir / "portfolios.csv", index=False)
+        all_portfolio_nav.to_csv(artifact_dir / "portfolio_nav.csv", index=False)
+        all_benchmark_nav.to_csv(artifact_dir / "benchmark_navs.csv", index=False)
         portfolio_returns = [
             {
+                "run_id": run_id,
+                "portfolio_id": portfolio_id,
                 "horizon": horizon,
                 "symbol": symbol,
                 "return": stock_return,
-                "contribution": (performance[horizon].stock_contributions or {}).get(symbol),
+                "contribution": (results[horizon].stock_contributions or {}).get(symbol),
                 "winning": stock_return > 0,
             }
-            for horizon, result in performance.items()
+            for portfolio_id, results in portfolio_performance.items()
+            for horizon, result in results.items()
             for symbol, stock_return in (result.stock_returns or {}).items()
         ]
         pd.DataFrame(
             portfolio_returns,
-            columns=["horizon", "symbol", "return", "contribution", "winning"],
+            columns=["run_id", "portfolio_id", "horizon", "symbol", "return", "contribution", "winning"],
         ).to_csv(artifact_dir / "portfolio_returns.csv", index=False)
-        performance_json = {
-            str(h): {
-                "horizon": p.horizon,
-                "status": p.status,
-                "total_return": p.total_return,
-                "max_drawdown": p.max_drawdown,
-                "gross_return": p.gross_return,
-                "evaluated_date": p.evaluated_date.isoformat() if p.evaluated_date else None,
-                "message": p.message,
-                "holding_win_rate": p.holding_win_rate,
-                "stock_returns": p.stock_returns,
-                "stock_contributions": p.stock_contributions,
-            }
-            for h, p in performance.items()
+        performance_json = _performance_json(performance)
+        portfolio_performance_json = {
+            portfolio_id: _performance_json(results)
+            for portfolio_id, results in portfolio_performance.items()
         }
-        benchmark_json = {
-            str(h): {
-                "horizon": p.horizon,
-                "status": p.status,
-                "total_return": p.total_return,
-                "max_drawdown": p.max_drawdown,
-                "gross_return": p.gross_return,
-                "evaluated_date": p.evaluated_date.isoformat() if p.evaluated_date else None,
-                "message": p.message,
-                "holding_win_rate": p.holding_win_rate,
-            }
-            for h, p in (benchmark_performance or {}).items()
+        benchmark_json = _performance_json(benchmark_performance or {})
+        benchmark_by_portfolio_json = {
+            portfolio_id: _performance_json(results)
+            for portfolio_id, results in benchmark_performance_by_portfolio.items()
         }
+        metrics = [
+            {"run_id": run_id, "portfolio_id": portfolio_id, **_performance_payload(result)}
+            for portfolio_id, results in portfolio_performance.items()
+            for result in results.values()
+        ]
+        pd.DataFrame(metrics).to_csv(artifact_dir / "portfolio_metrics.csv", index=False)
+        portfolio_manifest = []
+        for item in portfolio_specs:
+            effective = _effective_portfolio_research_spec(spec, item)
+            portfolio_manifest.append(
+                {
+                    "portfolio_id": item.portfolio_id,
+                    "name": item.name or item.portfolio_id,
+                    "initial_cash": effective.initial_cash,
+                    "portfolio_weighting": effective.portfolio_weighting,
+                    "max_single_weight": effective.max_single_weight,
+                    "max_industry_weight": effective.max_industry_weight,
+                    "min_holdings": effective.min_holdings,
+                    "lot_size": effective.lot_size,
+                }
+            )
+        spec_payload = _jsonable(spec.__dict__)
+        config_payload = {key: value for key, value in spec_payload.items() if key != "requested_date"}
         manifest = {
             "run_id": run_id,
+            "status": "COMPLETE",
             "requested_date": parse_date(spec.requested_date).isoformat(),
             "signal_date": signal_date.isoformat(),
             "spec": {
@@ -486,23 +763,80 @@ class HistoricalResearchLab:
                 "initial_cash": spec.initial_cash,
                 "commission_rate": spec.commission_rate,
                 "slippage_rate": spec.slippage_rate,
+                "lot_size": spec.lot_size,
+                "data_quality_mode": spec.data_quality_mode,
+                "factor_params": spec.factor_params,
+                "portfolios": _jsonable(spec.portfolios),
             },
+            "portfolios": portfolio_manifest,
             "rule_version": rule_version,
+            "factor": factor_definition or {"plugin_id": rule_version},
+            "spec_hash": json_hash(spec_payload),
+            "config_hash": json_hash(config_payload),
             "rule_source_hash": rule_source_hash,
             "source_hash": _source_hash(),
             "code_commit": code_commit(),
             "diagnostics": _jsonable(diagnostics),
             "performance": performance_json,
+            "portfolio_performance": portfolio_performance_json,
             "benchmark": benchmark_json,
+            "benchmark_by_portfolio": benchmark_by_portfolio_json,
             "artifacts": [
                 "candidates.csv",
                 "portfolio.csv",
+                "portfolios.csv",
                 "portfolio_returns.csv",
+                "portfolio_metrics.csv",
                 "nav.csv",
+                "portfolio_nav.csv",
                 "benchmark_nav.csv",
+                "benchmark_navs.csv",
                 "manifest.json",
             ],
         }
+        artifact_names = [name for name in manifest["artifacts"] if name != "manifest.json"]
+        manifest["artifact_hashes"] = _artifact_hashes(artifact_dir, artifact_names)
+        manifest["artifact_content_hash"] = json_hash(manifest["artifact_hashes"])
+        (artifact_dir / "manifest.json").write_text(
+            json.dumps(_jsonable(manifest), ensure_ascii=False, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+        return artifact_dir
+
+    def _write_failure_artifact(
+        self,
+        spec: ResearchSpec,
+        *,
+        requested: date | None,
+        signal_date: date | None,
+        diagnostics: dict[str, Any],
+        error: str,
+    ) -> Path:
+        """保存不会被后续成功运行覆盖的失败诊断。"""
+
+        payload = {
+            "requested_date": requested.isoformat() if requested else None,
+            "signal_date": signal_date.isoformat() if signal_date else None,
+            "spec": _jsonable(spec.__dict__),
+            "diagnostics": diagnostics,
+            "error": error,
+        }
+        run_id = (
+            f"research-failed-{pd.Timestamp.now(tz='UTC').strftime('%Y%m%dT%H%M%S%fZ')}"
+            f"-{json_hash(payload)[:10]}"
+        )
+        artifact_dir = self.runs_dir / run_id
+        artifact_dir.mkdir(parents=True, exist_ok=False)
+        manifest = {
+            "run_id": run_id,
+            "status": "FAILED",
+            **payload,
+            "source_hash": _source_hash(),
+            "code_commit": code_commit(),
+            "artifacts": ["manifest.json"],
+        }
+        if self.data_binding is not None:
+            manifest["diagnostics"]["data_source"] = _data_binding_metadata(self.data_binding)
         (artifact_dir / "manifest.json").write_text(
             json.dumps(_jsonable(manifest), ensure_ascii=False, indent=2, sort_keys=True),
             encoding="utf-8",
@@ -554,6 +888,7 @@ def _apply_universe_mode(
     data: pd.DataFrame,
     signal_date: date,
     mode: str,
+    history_snapshot: pd.DataFrame | None = None,
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
     mode = str(mode).strip().lower() or "observed-history"
     symbols = data["symbol"].astype(str).drop_duplicates()
@@ -566,6 +901,44 @@ def _apply_universe_mode(
         }
     if mode != "point-in-time":
         raise ValueError("universe_mode 必须是 observed-history 或 point-in-time")
+
+    if history_snapshot is not None:
+        snapshot = history_snapshot.copy()
+        snapshot["symbol"] = snapshot["symbol"].astype(str)
+        symbols_set = set(symbols.astype(str))
+        history_symbols = set(snapshot["symbol"])
+        filtered = data[data["symbol"].astype(str).isin(history_symbols)].copy()
+        metadata_columns = [
+            "symbol",
+            "name",
+            "industry_level1",
+            "industry_level2",
+            "industry_level3",
+        ]
+        metadata = snapshot[[column for column in metadata_columns if column in snapshot.columns]].drop_duplicates("symbol")
+        for column in metadata.columns:
+            if column != "symbol" and column in filtered.columns:
+                filtered = filtered.drop(columns=[column])
+        filtered = filtered.merge(metadata, on="symbol", how="left")
+        snapshot_ids = sorted({str(value) for value in snapshot["snapshot_id"].dropna()})
+        industry_column = filtered.get("industry_level1", pd.Series(dtype="string"))
+        missing_industry_symbols = int(
+            filtered.loc[industry_column.isna(), "symbol"].astype(str).nunique()
+            if not filtered.empty and "symbol" in filtered.columns
+            else 0
+        )
+        return filtered, {
+            "mode": mode,
+            "snapshot_id": snapshot_ids[0] if len(snapshot_ids) == 1 else "mixed",
+            "history_rows": int(len(snapshot)),
+            "total_symbols": int(len(symbols_set)),
+            "eligible_symbols": int(len(history_symbols)),
+            "excluded_after_as_of": int(len(symbols_set - history_symbols)),
+            "missing_symbols": sorted(symbols_set - history_symbols),
+            "industry_missing_symbols": missing_industry_symbols,
+            "industry_history_available": missing_industry_symbols == 0,
+            "point_in_time_quality": "complete" if missing_industry_symbols == 0 else "listing-only",
+        }
 
     listed_column = next((column for column in ("listed_date", "list_date", "上市日期") if column in data.columns), None)
     delisted_column = next((column for column in ("delisted_date", "delist_date", "退市日期") if column in data.columns), None)
@@ -593,7 +966,77 @@ def _apply_universe_mode(
         "eligible_symbols": int(len(eligible_symbols)),
         "excluded_after_as_of": int(len(symbols) - len(eligible_symbols)),
         "missing_listing_metadata": int(metadata["_listed"].isna().sum()),
+        "industry_history_available": False,
+        "point_in_time_quality": "listing-only",
     }
+
+
+def _validate_factor_parameters(factor: dict[str, Any], params: dict[str, Any]) -> None:
+    if params is None:
+        return
+    if not isinstance(params, dict):
+        raise ValueError("factor_params 必须是对象")
+    schema = factor.get("parameter_schema") or {}
+    unknown = sorted(set(params) - set(schema))
+    if unknown:
+        raise ValueError(f"因子插件 {factor['plugin_id']} 收到未声明参数: {unknown}")
+    for name, value in params.items():
+        rule = schema.get(name) or {}
+        expected = rule.get("type")
+        valid_type = {
+            "integer": isinstance(value, int) and not isinstance(value, bool),
+            "number": isinstance(value, (int, float)) and not isinstance(value, bool),
+            "string": isinstance(value, str),
+            "boolean": isinstance(value, bool),
+        }.get(expected, True)
+        if not valid_type:
+            raise ValueError(f"因子插件 {factor['plugin_id']} 参数 {name} 类型无效")
+        if "minimum" in rule and value < rule["minimum"]:
+            raise ValueError(f"因子插件 {factor['plugin_id']} 参数 {name} 小于最小值")
+        if "maximum" in rule and value > rule["maximum"]:
+            raise ValueError(f"因子插件 {factor['plugin_id']} 参数 {name} 大于最大值")
+    required = [name for name, rule in schema.items() if isinstance(rule, dict) and rule.get("required")]
+    missing = sorted(set(required) - set(params))
+    if missing:
+        raise ValueError(f"因子插件 {factor['plugin_id']} 缺少参数: {missing}")
+
+
+def _prepare_plugin_candidates(
+    candidates: pd.DataFrame,
+    funnel: dict[str, Any] | None,
+    before: pd.DataFrame,
+    factor: dict[str, Any],
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    """由引擎统一补齐展示元数据、百分位前的稳定排名和漏斗默认值。"""
+
+    output = candidates.copy()
+    latest = before.sort_values(["symbol", "date"], kind="mergesort").groupby("symbol", sort=False).tail(1)
+    metadata = latest.set_index(latest["symbol"].astype(str))
+    if "name" not in output.columns:
+        output["name"] = output["symbol"].map(metadata.get("name", pd.Series(dtype=str)))
+    if "industry" not in output.columns:
+        output["industry"] = output["symbol"].map(
+            metadata.get("industry_level1", pd.Series(dtype=str))
+        )
+    output["name"] = output["name"].fillna(output["symbol"])
+    output["industry"] = output["industry"].fillna("UNKNOWN")
+    if "reason" not in output.columns:
+        output["reason"] = np.where(output["eligible"], "通过因子", "未通过因子")
+    output["total_score"] = pd.to_numeric(output["total_score"], errors="coerce")
+    output["rank"] = np.nan
+    eligible = output["eligible"].astype(bool)
+    ascending = factor["score_direction"] == "lower_is_better"
+    ranked = output[eligible].sort_values(
+        ["total_score", "symbol"],
+        ascending=[ascending, True],
+        kind="mergesort",
+    )
+    output.loc[ranked.index, "rank"] = np.arange(1, len(ranked) + 1)
+    normalized_funnel = dict(funnel or {})
+    normalized_funnel.setdefault("universe", int(len(output)))
+    normalized_funnel.setdefault("rule_eligible", int(eligible.sum()))
+    normalized_funnel.setdefault("history_eligible", int(len(output)))
+    return output.sort_values(["rank", "symbol"], na_position="last", kind="mergesort").reset_index(drop=True), normalized_funnel
 
 
 def _score_fixed_v0(before: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, int]]:
@@ -696,6 +1139,69 @@ def _ineligible_row(symbol: str, history_count: int, reasons: list[str]) -> dict
     }
 
 
+def _resolve_portfolio_specs(spec: ResearchSpec) -> tuple[PortfolioSpec, ...]:
+    if not spec.portfolios:
+        return (
+            PortfolioSpec(
+                portfolio_id="strategy",
+                name="策略组合",
+                initial_cash=spec.initial_cash,
+                portfolio_weighting=spec.portfolio_weighting,
+                max_single_weight=spec.max_single_weight,
+                max_industry_weight=spec.max_industry_weight,
+                min_holdings=spec.min_holdings,
+                lot_size=spec.lot_size,
+            ),
+        )
+    resolved: list[PortfolioSpec] = []
+    seen: set[str] = set()
+    for item in spec.portfolios:
+        if not isinstance(item, PortfolioSpec):
+            raise ValueError("portfolios 必须由 PortfolioSpec 组成")
+        portfolio_id = str(item.portfolio_id).strip()
+        if not portfolio_id:
+            raise ValueError("portfolio_id 不能为空")
+        if portfolio_id in seen:
+            raise ValueError(f"portfolio_id 重复: {portfolio_id}")
+        safe_id = _safe_id(portfolio_id)
+        if any(_safe_id(existing) == safe_id for existing in seen):
+            raise ValueError(f"portfolio_id 经过列名标准化后重复: {portfolio_id}")
+        seen.add(portfolio_id)
+        resolved.append(replace(item, portfolio_id=portfolio_id))
+    return tuple(resolved)
+
+
+def _effective_portfolio_research_spec(spec: ResearchSpec, portfolio: PortfolioSpec) -> ResearchSpec:
+    return replace(
+        spec,
+        initial_cash=spec.initial_cash if portfolio.initial_cash is None else float(portfolio.initial_cash),
+        portfolio_weighting=(
+            spec.portfolio_weighting if portfolio.portfolio_weighting is None else portfolio.portfolio_weighting
+        ),
+        max_single_weight=(
+            spec.max_single_weight if portfolio.max_single_weight is None else portfolio.max_single_weight
+        ),
+        max_industry_weight=(
+            spec.max_industry_weight if portfolio.max_industry_weight is None else portfolio.max_industry_weight
+        ),
+        min_holdings=spec.min_holdings if portfolio.min_holdings is None else int(portfolio.min_holdings),
+        lot_size=spec.lot_size if portfolio.lot_size is None else int(portfolio.lot_size),
+        portfolios=(),
+    )
+
+
+def _annotate_portfolio(frame: pd.DataFrame, portfolio: PortfolioSpec) -> pd.DataFrame:
+    data = frame.copy()
+    data.insert(0, "portfolio_id", portfolio.portfolio_id)
+    data.insert(1, "portfolio_name", portfolio.name or portfolio.portfolio_id)
+    return data
+
+
+def _safe_id(value: str) -> str:
+    sanitized = "".join(character if character.isalnum() or character == "_" else "_" for character in value)
+    return sanitized or "portfolio"
+
+
 def _latest_text(frame: pd.DataFrame, column: str, fallback: str) -> str:
     if column not in frame.columns:
         return fallback
@@ -728,6 +1234,12 @@ def _build_portfolio(
         "shares",
     ]
     reasons: dict[str, str] = {}
+    if spec.initial_cash <= 0:
+        raise ValueError("initial_cash 必须为正数")
+    if int(spec.lot_size) <= 0:
+        raise ValueError("lot_size 必须为正整数")
+    if float(spec.lot_size) != int(spec.lot_size):
+        raise ValueError("lot_size 必须为正整数")
     if selected.empty or entry_date is None:
         return pd.DataFrame(columns=columns), "EMPTY_CANDIDATE_POOL", reasons
     if spec.min_holdings < 0:
@@ -783,8 +1295,18 @@ def _build_portfolio(
     rows: list[dict[str, Any]] = []
     for row, weight in zip(entry_rows, weights, strict=True):
         allocated = spec.initial_cash * float(weight) / (1.0 + spec.commission_rate)
-        shares = allocated / row["entry_price"] if row["entry_price"] > 0 else 0.0
+        raw_shares = allocated / row["entry_price"] if row["entry_price"] > 0 else 0.0
+        shares = float(np.floor(raw_shares / spec.lot_size) * spec.lot_size)
+        if shares <= 0:
+            reasons[str(row["symbol"])] = f"资金不足以买入一手（整手 {spec.lot_size}）"
+            continue
         rows.append({**row, "target_weight": round(float(weight), 10), "shares": shares})
+    if len(rows) < spec.min_holdings:
+        for row in rows:
+            reasons[str(row["symbol"])] = f"可执行数量少于最低持仓数 {spec.min_holdings}"
+        return pd.DataFrame(columns=columns), "INSUFFICIENT_HOLDINGS", reasons
+    if not rows:
+        return pd.DataFrame(columns=columns), "NO_EXECUTABLE_HOLDINGS", reasons
     portfolio = pd.DataFrame(rows, columns=columns)
     return portfolio, "OK", reasons
 
@@ -920,7 +1442,16 @@ def _evaluate_forward(
     empty_nav = pd.DataFrame(columns=["date", "horizon", "equity", "daily_return", "drawdown"])
     if portfolio.empty or entry_date is None:
         return {
-            h: HorizonPerformance(h, "INSUFFICIENT_FORWARD_DATA", None, None, None, None, "没有可建仓的股票")
+            h: HorizonPerformance(
+                h,
+                "INSUFFICIENT_FORWARD_DATA",
+                None,
+                None,
+                None,
+                None,
+                "没有可建仓的股票",
+                initial_cash=spec.initial_cash,
+            )
             for h in horizons
         }, empty_nav
     available_dates = sorted(after.loc[after["close"].notna(), "date"].drop_duplicates())
@@ -930,7 +1461,16 @@ def _evaluate_forward(
         entry_index = -1
     if entry_index < 0:
         return {
-            h: HorizonPerformance(h, "INSUFFICIENT_FORWARD_DATA", None, None, None, None, "没有完整建仓日行情")
+            h: HorizonPerformance(
+                h,
+                "INSUFFICIENT_FORWARD_DATA",
+                None,
+                None,
+                None,
+                None,
+                "没有完整建仓日行情",
+                initial_cash=spec.initial_cash,
+            )
             for h in horizons
         }, empty_nav
 
@@ -940,7 +1480,14 @@ def _evaluate_forward(
         target_index = entry_index + horizon
         if target_index >= len(available_dates):
             performance[horizon] = HorizonPerformance(
-                horizon, "INSUFFICIENT_FORWARD_DATA", None, None, None, None, "未来行情不足指定观察周期"
+                horizon,
+                "INSUFFICIENT_FORWARD_DATA",
+                None,
+                None,
+                None,
+                None,
+                "未来行情不足指定观察周期",
+                initial_cash=spec.initial_cash,
             )
             continue
         window_dates = available_dates[entry_index : target_index + 1]
@@ -960,6 +1507,7 @@ def _evaluate_forward(
                     None,
                     None,
                     "选中股票缺少完整未来行情",
+                    initial_cash=spec.initial_cash,
                 )
                 continue
             complete_columns = selected_prices.columns[~selected_prices.isna().any(axis=0)]
@@ -972,24 +1520,38 @@ def _evaluate_forward(
                     None,
                     None,
                     "基准没有完整未来行情",
+                    initial_cash=spec.initial_cash,
                 )
                 continue
             selected_prices = selected_prices.loc[:, complete_columns]
             entry_prices = entry_prices.reindex(complete_columns).astype(float)
             equal_weight = 1.0 / len(complete_columns)
-            shares = spec.initial_cash * equal_weight / (1.0 + spec.commission_rate) / entry_prices
+            shares = np.floor(
+                (spec.initial_cash * equal_weight / (1.0 + spec.commission_rate) / entry_prices) / spec.lot_size
+            ) * spec.lot_size
+            shares = shares.astype(float)
+        raw_entry_prices = entry_prices / (1.0 + spec.slippage_rate)
+        buy_notional = raw_entry_prices * shares
+        buy_values = buy_notional * (1.0 + spec.commission_rate)
+        cash_residual = float(spec.initial_cash - buy_values.sum())
         values = selected_prices.mul(shares, axis="columns")
-        equity = values.sum(axis=1, min_count=1)
+        equity = values.sum(axis=1, min_count=1) + cash_residual
         equity = equity.dropna()
         if equity.empty or len(equity) <= horizon:
             performance[horizon] = HorizonPerformance(
-                horizon, "INSUFFICIENT_FORWARD_DATA", None, None, None, None, "选中股票缺少完整未来行情"
+                horizon,
+                "INSUFFICIENT_FORWARD_DATA",
+                None,
+                None,
+                None,
+                None,
+                "选中股票缺少完整未来行情",
+                initial_cash=spec.initial_cash,
             )
             continue
         # 终点卖出成本单独计入净收益；净值路径按收盘市值计算。
         exit_cost_factor = (1.0 - spec.slippage_rate) * (1.0 - spec.commission_rate)
         exit_prices = selected_prices.iloc[-1].astype(float)
-        buy_values = entry_prices * shares * (1.0 + spec.commission_rate)
         net_exit_values = exit_prices * shares * exit_cost_factor
         all_stock_returns = {
             str(symbol): float(value)
@@ -1003,21 +1565,40 @@ def _evaluate_forward(
         # 成本前收益只反映收盘价相对信号后首个开盘价的变动，不把建仓
         # 佣金/滑点混入该指标。``equity`` 仍然保留真实建仓后的净值路径，
         # 因此可以同时看到成本前价格表现和成本后可实现收益。
-        raw_entry_prices = entry_prices / (1.0 + spec.slippage_rate)
-        target_weights = portfolio.set_index("symbol")["target_weight"].reindex(selected_prices.columns)
-        if allow_partial:
-            target_weights = pd.Series(
-                1.0 / len(selected_prices.columns), index=selected_prices.columns, dtype=float
-            )
+        target_weights = buy_values / spec.initial_cash
         gross_stock_returns = exit_prices / raw_entry_prices - 1.0
         gross_return = float(gross_stock_returns.mul(target_weights).sum())
-        total_return = float((equity.iloc[-1] * exit_cost_factor) / spec.initial_cash - 1.0)
+        total_return = float((net_exit_values.sum() + cash_residual) / spec.initial_cash - 1.0)
         peak = equity.cummax()
         drawdown = equity / peak - 1.0
         max_drawdown = float(drawdown.min())
         previous = equity.shift(1)
         daily_return = equity / previous - 1.0
         daily_return.iloc[0] = equity.iloc[0] / spec.initial_cash - 1.0
+        ending_equity = float(net_exit_values.sum() + cash_residual)
+        profit_loss = ending_equity - float(spec.initial_cash)
+        max_drawdown_amount = float((equity - peak).min())
+        daily_volatility = float(daily_return.std(ddof=1)) if len(daily_return) > 1 else None
+        annualized_volatility = daily_volatility * np.sqrt(252.0) if daily_volatility is not None else None
+        annualized_return = (
+            float((ending_equity / spec.initial_cash) ** (252.0 / horizon) - 1.0)
+            if ending_equity > 0
+            else -1.0
+        )
+        sharpe = (
+            float(daily_return.mean() / daily_volatility * np.sqrt(252.0))
+            if daily_volatility is not None and daily_volatility > 0
+            else None
+        )
+        buy_notional = raw_entry_prices * shares
+        exit_notional = exit_prices * shares * (1.0 - spec.slippage_rate)
+        commission_paid = float(
+            buy_notional.mul(spec.commission_rate).sum() + exit_notional.mul(spec.commission_rate).sum()
+        )
+        slippage_paid = float(
+            (entry_prices - raw_entry_prices).mul(shares).sum()
+            + (exit_prices * spec.slippage_rate).mul(shares).sum()
+        )
         for current_date, current_equity, current_return, current_drawdown in zip(
             equity.index, equity, daily_return, drawdown, strict=True
         ):
@@ -1031,39 +1612,97 @@ def _evaluate_forward(
                 }
             )
         performance[horizon] = HorizonPerformance(
-            horizon,
-            "COMPLETE",
-            total_return,
-            max_drawdown,
-            gross_return,
-            window_dates[-1].date(),
-            None,
-            holding_win_rate,
-            all_stock_returns if include_stock_details else None,
-            all_stock_contributions if include_stock_details else None,
+            horizon=horizon,
+            status="COMPLETE",
+            total_return=total_return,
+            max_drawdown=max_drawdown,
+            gross_return=gross_return,
+            evaluated_date=window_dates[-1].date(),
+            holding_win_rate=holding_win_rate,
+            stock_returns=all_stock_returns if include_stock_details else None,
+            stock_contributions=all_stock_contributions if include_stock_details else None,
+            initial_cash=float(spec.initial_cash),
+            ending_equity=ending_equity,
+            profit_loss=profit_loss,
+            max_drawdown_amount=max_drawdown_amount,
+            daily_volatility=daily_volatility,
+            annualized_return=annualized_return,
+            annualized_volatility=annualized_volatility,
+            sharpe=sharpe,
+            commission_paid=commission_paid,
+            slippage_paid=slippage_paid,
+            cash_residual=cash_residual,
         )
     return performance, pd.DataFrame(rows, columns=["date", "horizon", "equity", "daily_return", "drawdown"])
 
 
 def _quality_summary(data: pd.DataFrame, signal_date: date) -> dict[str, Any]:
     prices = data[["open", "high", "low", "close"]]
+    selection = data[data["date"] <= pd.Timestamp(signal_date)]
+    selection_prices = selection[["open", "high", "low", "close"]]
     invalid_ohlc = int(
         ((prices["high"] < prices[["open", "close"]].max(axis=1)) | (prices["low"] > prices[["open", "close"]].min(axis=1))).fillna(False).sum()
     )
-    adjustment_by_symbol = data[data["date"] <= pd.Timestamp(signal_date)].groupby("symbol")["adjustment"].nunique()
+    selection_invalid_ohlc = int(
+        ((selection_prices["high"] < selection_prices[["open", "close"]].max(axis=1)) | (selection_prices["low"] > selection_prices[["open", "close"]].min(axis=1))).fillna(False).sum()
+    )
+    adjustment_by_symbol = selection.groupby("symbol")["adjustment"].nunique()
     mixed_adjustment = int((adjustment_by_symbol > 1).sum())
-    unknown_adjustment = int(data.loc[data["date"] <= pd.Timestamp(signal_date), "adjustment"].isin({"unknown", "none", "nan"}).sum())
+    unknown_adjustment = int(selection["adjustment"].isin({"unknown", "none", "nan"}).sum())
     duplicate_groups = int(data.groupby(["symbol", "date"], dropna=False).size().gt(1).sum())
     non_positive_rows = int((prices <= 0).any(axis=1).sum())
+    selection_non_positive_rows = int((selection_prices <= 0).any(axis=1).sum())
+    incomplete_ohlc_rows = int(prices.isna().any(axis=1).sum())
+    selection_incomplete_ohlc_rows = int(selection_prices.isna().any(axis=1).sum())
+    missing_volume_amount_rows = int(selection[["volume", "amount"]].isna().all(axis=1).sum())
     return {
         "rows": int(len(data)),
         "symbols": int(data["symbol"].nunique()),
         "invalid_ohlc_rows": invalid_ohlc,
+        "selection_invalid_ohlc_rows": selection_invalid_ohlc,
         "duplicate_groups": duplicate_groups,
         "non_positive_ohlc_rows": non_positive_rows,
+        "selection_non_positive_ohlc_rows": selection_non_positive_rows,
+        "incomplete_ohlc_rows": incomplete_ohlc_rows,
+        "selection_incomplete_ohlc_rows": selection_incomplete_ohlc_rows,
+        "missing_volume_amount_rows": missing_volume_amount_rows,
         "mixed_adjustment_symbols": mixed_adjustment,
         "unknown_adjustment_rows": unknown_adjustment,
     }
+
+
+def _validate_quality_mode(summary: dict[str, Any], mode: str) -> None:
+    normalized = str(mode).strip().lower() or "exploratory"
+    if normalized not in {"exploratory", "strict"}:
+        raise ValueError("data_quality_mode 必须是 exploratory 或 strict")
+    summary["mode"] = normalized
+    reasons: list[str] = []
+    if normalized == "strict":
+        checks = (
+            (summary["duplicate_groups"], "存在重复日线"),
+            (summary["selection_invalid_ohlc_rows"], "存在非法 OHLC"),
+            (summary["selection_non_positive_ohlc_rows"], "存在非正 OHLC"),
+            (summary["selection_incomplete_ohlc_rows"], "存在不完整 OHLC"),
+            (summary["missing_volume_amount_rows"], "缺少成交量和成交额"),
+            (summary["mixed_adjustment_symbols"], "存在混合复权标的"),
+            (summary["unknown_adjustment_rows"], "存在未知或未复权行情"),
+        )
+        reasons = [message for count, message in checks if count]
+    summary["status"] = "PASS" if not reasons else "FAILED"
+    summary["reasons"] = reasons
+    if reasons:
+        raise ValueError(f"数据质量校验失败（{normalized}）: {'；'.join(reasons)}")
+
+
+def _validate_universe_quality(summary: dict[str, Any], mode: str) -> None:
+    """严格模式禁止把仅有上市窗口的 universe 当作正式 PIT 数据。"""
+
+    normalized = str(mode).strip().lower() or "exploratory"
+    if normalized == "strict" and summary.get("mode") == "point-in-time":
+        if summary.get("point_in_time_quality") != "complete":
+            raise ValueError(
+                "严格模式要求完整 point-in-time universe；当前缺少历史行业分类生效区间"
+            )
 
 
 def _evidence_label(
@@ -1071,21 +1710,33 @@ def _evidence_label(
     ci_low: float | None,
     reports: Sequence[ResearchReport],
     horizon: int,
+    portfolio_id: str | None = None,
 ) -> str:
     """只在正式 point-in-time 且样本足够、窗口独立时允许正向证据标签。"""
     if values.size < 20 or ci_low is None or ci_low <= 0:
         return "DESCRIPTIVE_ONLY"
     if any(report.diagnostics.get("universe_mode") != "point-in-time" for report in reports):
         return "DESCRIPTIVE_ONLY"
-    if _overlap_pairs(reports, horizon):
+    if any(report.diagnostics.get("universe", {}).get("point_in_time_quality") != "complete" for report in reports):
+        return "DESCRIPTIVE_ONLY"
+    if _overlap_pairs(reports, horizon, portfolio_id=portfolio_id):
         return "DESCRIPTIVE_ONLY"
     return "POSITIVE_EVIDENCE"
 
 
-def _overlap_pairs(reports: Sequence[ResearchReport], horizon: int) -> list[list[str]]:
+def _overlap_pairs(
+    reports: Sequence[ResearchReport],
+    horizon: int,
+    *,
+    portfolio_id: str | None = None,
+) -> list[list[str]]:
     windows: list[tuple[str, date, date]] = []
     for report in reports:
-        performance = report.performance.get(horizon)
+        performance = (
+            report.portfolio_performance.get(portfolio_id, {}).get(horizon)
+            if portfolio_id is not None
+            else report.performance.get(horizon)
+        )
         if not performance or performance.status != "COMPLETE" or performance.evaluated_date is None:
             continue
         start_value = report.diagnostics.get("entry_date") or report.signal_date
@@ -1099,14 +1750,148 @@ def _overlap_pairs(reports: Sequence[ResearchReport], horizon: int) -> list[list
     return overlaps
 
 
-def _new_run_id(spec: ResearchSpec, signal_date: date, candidates: pd.DataFrame, portfolio: pd.DataFrame) -> str:
+def _study_summary_row(
+    reports: Sequence[ResearchReport],
+    horizon: int,
+    portfolio_id: str,
+    *,
+    bootstrap_seed: int,
+    bootstrap_samples: int,
+) -> dict[str, Any]:
+    results = [report.portfolio_performance.get(portfolio_id, {}).get(horizon) for report in reports]
+    benchmark_results = [
+        report.benchmark_performance_by_portfolio.get(portfolio_id, {}).get(horizon) for report in reports
+    ]
+    values = np.asarray(
+        [
+            result.total_return
+            for result in results
+            if result and result.status == "COMPLETE" and result.total_return is not None
+        ],
+        dtype=float,
+    )
+    excess_values = np.asarray(
+        [
+            result.total_return - benchmark.total_return
+            for result, benchmark in zip(results, benchmark_results, strict=True)
+            if result
+            and benchmark
+            and result.status == "COMPLETE"
+            and benchmark.status == "COMPLETE"
+            and result.total_return is not None
+            and benchmark.total_return is not None
+        ],
+        dtype=float,
+    )
+    if values.size:
+        rng = np.random.default_rng(bootstrap_seed + int(horizon))
+        bootstrap_means = rng.choice(values, size=(bootstrap_samples, values.size), replace=True).mean(axis=1)
+        ci_low, ci_high = np.percentile(bootstrap_means, [2.5, 97.5]).tolist()
+        mean_return = float(values.mean())
+        median_return = float(np.median(values))
+        win_rate = float(np.mean(values > 0))
+        p25, p75 = np.percentile(values, [25, 75]).tolist()
+    else:
+        ci_low = ci_high = mean_return = median_return = win_rate = p25 = p75 = None
+    if excess_values.size:
+        rng = np.random.default_rng(bootstrap_seed + int(horizon) + 10_000)
+        excess_bootstrap = rng.choice(
+            excess_values,
+            size=(bootstrap_samples, excess_values.size),
+            replace=True,
+        ).mean(axis=1)
+        excess_ci_low, excess_ci_high = np.percentile(excess_bootstrap, [2.5, 97.5]).tolist()
+        mean_excess = float(excess_values.mean())
+        median_excess = float(np.median(excess_values))
+        excess_win_rate = float(np.mean(excess_values > 0))
+    else:
+        excess_ci_low = excess_ci_high = mean_excess = median_excess = excess_win_rate = None
+    return {
+        "horizon": horizon,
+        "sample_count": int(values.size),
+        "requested_count": len(reports),
+        "mean_return": mean_return,
+        "median_return": median_return,
+        "win_rate": win_rate,
+        "p25": None if p25 is None else float(p25),
+        "p75": None if p75 is None else float(p75),
+        "ci95_low": None if ci_low is None else float(ci_low),
+        "ci95_high": None if ci_high is None else float(ci_high),
+        "mean_excess": mean_excess,
+        "median_excess": median_excess,
+        "excess_win_rate": excess_win_rate,
+        "excess_sample_count": int(excess_values.size),
+        "excess_ci95_low": None if excess_ci_low is None else float(excess_ci_low),
+        "excess_ci95_high": None if excess_ci_high is None else float(excess_ci_high),
+        "evidence_label": _evidence_label(
+            excess_values,
+            float(excess_ci_low) if excess_ci_low is not None else None,
+            reports,
+            horizon,
+            portfolio_id=portfolio_id,
+        ),
+    }
+
+
+def _performance_payload(performance: HorizonPerformance) -> dict[str, Any]:
+    return {
+        "horizon": performance.horizon,
+        "status": performance.status,
+        "total_return": performance.total_return,
+        "max_drawdown": performance.max_drawdown,
+        "gross_return": performance.gross_return,
+        "evaluated_date": performance.evaluated_date.isoformat() if performance.evaluated_date else None,
+        "message": performance.message,
+        "holding_win_rate": performance.holding_win_rate,
+        "stock_returns": performance.stock_returns,
+        "stock_contributions": performance.stock_contributions,
+        "initial_cash": performance.initial_cash,
+        "ending_equity": performance.ending_equity,
+        "profit_loss": performance.profit_loss,
+        "max_drawdown_amount": performance.max_drawdown_amount,
+        "daily_volatility": performance.daily_volatility,
+        "annualized_return": performance.annualized_return,
+        "annualized_volatility": performance.annualized_volatility,
+        "sharpe": performance.sharpe,
+        "commission_paid": performance.commission_paid,
+        "slippage_paid": performance.slippage_paid,
+        "cash_residual": performance.cash_residual,
+    }
+
+
+def _performance_json(performance: dict[int, HorizonPerformance]) -> dict[str, dict[str, Any]]:
+    return {str(horizon): _performance_payload(result) for horizon, result in performance.items()}
+
+
+def _concat_portfolio_frames(frames: dict[str, pd.DataFrame]) -> pd.DataFrame:
+    if not frames:
+        return pd.DataFrame()
+    return pd.concat(list(frames.values()), ignore_index=True, sort=False)
+
+
+def _concat_nav_frames(frames: dict[str, pd.DataFrame]) -> pd.DataFrame:
+    rows: list[pd.DataFrame] = []
+    for portfolio_id, frame in frames.items():
+        data = frame.copy()
+        if "portfolio_id" not in data.columns:
+            data.insert(0, "portfolio_id", portfolio_id)
+        rows.append(data)
+    return pd.concat(rows, ignore_index=True, sort=False) if rows else pd.DataFrame()
+
+
+def _new_run_id(
+    spec: ResearchSpec,
+    signal_date: date,
+    candidates: pd.DataFrame,
+    portfolios: dict[str, pd.DataFrame],
+) -> str:
     digest = json_hash(
         {
             "requested_date": parse_date(spec.requested_date).isoformat(),
             "signal_date": signal_date.isoformat(),
-            "spec": spec.__dict__,
+            "spec": _jsonable(spec.__dict__),
             "candidates": candidates.to_dict("records"),
-            "portfolio": portfolio.to_dict("records"),
+            "portfolios": {portfolio_id: frame.to_dict("records") for portfolio_id, frame in portfolios.items()},
         }
     )[:10]
     return f"research-{pd.Timestamp.now(tz='UTC').strftime('%Y%m%dT%H%M%S%fZ')}-{digest}"
@@ -1122,7 +1907,19 @@ def _source_hash() -> str:
     return hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
 
 
+def _artifact_hashes(artifact_dir: Path, names: Sequence[str]) -> dict[str, str]:
+    """计算已写入的非 manifest 产物内容哈希；manifest 自身不能自包含哈希。"""
+
+    return {
+        name: hashlib.sha256((artifact_dir / name).read_bytes()).hexdigest()
+        for name in names
+        if (artifact_dir / name).is_file()
+    }
+
+
 def _jsonable(value: Any) -> Any:
+    if is_dataclass(value):
+        return _jsonable(asdict(value))
     if isinstance(value, dict):
         return {str(k): _jsonable(v) for k, v in value.items()}
     if isinstance(value, (list, tuple)):
@@ -1143,3 +1940,11 @@ def _jsonable(value: Any) -> Any:
     except (TypeError, ValueError):
         pass
     return value
+
+
+def _data_binding_metadata(binding: Any) -> dict[str, Any]:
+    if hasattr(binding, "to_dict"):
+        value = binding.to_dict()
+        if isinstance(value, dict):
+            return value
+    return {"db_path": str(getattr(binding, "db_path", binding)), "source": "local-duckdb"}

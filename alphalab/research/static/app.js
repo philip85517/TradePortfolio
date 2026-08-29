@@ -1,7 +1,7 @@
 (() => {
   "use strict";
 
-  const state = { mode: "selection", summary: null, candidates: [], visible: [], selectedSymbol: null, detail: null, portfolio: null, chart: null };
+  const state = { mode: "selection", summary: null, candidates: [], visible: [], selectedSymbol: null, detail: null, portfolio: null, portfolioId: null, portfolioIds: [], chart: null };
   const $ = (id) => document.getElementById(id);
 
   function escapeHtml(value) {
@@ -60,6 +60,22 @@
       option.textContent = value;
       industry.appendChild(option);
     }
+    renderPortfolioOptions(summary.portfolios || []);
+  }
+
+  function renderPortfolioOptions(portfolios) {
+    const select = $("portfolioSelect");
+    const values = (portfolios || []).filter((item) => item?.portfolio_id).map((item) => ({
+      id: String(item.portfolio_id),
+      name: item.name || item.portfolio_id,
+    }));
+    state.portfolioIds = values.map((item) => item.id);
+    if (!state.portfolioId || !state.portfolioIds.includes(state.portfolioId)) state.portfolioId = state.portfolioIds[0] || null;
+    select.innerHTML = values.length
+      ? values.map((item) => `<option value="${escapeHtml(item.id)}">${escapeHtml(item.name)} · ${escapeHtml(item.id)}</option>`).join("")
+      : "<option>暂无组合</option>";
+    select.value = state.portfolioId || "";
+    select.disabled = values.length < 2;
   }
 
   function renderCandidates(rows) {
@@ -136,6 +152,8 @@
       panel.hidden = true;
       return;
     }
+    state.portfolioId = payload.portfolio_id || state.portfolioId;
+    if (state.portfolioIds.includes(state.portfolioId)) $("portfolioSelect").value = state.portfolioId;
     panel.hidden = false;
     const holdings = payload.holdings || [];
     const performance = payload.performance || {};
@@ -152,7 +170,12 @@
     if (primaryComparison && primaryComparison.total_return_delta !== null && primaryComparison.total_return_delta !== undefined) {
       metricValues.push([`${primaryHorizon}日相对基准`, percent(primaryComparison.total_return_delta)]);
     }
-    $("portfolioMetricsGrid").innerHTML = metricValues.map(([label, value]) => `<div class="performance-card"><span>${label}</span><strong>${escapeHtml(value)}</strong></div>`).join("");
+    const portfolioHtml = (payload.portfolios || []).map((portfolio) => {
+      const result = (portfolio.performance || {})[primaryHorizon] || {};
+      const profit = result.profit_loss === null || result.profit_loss === undefined ? "--" : number(result.profit_loss);
+      return `<div class="performance-card"><span>${escapeHtml(portfolio.name || portfolio.portfolio_id)} · ${primaryHorizon}日</span><strong>${percent(result.total_return)}</strong><small>本金 ${number(portfolio.initial_cash, 0)} · 盈亏 ${profit}</small></div>`;
+    }).join("");
+    $("portfolioMetricsGrid").innerHTML = metricValues.map(([label, value]) => `<div class="performance-card"><span>${label}</span><strong>${escapeHtml(value)}</strong></div>`).join("") + portfolioHtml;
     $("portfolioStatusBadge").textContent = complete.length ? "已完成" : "不可评估";
     $("portfolioStatusBadge").className = `badge ${complete.length ? "accent" : ""}`;
     $("portfolioGrid").innerHTML = holdings.length
@@ -210,7 +233,8 @@
   }
 
   function loadPortfolio() {
-    return api("/api/portfolio").then((payload) => { state.portfolio = payload; renderPortfolio(payload); return payload; });
+    const query = state.portfolioId ? `?${new URLSearchParams({ portfolio_id: state.portfolioId })}` : "";
+    return api(`/api/portfolio${query}`).then((payload) => { state.portfolio = payload; renderPortfolio(payload); return payload; });
   }
 
   function renderDetail(detail) {
@@ -234,7 +258,9 @@
     if (!symbol) return;
     state.selectedSymbol = symbol;
     renderCandidates(state.visible);
-    api(`/api/stock?${new URLSearchParams({ symbol, mode: state.mode })}`).then(renderDetail).catch(showError);
+    const params = { symbol, mode: state.mode };
+    if (state.portfolioId) params.portfolio_id = state.portfolioId;
+    api(`/api/stock?${new URLSearchParams(params)}`).then(renderDetail).catch(showError);
   }
 
   function switchMode(mode) {
@@ -302,6 +328,13 @@
   $("status").addEventListener("change", () => loadCandidates().catch(showError));
   $("industry").addEventListener("change", () => loadCandidates().catch(showError));
   $("reason").addEventListener("change", () => loadCandidates().catch(showError));
+  $("portfolioSelect").addEventListener("change", () => {
+    state.portfolioId = $("portfolioSelect").value || null;
+    state.portfolio = null;
+    if (state.mode === "evaluation") {
+      loadPortfolio().then(() => { if (state.selectedSymbol) selectSymbol(state.selectedSymbol); }).catch(showError);
+    }
+  });
   $("selectionMode").addEventListener("click", () => switchMode("selection"));
   $("evaluationMode").addEventListener("click", () => switchMode("evaluation"));
   $("previousButton").addEventListener("click", () => move(-1));

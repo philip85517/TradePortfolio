@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 import tempfile
+from datetime import date
 from pathlib import Path
 
 import pandas as pd
@@ -21,7 +23,15 @@ from ..config import (
 )
 from ..data import Universe
 from ..data.loader import load_etf_metadata, load_market_data
-from ..research import DuckDBMarketDataAdapter, HistoricalResearchLab, ResearchRunStore, ResearchSpec
+from ..research import (
+    DuckDBMarketDataAdapter,
+    HistoricalResearchLab,
+    PortfolioSpec,
+    ResearchRunStore,
+    ResearchSpec,
+    auto_bind_research_db,
+    ensure_research_data,
+)
 from ..research.review import serve_review
 from ..storage import PaperDatabase
 from ..utils import money_round, normalize_symbol, parse_date
@@ -46,7 +56,7 @@ DEFAULT_SEED_SYMBOLS = [
     ("513050.SH", "中概互联网ETF易方达", "HK_TECH"),
 ]
 
-DEFAULT_RESEARCH_DB = REPO_ROOT / "etf_strategy" / "data" / "processed" / "stock_market_data_2021.duckdb"
+DEFAULT_RESEARCH_DB = "auto"
 DEFAULT_RESEARCH_RUNS = REPO_ROOT / "alphalab" / "reports" / "research"
 
 
@@ -386,9 +396,18 @@ def cmd_demo(args) -> int:
 
 def cmd_research_run(args) -> int:
     """运行固定 V0 历史截面研究。"""
-    adapter = DuckDBMarketDataAdapter(args.db)
-    lab = HistoricalResearchLab(adapter, args.runs_dir)
     horizons = _parse_research_horizons(args.horizons)
+    requested_date = parse_date(args.as_of)
+    start_date, end_date = _research_data_window((requested_date,), horizons)
+    binding = _bind_research_data(
+        args.db,
+        args.market,
+        start_date,
+        end_date,
+        require_point_in_time=args.universe_mode == "point-in-time",
+    )
+    adapter = DuckDBMarketDataAdapter(binding.db_path, binding.universe_db_path)
+    lab = HistoricalResearchLab(adapter, args.runs_dir, data_binding=binding)
     spec = ResearchSpec(
         requested_date=args.as_of,
         rule_version=args.rule_version,
@@ -403,23 +422,30 @@ def cmd_research_run(args) -> int:
         max_industry_weight=args.max_industry_weight,
         min_holdings=args.min_holdings,
         universe_mode=args.universe_mode,
+        data_quality_mode=args.data_quality_mode,
+        factor_params=_parse_factor_params(args.factor_params),
+        portfolios=_parse_portfolio_specs(args.portfolio),
     )
     result = lab.run(spec)
+    print(f"  数据源: {binding.db_path} | 覆盖 {binding.min_date} → {binding.max_date} | {binding.coverage_status}")
     print(f"[research] 请求日期 {result.requested_date} | 有效信号日 {result.signal_date}")
     funnel = result.diagnostics.get("funnel", {})
     print(
         f"  universe {funnel.get('universe', 0)} → 合格 {funnel.get('rule_eligible', 0)}"
         f" → Top {len(result.portfolio)}"
     )
-    for horizon in sorted(result.performance):
-        performance = result.performance[horizon]
-        if performance.status == "COMPLETE":
-            print(
-                f"  {horizon}日: 收益 {performance.total_return:.2%}"
-                f" | 最大回撤 {performance.max_drawdown:.2%}"
-            )
-        else:
-            print(f"  {horizon}日: {performance.status}（{performance.message}）")
+    for portfolio_id, portfolio_performance in result.portfolio_performance.items():
+        print(f"  Portfolio {portfolio_id} | 本金 {portfolio_performance[next(iter(portfolio_performance))].initial_cash if portfolio_performance else '--'}")
+        for horizon in sorted(portfolio_performance):
+            performance = portfolio_performance[horizon]
+            if performance.status == "COMPLETE":
+                print(
+                    f"    {horizon}日: 收益 {performance.total_return:.2%}"
+                    f" | 盈亏 {performance.profit_loss:,.2f}"
+                    f" | 最大回撤 {performance.max_drawdown:.2%}"
+                )
+            else:
+                print(f"    {horizon}日: {performance.status}（{performance.message}）")
     print(f"  运行 ID: {result.run_id}")
     print(f"  产物: {result.artifact_dir}")
     return 0
@@ -446,11 +472,94 @@ def _parse_research_dates(value: str) -> tuple[str, ...]:
         raise ValueError("as-of 必须是逗号分隔的 YYYY-MM-DD 日期") from exc
 
 
+def _parse_portfolio_specs(values: list[str] | None) -> tuple[PortfolioSpec, ...]:
+    """解析 CLI 的 ``id=initial_cash`` 重复参数。"""
+
+    if not values:
+        return ()
+    specs: list[PortfolioSpec] = []
+    seen: set[str] = set()
+    for value in values:
+        text = str(value).strip()
+        if "=" not in text:
+            raise ValueError("portfolio 参数必须使用 id=initial_cash 格式")
+        portfolio_id, cash_text = (part.strip() for part in text.split("=", 1))
+        if not portfolio_id:
+            raise ValueError("portfolio id 不能为空")
+        if portfolio_id in seen:
+            raise ValueError(f"portfolio id 重复: {portfolio_id}")
+        try:
+            initial_cash = float(cash_text)
+        except ValueError as exc:
+            raise ValueError(f"portfolio {portfolio_id} 的本金不是有效数字") from exc
+        if initial_cash <= 0:
+            raise ValueError(f"portfolio {portfolio_id} 的本金必须为正数")
+        seen.add(portfolio_id)
+        specs.append(PortfolioSpec(portfolio_id=portfolio_id, initial_cash=initial_cash))
+    return tuple(specs)
+
+
+def _parse_factor_params(value: str | None) -> dict:
+    if not value:
+        return {}
+    try:
+        params = json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise ValueError("factor-params 必须是 JSON 对象") from exc
+    if not isinstance(params, dict):
+        raise ValueError("factor-params 必须是 JSON 对象")
+    return params
+
+
+def _research_data_window(dates: tuple[date | str, ...], horizons: tuple[int, ...]) -> tuple[date, date]:
+    parsed = [parse_date(value) for value in dates]
+    return (
+        (pd.Timestamp(min(parsed)) - pd.Timedelta(days=450)).date(),
+        (pd.Timestamp(max(parsed)) + pd.Timedelta(days=max(horizons) * 3 + 15)).date(),
+    )
+
+
+def _bind_research_data(
+    db_path: str,
+    market: str,
+    start_date: date,
+    end_date: date,
+    *,
+    require_point_in_time: bool = False,
+):
+    if str(db_path).strip().lower() in {"", "auto"}:
+        return ensure_research_data(
+            db_path=db_path,
+            market=market,
+            start_date=start_date,
+            end_date=end_date,
+            require_point_in_time=require_point_in_time,
+        )
+    if require_point_in_time:
+        return ensure_research_data(
+            db_path=db_path,
+            market=market,
+            start_date=start_date,
+            end_date=end_date,
+            require_point_in_time=True,
+        )
+    return auto_bind_research_db(db_path=db_path, market=market)
+
+
 def cmd_research_study(args) -> int:
     """在多个历史截面重复运行固定因子并输出描述性汇总。"""
-    adapter = DuckDBMarketDataAdapter(args.db)
-    lab = HistoricalResearchLab(adapter, args.runs_dir)
     horizons = _parse_research_horizons(args.horizons)
+    requested_dates = _parse_research_dates(args.as_of)
+    start_date, end_date = _research_data_window(requested_dates, horizons)
+    binding = _bind_research_data(
+        args.db,
+        args.market,
+        start_date,
+        end_date,
+        require_point_in_time=args.universe_mode == "point-in-time",
+    )
+    adapter = DuckDBMarketDataAdapter(binding.db_path, binding.universe_db_path)
+    lab = HistoricalResearchLab(adapter, args.runs_dir, data_binding=binding)
     specs = tuple(
         ResearchSpec(
             requested_date=requested_date,
@@ -466,37 +575,60 @@ def cmd_research_study(args) -> int:
             max_industry_weight=args.max_industry_weight,
             min_holdings=args.min_holdings,
             universe_mode=args.universe_mode,
+            data_quality_mode=args.data_quality_mode,
+            factor_params=_parse_factor_params(args.factor_params),
+            portfolios=_parse_portfolio_specs(args.portfolio),
         )
-        for requested_date in _parse_research_dates(args.as_of)
+        for requested_date in requested_dates
     )
     result = lab.run_study(specs, bootstrap_seed=args.bootstrap_seed, bootstrap_samples=args.bootstrap_samples)
+    print(f"[research] 数据源: {binding.db_path} | 覆盖 {binding.min_date} → {binding.max_date} | {binding.coverage_status}")
     print(f"[research] study {result.study_id} | 截面 {len(result.reports)} 个")
-    for row in result.summary.to_dict("records"):
-        if row["sample_count"]:
-            excess_text = (
-                f" | 超额均值 {row['mean_excess']:.2%}"
-                f" | 超额95% CI [{row['excess_ci95_low']:.2%}, {row['excess_ci95_high']:.2%}]"
-                if row.get("excess_sample_count")
-                else " | 超额收益无可评估样本"
-            )
-            print(
-                f"  {row['horizon']}日: 样本 {row['sample_count']}/{row['requested_count']}"
-                f" | 均值 {row['mean_return']:.2%} | 胜率 {row['win_rate']:.2%}"
-                f"{excess_text}"
-                f" | {row['evidence_label']}"
-            )
-        else:
-            print(f"  {row['horizon']}日: 无可评估样本 | {row['evidence_label']}")
+    def print_study_rows(rows, prefix: str = ""):
+        for row in rows:
+            if row["sample_count"]:
+                excess_text = (
+                    f" | 超额均值 {row['mean_excess']:.2%}"
+                    f" | 超额95% CI [{row['excess_ci95_low']:.2%}, {row['excess_ci95_high']:.2%}]"
+                    if row.get("excess_sample_count")
+                    else " | 超额收益无可评估样本"
+                )
+                print(
+                    f"{prefix}{row['horizon']}日: 样本 {row['sample_count']}/{row['requested_count']}"
+                    f" | 均值 {row['mean_return']:.2%} | 胜率 {row['win_rate']:.2%}"
+                    f"{excess_text}"
+                    f" | {row['evidence_label']}"
+                )
+            else:
+                print(f"{prefix}{row['horizon']}日: 无可评估样本 | {row['evidence_label']}")
+
+    portfolio_ids = result.portfolio_summary["portfolio_id"].drop_duplicates().astype(str).tolist()
+    if len(portfolio_ids) <= 1:
+        print_study_rows(result.summary.to_dict("records"), "  ")
+    else:
+        for portfolio_id in portfolio_ids:
+            print(f"  Portfolio {portfolio_id}")
+            rows = result.portfolio_summary[
+                result.portfolio_summary["portfolio_id"].astype(str) == portfolio_id
+            ].to_dict("records")
+            print_study_rows(rows, "    ")
     print(f"  产物: {result.artifact_dir}")
     return 0
 
 
 def cmd_research_review(args) -> int:
     """启动固定研究运行的只读候选审阅页。"""
+    review_db = args.db
+    if str(review_db).strip().lower() in {"", "auto"}:
+        manifest = ResearchRunStore(args.runs_dir).manifest(args.run_id)
+        recorded = manifest.get("diagnostics", {}).get("data_source", {}).get("db_path")
+        if recorded and Path(str(recorded)).is_file():
+            review_db = recorded
+    binding = auto_bind_research_db(db_path=review_db, market="a_share")
     serve_review(
         run_id=args.run_id,
         runs_dir=args.runs_dir,
-        db_path=args.db,
+        db_path=binding.db_path,
         host=args.host,
         port=args.port,
     )
@@ -521,8 +653,26 @@ def cmd_research_list(args) -> int:
         print(
             f"{item['run_id']} | 请求 {item.get('requested_date', '--')}"
             f" | 信号 {item.get('signal_date', '--')} | 规则 {item.get('rule_version', '--')}"
+            f" | 状态 {item.get('status', 'COMPLETE')}"
             f" | 持仓 {item.get('selected_count', 0)} | {'; '.join(metrics) or '无指标'}"
         )
+        if item.get("status") == "FAILED":
+            print(f"  错误: {item.get('error') or '--'}")
+        for portfolio in item.get("portfolios", []):
+            horizon_text = []
+            for horizon, result in sorted(portfolio.get("performance", {}).items(), key=lambda pair: int(pair[0])):
+                if result.get("total_return") is None:
+                    horizon_text.append(f"{horizon}日 {result.get('status', '--')}")
+                else:
+                    horizon_text.append(
+                        f"{horizon}日 收益 {float(result['total_return']):.2%}"
+                        f" 盈亏 {float(result.get('profit_loss', 0.0)):+,.2f}"
+                        f" 回撤 {float(result.get('max_drawdown', 0.0)):.2%}"
+                    )
+            print(
+                f"  Portfolio {portfolio['portfolio_id']} | 本金 {portfolio.get('initial_cash', '--')}"
+                f" | {'; '.join(horizon_text) or '无指标'}"
+            )
     return 0
 
 
@@ -535,13 +685,38 @@ def cmd_research_show(args) -> int:
     print(f"  请求日期: {manifest.get('requested_date', '--')} | 有效信号日: {manifest.get('signal_date', '--')}")
     print(f"  规则: {manifest.get('rule_version', '--')} | Top N: {spec.get('top_n', '--')} | 市场: {spec.get('market', '--')}")
     print(f"  数据范围: {' → '.join(str(value) for value in diagnostics.get('data_range', [])) or '--'}")
+    portfolios = manifest.get("portfolios", [])
+    if portfolios:
+        print("  Portfolio:")
+        for portfolio in portfolios:
+            print(
+                f"    {portfolio.get('portfolio_id', '--')} ({portfolio.get('name', '--')})"
+                f" | 本金 {portfolio.get('initial_cash', '--')}"
+            )
     for horizon, result in sorted(manifest.get("performance", {}).items(), key=lambda item: int(item[0])):
         total = result.get("total_return")
         drawdown = result.get("max_drawdown")
         if total is None:
             print(f"  {horizon}日: {result.get('status', '--')}（{result.get('message') or ''}）")
         else:
-            print(f"  {horizon}日: 收益 {float(total):.2%} | 最大回撤 {float(drawdown):.2%}")
+            print(
+                f"  {horizon}日: 收益 {float(total):.2%}"
+                f" | 盈亏 {float(result.get('profit_loss', 0.0)):.2f}"
+                f" | 最大回撤 {float(drawdown):.2%}"
+            )
+    for portfolio_id, results in manifest.get("portfolio_performance", {}).items():
+        if len(manifest.get("portfolio_performance", {})) <= 1:
+            continue
+        print(f"  [{portfolio_id}]")
+        for horizon, result in sorted(results.items(), key=lambda item: int(item[0])):
+            if result.get("total_return") is None:
+                print(f"    {horizon}日: {result.get('status', '--')}")
+            else:
+                print(
+                    f"    {horizon}日: 收益 {float(result['total_return']):.2%}"
+                    f" | 盈亏 {float(result.get('profit_loss', 0.0)):.2f}"
+                    f" | 最大回撤 {float(result.get('max_drawdown', 0.0)):.2%}"
+                )
     return 0
 
 
@@ -561,6 +736,18 @@ def cmd_research_compare(args) -> int:
             f"  {horizon}日: 收益差 {float(delta):+.2%}" if delta is not None else f"  {horizon}日: 收益差 --",
             f"| 回撤差 {float(drawdown_delta):+.2%}" if drawdown_delta is not None else "| 回撤差 --",
         )
+    for portfolio_id, results in comparison.get("portfolios", {}).items():
+        for horizon, result in results.items():
+            delta = result.get("total_return_delta")
+            profit_delta = result.get("profit_loss_delta")
+            drawdown_delta = result.get("max_drawdown_delta")
+            print(
+                f"  Portfolio {portfolio_id} {horizon}日: 收益差 {float(delta):+.2%}"
+                if delta is not None
+                else f"  Portfolio {portfolio_id} {horizon}日: 收益差 --",
+                f"| 盈亏差 {float(profit_delta):+,.2f}" if profit_delta is not None else "| 盈亏差 --",
+                f"| 回撤差 {float(drawdown_delta):+.2%}" if drawdown_delta is not None else "| 回撤差 --",
+            )
     return 0
 
 
@@ -646,10 +833,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_research_run = research_sub.add_parser("run", help="运行固定 V0 选股与组合前瞻回测")
     p_research_run.add_argument("--as-of", required=True, help="请求的历史日期，例如 2025-07-01")
     p_research_run.add_argument("--rule-version", default="fixed_v0", help="因子插件版本，当前支持 fixed_v0")
-    p_research_run.add_argument("--db", default=str(DEFAULT_RESEARCH_DB), help="只读股票行情 DuckDB")
+    p_research_run.add_argument("--factor-params", default=None, help="因子参数 JSON 对象")
+    p_research_run.add_argument("--db", default=DEFAULT_RESEARCH_DB, help="行情 DuckDB；默认自动发现本机已有开源数据库")
     p_research_run.add_argument("--runs-dir", default=str(DEFAULT_RESEARCH_RUNS), help="研究产物目录")
     p_research_run.add_argument("--top-n", type=int, default=10)
     p_research_run.add_argument("--initial-cash", type=float, default=100000.0)
+    p_research_run.add_argument("--portfolio", action="append", default=None, help="独立组合本金，格式 id=initial_cash，可重复")
     p_research_run.add_argument("--horizons", default="21,42", help="观察周期，逗号分隔交易日，例如 21,42")
     p_research_run.add_argument("--commission-rate", type=float, default=0.0003, help="单边佣金比例")
     p_research_run.add_argument("--slippage-rate", type=float, default=0.0005, help="单边滑点比例")
@@ -659,10 +848,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_research_run.add_argument("--max-industry-weight", type=float, default=None)
     p_research_run.add_argument("--min-holdings", type=int, default=0)
     p_research_run.add_argument("--universe-mode", choices=["observed-history", "point-in-time"], default="observed-history")
+    p_research_run.add_argument("--data-quality-mode", choices=["exploratory", "strict"], default="exploratory")
     p_research_run.set_defaults(func=cmd_research_run)
     p_research_review = research_sub.add_parser("review", help="启动固定运行的只读候选审阅页")
     p_research_review.add_argument("--run-id", required=True, help="research run ID")
-    p_research_review.add_argument("--db", default=str(DEFAULT_RESEARCH_DB), help="只读股票行情 DuckDB")
+    p_research_review.add_argument("--db", default=DEFAULT_RESEARCH_DB, help="行情 DuckDB；默认自动发现本机已有开源数据库")
     p_research_review.add_argument("--runs-dir", default=str(DEFAULT_RESEARCH_RUNS), help="研究产物目录")
     p_research_review.add_argument("--host", default="127.0.0.1")
     p_research_review.add_argument("--port", type=int, default=8787)
@@ -681,11 +871,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_research_compare.set_defaults(func=cmd_research_compare)
     p_research_study = research_sub.add_parser("study", help="多个历史截面研究汇总")
     p_research_study.add_argument("--as-of", required=True, help="逗号分隔的历史日期，例如 2024-01-01,2024-04-01")
-    p_research_study.add_argument("--db", default=str(DEFAULT_RESEARCH_DB), help="只读股票行情 DuckDB")
+    p_research_study.add_argument("--db", default=DEFAULT_RESEARCH_DB, help="行情 DuckDB；默认自动发现本机已有开源数据库")
     p_research_study.add_argument("--runs-dir", default=str(DEFAULT_RESEARCH_RUNS), help="研究产物目录")
     p_research_study.add_argument("--rule-version", default="fixed_v0", help="因子插件版本，当前支持 fixed_v0")
+    p_research_study.add_argument("--factor-params", default=None, help="因子参数 JSON 对象")
     p_research_study.add_argument("--top-n", type=int, default=10)
     p_research_study.add_argument("--initial-cash", type=float, default=100000.0)
+    p_research_study.add_argument("--portfolio", action="append", default=None, help="独立组合本金，格式 id=initial_cash，可重复")
     p_research_study.add_argument("--horizons", default="21,42", help="观察周期，逗号分隔交易日")
     p_research_study.add_argument("--commission-rate", type=float, default=0.0003, help="单边佣金比例")
     p_research_study.add_argument("--slippage-rate", type=float, default=0.0005, help="单边滑点比例")
@@ -695,6 +887,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_research_study.add_argument("--max-industry-weight", type=float, default=None)
     p_research_study.add_argument("--min-holdings", type=int, default=0)
     p_research_study.add_argument("--universe-mode", choices=["observed-history", "point-in-time"], default="observed-history")
+    p_research_study.add_argument("--data-quality-mode", choices=["exploratory", "strict"], default="exploratory")
     p_research_study.add_argument("--bootstrap-seed", type=int, default=0)
     p_research_study.add_argument("--bootstrap-samples", type=int, default=2000)
     p_research_study.set_defaults(func=cmd_research_study)

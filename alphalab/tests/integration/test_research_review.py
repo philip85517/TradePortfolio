@@ -12,7 +12,7 @@ import duckdb
 import pandas as pd
 import pytest
 
-from alphalab.research import HistoricalResearchLab, InMemoryMarketDataAdapter, ResearchSpec
+from alphalab.research import HistoricalResearchLab, InMemoryMarketDataAdapter, PortfolioSpec, ResearchSpec
 from alphalab.research.review import ReviewState, create_review_server, load_review_run
 
 
@@ -42,12 +42,18 @@ def _bars() -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def _state(tmp_path) -> ReviewState:
+def _state(tmp_path, *, multiple: bool = False) -> ReviewState:
     bars = _bars()
     run_dir = tmp_path / "runs"
-    report = HistoricalResearchLab(InMemoryMarketDataAdapter(bars), runs_dir=run_dir).run(
-        ResearchSpec(requested_date="2025-06-30", top_n=2, horizons=(3, 5))
-    )
+    spec = ResearchSpec(requested_date="2025-06-30", top_n=2, horizons=(3, 5))
+    if multiple:
+        spec = ResearchSpec(
+            requested_date="2025-06-30",
+            top_n=2,
+            horizons=(3, 5),
+            portfolios=(PortfolioSpec("small", initial_cash=50_000), PortfolioSpec("large", initial_cash=200_000)),
+        )
+    report = HistoricalResearchLab(InMemoryMarketDataAdapter(bars), runs_dir=run_dir).run(spec)
     db_path = tmp_path / "market.duckdb"
     con = duckdb.connect(str(db_path))
     con.execute(
@@ -118,19 +124,56 @@ def test_review_portfolio_payload_exposes_nav_and_holdings(tmp_path):
     assert {"date", "equity", "drawdown"}.issubset(payload["nav"][0])
 
 
+def test_review_portfolio_payload_exposes_each_portfolio_metrics(tmp_path):
+    state = _state(tmp_path, multiple=True)
+
+    payload = state.portfolio_detail()
+
+    assert {item["portfolio_id"] for item in payload["portfolios"]} == {"small", "large"}
+    by_id = {item["portfolio_id"]: item for item in payload["portfolios"]}
+    assert by_id["small"]["initial_cash"] == 50_000
+    assert by_id["large"]["performance"]["3"]["profit_loss"] > by_id["small"]["performance"]["3"]["profit_loss"]
+
+
+def test_review_portfolio_selection_returns_selected_holdings_and_nav(tmp_path):
+    state = _state(tmp_path, multiple=True)
+
+    payload = state.portfolio_detail("large")
+    stock = state.stock_detail("300468", mode="evaluation", portfolio_id="large")
+
+    assert payload["portfolio_id"] == "large"
+    assert payload["portfolio_ids"] == ["small", "large"]
+    assert payload["performance"]["3"]["initial_cash"] == 200_000
+    assert payload["holdings"]
+    assert all(row["portfolio_id"] == "large" for row in payload["holdings"])
+    assert payload["nav"]
+    assert all(row["portfolio_id"] == "large" for row in payload["nav"])
+    assert stock["portfolio_id"] == "large"
+    assert stock["portfolio"]["portfolio_id"] == "large"
+    assert stock["portfolio_performance"]["3"]["initial_cash"] == 200_000
+
+
+def test_review_rejects_unknown_portfolio(tmp_path):
+    state = _state(tmp_path, multiple=True)
+
+    with pytest.raises(KeyError, match="组合不存在"):
+        state.portfolio_detail("missing")
+
+
 def test_review_portfolio_endpoint_is_read_only(tmp_path):
-    state = _state(tmp_path)
+    state = _state(tmp_path, multiple=True)
     server = create_review_server(state)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
-        payload = _get_json(server, "/api/portfolio")
+        payload = _get_json(server, "/api/portfolio?portfolio_id=large")
     finally:
         server.shutdown()
         thread.join(timeout=2)
         server.server_close()
 
     assert payload["status"] == "OK"
+    assert payload["portfolio_id"] == "large"
     assert payload["nav"]
     assert payload["holdings"]
 
@@ -193,3 +236,12 @@ def test_missing_or_incomplete_run_is_rejected(tmp_path):
 
     with pytest.raises(ValueError, match="产物不完整"):
         load_review_run(tmp_path / "runs", "bad")
+
+
+def test_review_rejects_modified_hashed_artifact(tmp_path):
+    state = _state(tmp_path)
+    portfolio_nav = state.run.run_dir / "portfolio_nav.csv"
+    portfolio_nav.write_text(portfolio_nav.read_text(encoding="utf-8") + "\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="内容哈希不匹配"):
+        load_review_run(state.run.run_dir.parent, state.run.manifest["run_id"])

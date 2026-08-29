@@ -29,9 +29,12 @@ class ResearchRunStore:
             if not run_id or manifest_path.parent.name != run_id:
                 continue
             performance = manifest.get("performance", {})
+            portfolio_performance = manifest.get("portfolio_performance", {"strategy": performance})
             summaries.append(
                 {
                     "run_id": run_id,
+                    "status": manifest.get("status", "COMPLETE"),
+                    "error": manifest.get("error"),
                     "requested_date": manifest.get("requested_date"),
                     "signal_date": manifest.get("signal_date"),
                     "rule_version": manifest.get("rule_version"),
@@ -45,6 +48,7 @@ class ResearchRunStore:
                         }
                         for horizon, result in performance.items()
                     },
+                    "portfolios": _portfolio_summaries(manifest, portfolio_performance),
                 }
             )
         return sorted(summaries, key=lambda item: item["run_id"])
@@ -86,6 +90,44 @@ class ResearchRunStore:
                 "right_max_drawdown": right_result.get("max_drawdown"),
                 "max_drawdown_delta": _delta(left_result.get("max_drawdown"), right_result.get("max_drawdown")),
             }
+        left_portfolios = left.get("portfolio_performance", {"strategy": left.get("performance", {})})
+        right_portfolios = right.get("portfolio_performance", {"strategy": right.get("performance", {})})
+        portfolio_ids = sorted(set(left_portfolios) | set(right_portfolios))
+        left_portfolio_symbols = self._portfolio_symbols_by_id(left_run_id, left_portfolios)
+        right_portfolio_symbols = self._portfolio_symbols_by_id(right_run_id, right_portfolios)
+        portfolio_comparison: dict[str, dict[str, Any]] = {}
+        for portfolio_id in portfolio_ids:
+            left_results = left_portfolios.get(portfolio_id, {})
+            right_results = right_portfolios.get(portfolio_id, {})
+            portfolio_horizons = sorted(
+                {str(key) for key in left_results} | {str(key) for key in right_results},
+                key=lambda value: int(value),
+            )
+            portfolio_comparison[portfolio_id] = {
+                horizon: {
+                    "left_initial_cash": left_results.get(horizon, {}).get("initial_cash"),
+                    "right_initial_cash": right_results.get(horizon, {}).get("initial_cash"),
+                    "left_profit_loss": left_results.get(horizon, {}).get("profit_loss"),
+                    "right_profit_loss": right_results.get(horizon, {}).get("profit_loss"),
+                    "profit_loss_delta": _delta(
+                        left_results.get(horizon, {}).get("profit_loss"),
+                        right_results.get(horizon, {}).get("profit_loss"),
+                    ),
+                    "left_total_return": left_results.get(horizon, {}).get("total_return"),
+                    "right_total_return": right_results.get(horizon, {}).get("total_return"),
+                    "total_return_delta": _delta(
+                        left_results.get(horizon, {}).get("total_return"),
+                        right_results.get(horizon, {}).get("total_return"),
+                    ),
+                    "left_max_drawdown": left_results.get(horizon, {}).get("max_drawdown"),
+                    "right_max_drawdown": right_results.get(horizon, {}).get("max_drawdown"),
+                    "max_drawdown_delta": _delta(
+                        left_results.get(horizon, {}).get("max_drawdown"),
+                        right_results.get(horizon, {}).get("max_drawdown"),
+                    ),
+                }
+                for horizon in portfolio_horizons
+            }
         return {
             "left": _identity(left),
             "right": _identity(right),
@@ -95,7 +137,25 @@ class ResearchRunStore:
                 "added": sorted(set(right_symbols) - set(left_symbols)),
                 "removed": sorted(set(left_symbols) - set(right_symbols)),
             },
+            "portfolio_symbols": {
+                portfolio_id: {
+                    "left": left_portfolio_symbols.get(portfolio_id, []),
+                    "right": right_portfolio_symbols.get(portfolio_id, []),
+                    "added": sorted(
+                        set(right_portfolio_symbols.get(portfolio_id, []))
+                        - set(left_portfolio_symbols.get(portfolio_id, []))
+                    ),
+                    "removed": sorted(
+                        set(left_portfolio_symbols.get(portfolio_id, []))
+                        - set(right_portfolio_symbols.get(portfolio_id, []))
+                    ),
+                }
+                for portfolio_id in sorted(
+                    set(left_portfolio_symbols) | set(right_portfolio_symbols) | set(portfolio_ids)
+                )
+            },
             "performance": performance,
+            "portfolios": portfolio_comparison,
         }
 
     def _run_dir(self, run_id: str) -> Path:
@@ -115,6 +175,58 @@ class ResearchRunStore:
         if "symbol" not in frame.columns:
             return []
         return frame["symbol"].dropna().astype(str).tolist()
+
+    def _portfolio_symbols_by_id(
+        self,
+        run_id: str,
+        performance: dict[str, Any],
+    ) -> dict[str, list[str]]:
+        """读取每个组合的冻结持仓；兼容早期只有 primary 产物的运行。"""
+        aggregate_path = self._run_dir(run_id) / "portfolios.csv"
+        if aggregate_path.is_file():
+            frame = pd.read_csv(aggregate_path, dtype={"symbol": "string", "portfolio_id": "string"})
+            if {"portfolio_id", "symbol"}.issubset(frame.columns):
+                return {
+                    str(portfolio_id): group["symbol"].dropna().astype(str).tolist()
+                    for portfolio_id, group in frame.groupby("portfolio_id", sort=False)
+                }
+        return {str(portfolio_id): self._portfolio_symbols(run_id) for portfolio_id in performance}
+
+
+def _portfolio_summaries(manifest: dict[str, Any], performance: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
+    configs = {str(item.get("portfolio_id")): item for item in manifest.get("portfolios", [])}
+    portfolio_ids = list(dict.fromkeys(list(configs) + [str(portfolio_id) for portfolio_id in performance]))
+    summaries = []
+    for portfolio_id in portfolio_ids:
+        results = performance.get(portfolio_id, {})
+        config = configs.get(str(portfolio_id), {})
+        summaries.append(
+            {
+                "portfolio_id": str(portfolio_id),
+                "name": config.get("name", portfolio_id),
+                "initial_cash": config.get("initial_cash"),
+                "performance": {
+                    str(horizon): {
+                        "status": result.get("status"),
+                        "initial_cash": result.get("initial_cash"),
+                        "ending_equity": result.get("ending_equity"),
+                        "profit_loss": result.get("profit_loss"),
+                        "total_return": result.get("total_return"),
+                        "max_drawdown": result.get("max_drawdown"),
+                        "max_drawdown_amount": result.get("max_drawdown_amount"),
+                        "daily_volatility": result.get("daily_volatility"),
+                        "annualized_return": result.get("annualized_return"),
+                        "annualized_volatility": result.get("annualized_volatility"),
+                        "sharpe": result.get("sharpe"),
+                        "commission_paid": result.get("commission_paid"),
+                        "slippage_paid": result.get("slippage_paid"),
+                        "cash_residual": result.get("cash_residual"),
+                    }
+                    for horizon, result in results.items()
+                },
+            }
+        )
+    return summaries
 
 
 def _identity(manifest: dict[str, Any]) -> dict[str, Any]:

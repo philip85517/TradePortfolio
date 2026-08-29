@@ -52,13 +52,17 @@ A 股日线，过滤 20 日日均成交额与 MA60 条件，按动量/成交额�
 ```bash
 ./.venv/bin/python -m alphalab research run \
   --as-of 2025-07-01 \
-  --db etf_strategy/data/processed/stock_market_data_2021.duckdb \
   --runs-dir alphalab/reports/research
 ```
 
-每次运行都会创建一个新的不可覆盖目录，包含 `candidates.csv`（全量筛选漏斗与原因）、
-`portfolio.csv`（Top 组合）、`nav.csv`（前瞻净值路径）和 `manifest.json`（规则、参数、
-数据质量与结果快照）。请求日期不是交易日时，自动回退到之前最近的有效信号日。
+默认自动发现本机已有的开源行情 DuckDB；覆盖不足时会调用现有 BaoStock updater 补到当前项目缓存，
+不要求手动导入 CSV/Parquet。使用 `--universe-mode point-in-time` 时会自动生成上市/退市历史 sidecar；
+当前开源链路没有历史行业分类时，运行会明确标记为 `listing-only`。
+若同时指定 `--data-quality-mode strict`，缺少历史行业生效区间会直接失败并保存 `FAILED` 诊断；不使用手工文件倒推历史。
+
+每次运行都会创建一个新的不可覆盖目录，包含候选筛选、组合持仓、逐日净值、
+`portfolio_metrics.csv`（按组合/周期的本金、绝对盈亏、收益率、回撤、波动、Sharpe 和成本）以及
+`manifest.json`（规则契约、参数、数据质量与数据快照）。请求日期不是交易日时，自动回退到之前最近的有效信号日。
 
 使用运行 ID 启动只读候选审阅页：
 
@@ -66,21 +70,34 @@ A 股日线，过滤 20 日日均成交额与 MA60 条件，按动量/成交额�
 ./.venv/bin/python -m alphalab research review \
   --run-id <RUN_ID> \
   --runs-dir alphalab/reports/research \
-  --db etf_strategy/data/processed/stock_market_data_2021.duckdb
+  --db auto
 ```
 
 页面默认处于“选股审阅”模式，后端不会返回信号日后的行情；点击“事后评估”后才会显示
-未来蜡烛、建仓点、21/42 日结果和组合上下文。按 `↑/↓` 可在当前候选列表中切换股票。
+未来蜡烛、建仓点、21/42 日结果和组合上下文。评估模式下可按组合切换器查看每个 Portfolio 的独立持仓、净值、绝对盈亏、收益率、回撤与成本；按 `↑/↓` 可在当前候选列表中切换股票。
 
-研究运行支持自定义观察周期与成本参数；当前规则插件固定为 `fixed_v0`：
+研究运行支持自定义观察周期、成本、整手和严格质量门禁；当前规则插件为 `fixed_v0`：
 
 ```bash
 ./.venv/bin/python -m alphalab research run \
   --as-of 2025-07-01 \
   --horizons 21,42,63 \
   --commission-rate 0.0003 \
-  --slippage-rate 0.0005
+  --slippage-rate 0.0005 \
+  --data-quality-mode strict
 ```
+
+一个实验可以定义多个独立本金的 Portfolio；重复 `--portfolio` 即可：
+
+```bash
+./.venv/bin/python -m alphalab research run \
+  --as-of 2025-07-01 \
+  --portfolio small=50000 \
+  --portfolio large=200000
+```
+
+显式注册的自定义因子需要声明版本、支持市场、必需字段、最小历史窗口、分数方向和参数 schema；
+通过 `factor_params`/`score_with_params` 接口接收参数，排名与组合构建仍由研究引擎统一完成。
 
 可以通过命令行管理和比较冻结运行：
 

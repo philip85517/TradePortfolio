@@ -7,6 +7,7 @@ DuckDB，不会重跑因子、不修改产物，也不会写入模拟交易账�
 from __future__ import annotations
 
 import json
+import hashlib
 import mimetypes
 from dataclasses import dataclass, field
 from datetime import date, timedelta
@@ -39,6 +40,9 @@ class ReviewRun:
     nav_frame: pd.DataFrame
     portfolio_returns_frame: pd.DataFrame
     benchmark_nav_frame: pd.DataFrame = field(default_factory=pd.DataFrame)
+    portfolios_frame: pd.DataFrame = field(default_factory=pd.DataFrame)
+    portfolio_nav_frame: pd.DataFrame = field(default_factory=pd.DataFrame)
+    benchmark_navs_frame: pd.DataFrame = field(default_factory=pd.DataFrame)
 
 
 def load_review_run(runs_dir: str | Path, run_id: str) -> ReviewRun:
@@ -61,6 +65,15 @@ def load_review_run(runs_dir: str | Path, run_id: str) -> ReviewRun:
         raise ValueError("manifest.json 无法读取") from exc
     if manifest.get("run_id") != run_id:
         raise ValueError("manifest.json 中的运行 ID 与目录不一致")
+    artifact_hashes = manifest.get("artifact_hashes", {})
+    if isinstance(artifact_hashes, dict):
+        for name, expected in artifact_hashes.items():
+            path = run_dir / str(name)
+            if not path.is_file():
+                raise ValueError(f"研究运行产物缺失: {name}")
+            actual = hashlib.sha256(path.read_bytes()).hexdigest()
+            if actual != str(expected):
+                raise ValueError(f"研究运行产物内容哈希不匹配: {name}")
 
     candidates = pd.read_csv(run_dir / "candidates.csv", dtype={"symbol": "string"})
     if "symbol" not in candidates.columns:
@@ -76,7 +89,24 @@ def load_review_run(runs_dir: str | Path, run_id: str) -> ReviewRun:
     portfolio_returns = pd.read_csv(run_dir / "portfolio_returns.csv", dtype={"symbol": "string"})
     benchmark_path = run_dir / "benchmark_nav.csv"
     benchmark_nav = pd.read_csv(benchmark_path) if benchmark_path.is_file() else pd.DataFrame()
-    return ReviewRun(run_dir, manifest, candidates, portfolio, nav, portfolio_returns, benchmark_nav)
+    portfolios_path = run_dir / "portfolios.csv"
+    portfolio_nav_path = run_dir / "portfolio_nav.csv"
+    benchmark_navs_path = run_dir / "benchmark_navs.csv"
+    portfolios = pd.read_csv(portfolios_path, dtype={"symbol": "string"}) if portfolios_path.is_file() else pd.DataFrame()
+    portfolio_nav = pd.read_csv(portfolio_nav_path) if portfolio_nav_path.is_file() else pd.DataFrame()
+    benchmark_navs = pd.read_csv(benchmark_navs_path) if benchmark_navs_path.is_file() else pd.DataFrame()
+    return ReviewRun(
+        run_dir,
+        manifest,
+        candidates,
+        portfolio,
+        nav,
+        portfolio_returns,
+        benchmark_nav,
+        portfolios,
+        portfolio_nav,
+        benchmark_navs,
+    )
 
 
 class ReviewState:
@@ -113,7 +143,93 @@ class ReviewState:
             "data_range": diagnostics.get("data_range"),
             "data_quality": diagnostics.get("data_quality", {}),
             "industries": self.industries(),
+            "portfolio_ids": self.portfolio_ids(),
+            "portfolios": self._portfolio_summaries(),
         }
+
+    def portfolio_ids(self) -> list[str]:
+        """返回冻结运行中可审阅的组合 ID，保持 manifest 声明顺序。"""
+        configured = [
+            str(item.get("portfolio_id"))
+            for item in self.run.manifest.get("portfolios", [])
+            if str(item.get("portfolio_id", "")).strip()
+        ]
+        performance = self.run.manifest.get("portfolio_performance", {})
+        if not performance:
+            performance = {"strategy": self.run.manifest.get("performance", {})}
+        return list(dict.fromkeys(configured + [str(key) for key in performance]))
+
+    def _portfolio_summaries(self) -> list[dict[str, Any]]:
+        performance = self.run.manifest.get("portfolio_performance", {})
+        if not performance:
+            performance = {"strategy": self.run.manifest.get("performance", {})}
+        configs = self._portfolio_configs()
+        return [
+            {
+                "portfolio_id": portfolio_id,
+                "name": configs.get(portfolio_id, {}).get("name", portfolio_id),
+                "initial_cash": configs.get(portfolio_id, {}).get("initial_cash"),
+                "performance": _jsonable(performance.get(portfolio_id, {})),
+            }
+            for portfolio_id in self.portfolio_ids()
+        ]
+
+    def _portfolio_configs(self) -> dict[str, dict[str, Any]]:
+        return {
+            str(item.get("portfolio_id")): item
+            for item in self.run.manifest.get("portfolios", [])
+            if str(item.get("portfolio_id", "")).strip()
+        }
+
+    def _resolve_portfolio_id(self, portfolio_id: str | None) -> str:
+        available = self.portfolio_ids()
+        if not available:
+            return "strategy"
+        requested = str(portfolio_id or "").strip()
+        if not requested:
+            return available[0]
+        if requested not in available:
+            raise KeyError(f"组合不存在: {requested}")
+        return requested
+
+    def _primary_portfolio_id(self) -> str:
+        return self._resolve_portfolio_id(None)
+
+    def _portfolio_frame(self, portfolio_id: str) -> pd.DataFrame:
+        aggregate = self.run.portfolios_frame
+        if not aggregate.empty and "portfolio_id" in aggregate.columns:
+            return aggregate[aggregate["portfolio_id"].astype(str) == portfolio_id].copy()
+        if portfolio_id == self._primary_portfolio_id():
+            return self.run.portfolio_frame.copy()
+        return pd.DataFrame(columns=self.run.portfolio_frame.columns)
+
+    def _portfolio_nav_frame(self, portfolio_id: str) -> pd.DataFrame:
+        aggregate = self.run.portfolio_nav_frame
+        if not aggregate.empty and "portfolio_id" in aggregate.columns:
+            return aggregate[aggregate["portfolio_id"].astype(str) == portfolio_id].copy()
+        if portfolio_id == self._primary_portfolio_id():
+            return self.run.nav_frame.copy()
+        return pd.DataFrame()
+
+    def _benchmark_nav_frame(self, portfolio_id: str) -> pd.DataFrame:
+        aggregate = self.run.benchmark_navs_frame
+        if not aggregate.empty and "portfolio_id" in aggregate.columns:
+            return aggregate[aggregate["portfolio_id"].astype(str) == portfolio_id].copy()
+        if portfolio_id == self._primary_portfolio_id():
+            return self.run.benchmark_nav_frame.copy()
+        return pd.DataFrame()
+
+    def _portfolio_performance(self, portfolio_id: str) -> dict[str, Any]:
+        all_performance = self.run.manifest.get("portfolio_performance", {})
+        if not all_performance:
+            all_performance = {"strategy": self.run.manifest.get("performance", {})}
+        return all_performance.get(portfolio_id, {})
+
+    def _benchmark_performance(self, portfolio_id: str) -> dict[str, Any]:
+        all_performance = self.run.manifest.get("benchmark_by_portfolio", {})
+        if not all_performance:
+            all_performance = {"strategy": self.run.manifest.get("benchmark", {})}
+        return all_performance.get(portfolio_id, {})
 
     def industries(self) -> list[str]:
         if "industry" not in self.run.candidates_frame.columns:
@@ -129,10 +245,11 @@ class ReviewState:
             values.update(part.strip() for part in reason.split("；") if part.strip())
         return sorted(values)
 
-    def portfolio_detail(self) -> dict[str, Any]:
+    def portfolio_detail(self, portfolio_id: str | None = None) -> dict[str, Any]:
         """返回冻结运行的组合路径和前瞻指标，不重新计算研究结果。"""
-        performance = self.run.manifest.get("performance", {})
-        benchmark_performance = self.run.manifest.get("benchmark", {})
+        selected_portfolio_id = self._resolve_portfolio_id(portfolio_id)
+        performance = self._portfolio_performance(selected_portfolio_id)
+        benchmark_performance = self._benchmark_performance(selected_portfolio_id)
         comparison = {
             str(horizon): {
                 "total_return_delta": _delta(
@@ -146,20 +263,24 @@ class ReviewState:
             }
             for horizon, result in performance.items()
         }
-        nav = self.run.nav_frame.copy()
+        portfolio_frame = self._portfolio_frame(selected_portfolio_id)
+        nav = self._portfolio_nav_frame(selected_portfolio_id)
         if not nav.empty and "horizon" in nav.columns:
             nav["horizon"] = pd.to_numeric(nav["horizon"], errors="coerce").astype("Int64")
         return {
-            "status": "OK" if not self.run.portfolio_frame.empty else "EMPTY_PORTFOLIO",
+            "status": "OK" if not portfolio_frame.empty else "EMPTY_PORTFOLIO",
+            "portfolio_id": selected_portfolio_id,
+            "portfolio_ids": self.portfolio_ids(),
             "signal_date": self.signal_date.isoformat(),
             "entry_date": self.run.manifest.get("diagnostics", {}).get("entry_date"),
             "horizons": sorted({int(key) for key in performance}) or list(self.horizons),
             "performance": _jsonable(performance),
-            "holdings": _records(self.run.portfolio_frame),
+            "portfolios": self._portfolio_summaries(),
+            "holdings": _records(portfolio_frame),
             "nav": _records(nav),
             "benchmark_performance": _jsonable(benchmark_performance),
             "comparison": _jsonable(comparison),
-            "benchmark_nav": _records(self.run.benchmark_nav_frame),
+            "benchmark_nav": _records(self._benchmark_nav_frame(selected_portfolio_id)),
         }
 
     def candidates(
@@ -200,11 +321,17 @@ class ReviewState:
         frame = frame.drop(columns=["_rank_sort"])
         return _records(frame)
 
-    def stock_detail(self, symbol: str, mode: str = "selection") -> dict[str, Any]:
+    def stock_detail(
+        self,
+        symbol: str,
+        mode: str = "selection",
+        portfolio_id: str | None = None,
+    ) -> dict[str, Any]:
         symbol = str(symbol).strip()
         mode = str(mode).strip().lower() or "selection"
         if mode not in {"selection", "evaluation"}:
             raise ValueError("mode 必须是 selection 或 evaluation")
+        selected_portfolio_id = self._resolve_portfolio_id(portfolio_id)
         rows = self.run.candidates_frame[self.run.candidates_frame["symbol"].astype(str) == symbol]
         if rows.empty:
             raise KeyError(f"候选股票不存在: {symbol}")
@@ -215,6 +342,7 @@ class ReviewState:
                 "status": "NO_CHART_DATA",
                 "symbol": symbol,
                 "mode": mode,
+                "portfolio_id": selected_portfolio_id,
                 "signal_date": self.signal_date.isoformat(),
                 "candidate": candidate,
                 "rows": [],
@@ -231,9 +359,8 @@ class ReviewState:
             bars = bars[bars["date"] <= pd.Timestamp(end_date)].copy()
         if not bars.empty:
             bars["date"] = pd.to_datetime(bars["date"]).dt.date
-        portfolio_rows = self.run.portfolio_frame[
-            self.run.portfolio_frame.get("symbol", pd.Series(dtype=str)).astype(str) == symbol
-        ]
+        portfolio_frame = self._portfolio_frame(selected_portfolio_id)
+        portfolio_rows = portfolio_frame[portfolio_frame.get("symbol", pd.Series(dtype=str)).astype(str) == symbol]
         markers: dict[str, Any] = {"signal_date": self.signal_date.isoformat()}
         performance: dict[str, Any] = {}
         portfolio_performance: dict[str, Any] = {}
@@ -241,7 +368,7 @@ class ReviewState:
         if mode == "evaluation":
             entry_date = _date_text(portfolio_rows.iloc[0].get("entry_date")) if not portfolio_rows.empty else None
             markers["entry_date"] = entry_date
-            for horizon, result in self.run.manifest.get("performance", {}).items():
+            for horizon, result in self._portfolio_performance(selected_portfolio_id).items():
                 if result.get("status") == "COMPLETE":
                     markers[f"horizon_{horizon}_date"] = result.get("evaluated_date")
                 stock_return = (result.get("stock_returns") or {}).get(symbol)
@@ -260,6 +387,17 @@ class ReviewState:
                     "gross_return": result.get("gross_return"),
                     "max_drawdown": result.get("max_drawdown"),
                     "holding_win_rate": result.get("holding_win_rate"),
+                    "initial_cash": result.get("initial_cash"),
+                    "ending_equity": result.get("ending_equity"),
+                    "profit_loss": result.get("profit_loss"),
+                    "max_drawdown_amount": result.get("max_drawdown_amount"),
+                    "daily_volatility": result.get("daily_volatility"),
+                    "annualized_return": result.get("annualized_return"),
+                    "annualized_volatility": result.get("annualized_volatility"),
+                    "sharpe": result.get("sharpe"),
+                    "commission_paid": result.get("commission_paid"),
+                    "slippage_paid": result.get("slippage_paid"),
+                    "cash_residual": result.get("cash_residual"),
                     "evaluated_date": result.get("evaluated_date"),
                 }
             portfolio_payload = _records(portfolio_rows)[0] if not portfolio_rows.empty else None
@@ -267,6 +405,7 @@ class ReviewState:
             "status": "OK" if not bars.empty else "NO_SELECTION_DATA",
             "symbol": symbol,
             "mode": mode,
+            "portfolio_id": selected_portfolio_id,
             "signal_date": self.signal_date.isoformat(),
             "candidate": candidate,
             "portfolio": portfolio_payload,
@@ -306,7 +445,8 @@ class ReviewRequestHandler(BaseHTTPRequestHandler):
             elif parsed.path == "/api/summary":
                 self._send_json(self.review_state.summary())
             elif parsed.path == "/api/portfolio":
-                self._send_json(self.review_state.portfolio_detail())
+                params = parse_qs(parsed.query)
+                self._send_json(self.review_state.portfolio_detail(_first(params, "portfolio_id")))
             elif parsed.path == "/api/candidates":
                 params = parse_qs(parsed.query)
                 self._send_json(
@@ -326,7 +466,13 @@ class ReviewRequestHandler(BaseHTTPRequestHandler):
                 symbol = _first(params, "symbol")
                 if not symbol:
                     raise ValueError("symbol 参数必填")
-                self._send_json(self.review_state.stock_detail(symbol, _first(params, "mode", "selection")))
+                self._send_json(
+                    self.review_state.stock_detail(
+                        symbol,
+                        _first(params, "mode", "selection"),
+                        _first(params, "portfolio_id"),
+                    )
+                )
             else:
                 self._send_json({"error": "Not found"}, status=404)
         except KeyError as exc:

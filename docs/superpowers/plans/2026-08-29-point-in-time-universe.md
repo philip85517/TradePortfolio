@@ -1,5 +1,7 @@
 # Point-in-Time Stock Universe Implementation Plan
 
+> Implementation note (2026-08-29): this original plan assumed a manual CSV/Parquet importer. The V1 requirement was subsequently changed to automatic binding of existing open-source DuckDB/provider data. The current implementation follows `alphalab/research/data_binding.py` and `universe_history.py`; manual import is not part of the user workflow. The historical industry-effective-interval requirement remains an explicit data-source gap and must not be filled by copying the current industry snapshot backward.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** 为 AlphaLab 因子迭代提供可审计的历史股票池数据契约、导入校验工具和按日期读取接口，并接入历史研究引擎的 `point-in-time` 模式。
