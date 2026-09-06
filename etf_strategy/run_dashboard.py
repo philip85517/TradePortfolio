@@ -23,6 +23,10 @@ from src.universe import classify_etf_theme, deduplicate_by_theme
 from src.utils import load_config
 
 ROOT = Path(__file__).resolve().parent
+if str(ROOT.parent) not in sys.path:
+    sys.path.insert(0, str(ROOT.parent))
+from alphalab.research.workbench import WorkbenchHTTPMixin
+from alphalab.research.workflow import ResearchWorkflow
 STATIC_ROOT = ROOT / "web" / "static"
 CONFIG_PATH = ROOT / "config" / "strategy_config.yaml"
 
@@ -37,6 +41,8 @@ class DashboardState:
         self.stock_score_inflight: dict[tuple, threading.Event] = {}
         self.rolling_plan_cache: dict[tuple, dict] = {}
         self.score_cache_lock = threading.RLock()
+        self.workflow = None
+        self.workflow_lock = threading.Lock()
 
 
 def parse_args() -> argparse.Namespace:
@@ -61,10 +67,23 @@ def main() -> None:
     server.serve_forever()
 
 
-class DashboardHandler(BaseHTTPRequestHandler):
+class DashboardHandler(WorkbenchHTTPMixin, BaseHTTPRequestHandler):
     dashboard_state: DashboardState
 
+    def get_workflow(self):
+        state = self.dashboard_state
+        with state.workflow_lock:
+            if state.workflow is None:
+                state.workflow = ResearchWorkflow(
+                    ROOT.parent / "alphalab" / "reports" / "workbench",
+                    db_path=str(state.market_db_path) if state.market_db_path.is_file() else "auto",
+                    runs_dir=ROOT.parent / "alphalab" / "reports" / "research",
+                )
+            return state.workflow
+
     def do_GET(self) -> None:  # noqa: N802 - stdlib hook.
+        if self.handle_workbench():
+            return
         parsed = urlparse(self.path)
         try:
             if parsed.path == "/":
@@ -95,6 +114,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self._send_json({"error": str(exc)}, status=500)
 
     def do_POST(self) -> None:  # noqa: N802 - stdlib hook.
+        if self.handle_workbench():
+            return
         parsed = urlparse(self.path)
         try:
             if parsed.path == "/api/update":
@@ -103,6 +124,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self.send_error(404, "Not found")
         except Exception as exc:  # noqa: BLE001 - return JSON errors to the UI.
             self._send_json({"error": str(exc)}, status=500)
+
+    def do_PATCH(self) -> None:
+        if not self.handle_workbench():
+            self.send_error(404, "Not found")
 
     def log_message(self, fmt: str, *args) -> None:
         return

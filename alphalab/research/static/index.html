@@ -4,10 +4,10 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>alphaLab · 历史截面审阅</title>
-    <link rel="stylesheet" href="/styles.css" />
+    <link rel="stylesheet" href="styles.css" />
     <!-- LightweightCharts is used when the CDN is available; app.js keeps an SVG fallback for offline review. -->
     <script src="https://cdn.jsdelivr.net/npm/lightweight-charts@4.2.3/dist/lightweight-charts.standalone.production.js"></script>
-    <script src="/app.js" defer></script>
+    <script src="app.js" defer></script>
   </head>
   <body>
     <div class="app-shell">
@@ -109,7 +109,7 @@
                   <p id="chartNotice" class="chart-notice">选股审阅模式：后端响应在有效信号日截止。</p>
                 </div>
                 <aside class="panel stat-panel">
-                  <div class="panel-header"><div><p class="section-kicker">FIXED V0 FACTORS</p><h3>因子拆解</h3></div><span id="selectionBadge" class="badge">--</span></div>
+                  <div class="panel-header"><div><p id="factorSource" class="section-kicker">选股信息</p><h3 id="factorTitle">因子拆解</h3></div><span id="selectionBadge" class="badge">--</span></div>
                   <div id="factorGrid" class="factor-grid"></div>
                   <div class="reason-box"><span>过滤原因</span><strong id="detailReason">--</strong></div>
                 </aside>

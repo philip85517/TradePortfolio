@@ -50,6 +50,8 @@ class ResearchSpec:
     data_quality_mode: str = "exploratory"
     factor_params: dict[str, Any] = field(default_factory=dict)
     portfolios: tuple["PortfolioSpec", ...] = ()
+    target_weights: dict[str, float] = field(default_factory=dict)
+    wizard_metadata: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -680,6 +682,11 @@ class HistoricalResearchLab:
     ) -> Path:
         artifact_dir = self.runs_dir / run_id
         artifact_dir.mkdir(parents=True, exist_ok=False)
+        snapshot_artifacts = []
+        snapshot_writer = getattr(self.data_binding, "write_snapshot", None)
+        if callable(snapshot_writer):
+            snapshot_artifacts = snapshot_writer(artifact_dir)
+            diagnostics["data_source"] = _data_binding_metadata(self.data_binding)
         portfolios = portfolios or {"strategy": portfolio}
         portfolio_performance = portfolio_performance or {"strategy": performance}
         portfolio_nav = portfolio_nav or {"strategy": nav}
@@ -788,6 +795,8 @@ class HistoricalResearchLab:
                 "lot_size": spec.lot_size,
                 "data_quality_mode": spec.data_quality_mode,
                 "factor_params": spec.factor_params,
+                "target_weights": spec.target_weights,
+                "wizard_metadata": spec.wizard_metadata,
                 "portfolios": _jsonable(spec.portfolios),
             },
             "portfolios": portfolio_manifest,
@@ -816,6 +825,7 @@ class HistoricalResearchLab:
                 "manifest.json",
             ],
         }
+        manifest["artifacts"].extend(snapshot_artifacts)
         artifact_names = [name for name in manifest["artifacts"] if name != "manifest.json"]
         manifest["artifact_hashes"] = _artifact_hashes(artifact_dir, artifact_names)
         manifest["artifact_content_hash"] = json_hash(manifest["artifact_hashes"])
@@ -1269,8 +1279,8 @@ def _build_portfolio(
         return pd.DataFrame(columns=columns), "EMPTY_CANDIDATE_POOL", reasons
     if spec.min_holdings < 0:
         raise ValueError("min_holdings 不能为负数")
-    if spec.portfolio_weighting not in {"equal", "score"}:
-        raise ValueError("portfolio_weighting 必须是 equal 或 score")
+    if spec.portfolio_weighting not in {"equal", "score", "custom"}:
+        raise ValueError("portfolio_weighting 必须是 equal、score 或 custom")
     for value, label in [
         (spec.max_single_weight, "max_single_weight"),
         (spec.max_industry_weight, "max_industry_weight"),
@@ -1305,13 +1315,27 @@ def _build_portfolio(
         return pd.DataFrame(columns=columns), "NO_ENTRY_DATA", reasons
 
     frame = pd.DataFrame(entry_rows)
-    raw_weights = _raw_portfolio_weights(frame, spec.portfolio_weighting)
-    weights = _constrained_weights(
-        raw_weights,
-        frame["industry"].fillna("UNKNOWN").astype(str).tolist(),
-        spec.max_single_weight,
-        spec.max_industry_weight,
-    )
+    if spec.portfolio_weighting == "custom":
+        if set(spec.target_weights) != set(selected["symbol"].astype(str)):
+            raise ValueError("显式权重必须覆盖全部选中股票，且不能包含其他股票")
+        weights = np.asarray([float(spec.target_weights[str(symbol)]) for symbol in frame["symbol"]])
+        if not np.isfinite(weights).all() or (weights < 0).any() or weights.sum() > 1 + 1e-9:
+            raise ValueError("显式权重必须非负、有限且总和不超过 100%")
+        violates_single = spec.max_single_weight is not None and (weights > spec.max_single_weight + 1e-9).any()
+        violates_industry = spec.max_industry_weight is not None and any(
+            weights[frame["industry"].eq(industry)].sum() > spec.max_industry_weight + 1e-9
+            for industry in frame["industry"].unique()
+        )
+        if violates_single or violates_industry:
+            weights = None
+    else:
+        raw_weights = _raw_portfolio_weights(frame, spec.portfolio_weighting)
+        weights = _constrained_weights(
+            raw_weights,
+            frame["industry"].fillna("UNKNOWN").astype(str).tolist(),
+            spec.max_single_weight,
+            spec.max_industry_weight,
+        )
     if weights is None:
         for row in entry_rows:
             reasons[str(row["symbol"])] = "组合约束不可行"
@@ -1343,6 +1367,8 @@ def _build_benchmark(
     spec: ResearchSpec,
 ) -> pd.DataFrame:
     """用相同历史截面中的数据合格股票构造等权基准。"""
+    if spec.wizard_metadata.get("benchmark_disabled_reason"):
+        return pd.DataFrame()
     if "history_count" not in candidates.columns:
         return pd.DataFrame()
     benchmark = candidates[pd.to_numeric(candidates["history_count"], errors="coerce") >= 120].copy()
@@ -1557,7 +1583,7 @@ def _evaluate_forward(
             shares = shares.astype(float)
         raw_entry_prices = entry_prices / (1.0 + spec.slippage_rate)
         buy_notional = raw_entry_prices * shares
-        buy_values = buy_notional * (1.0 + spec.commission_rate)
+        buy_values = entry_prices * shares * (1.0 + spec.commission_rate)
         cash_residual = float(spec.initial_cash - buy_values.sum())
         values = selected_prices.mul(shares, axis="columns")
         equity = values.sum(axis=1, min_count=1) + cash_residual
@@ -1618,7 +1644,7 @@ def _evaluate_forward(
         buy_notional = raw_entry_prices * shares
         exit_notional = exit_prices * shares * (1.0 - spec.slippage_rate)
         commission_paid = float(
-            buy_notional.mul(spec.commission_rate).sum() + exit_notional.mul(spec.commission_rate).sum()
+            (entry_prices * shares).mul(spec.commission_rate).sum() + exit_notional.mul(spec.commission_rate).sum()
         )
         slippage_paid = float(
             (entry_prices - raw_entry_prices).mul(shares).sum()

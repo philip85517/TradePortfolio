@@ -12,4 +12,5 @@ etf_strategy/data/processed/
 alphalab/storage/paper_trading.db
 alphalab/reports/paper/
 alphalab/reports/research/
+alphalab/reports/workbench/
 alphalab/data/market/*.csv
