@@ -1,11 +1,22 @@
 (() => {
   "use strict";
 
+  function reviewLabels(summary) {
+    const scope = summary.spec?.wizard_metadata?.scope;
+    const manual = scope?.selection_mode === "manual" || summary.rule_version === "manual_v1";
+    return {requestedDate: scope?.start_date && scope?.end_date ? `${scope.start_date} → ${scope.end_date}` : summary.requested_date || "--",
+      rule: manual ? "手选股票" : summary.rule_version || "--", factorSource: manual ? "手选股票" : "FIXED V0 FACTORS",
+      factorTitle: manual ? "持仓与筛选信息" : "因子拆解"};
+  }
+  if (typeof module !== "undefined") module.exports = {reviewLabels};
+  if (typeof document === "undefined") return;
+
   const state = {
     mode: "selection", summary: null, candidates: [], visible: [], selectedSymbol: null,
     detail: null, portfolio: null, portfolioId: null, portfolioIds: [], chart: null,
     chartSettings: { timeframe: localStorage.getItem("alphalab.chart.timeframe") || "1d", volume: true, ema: { 5: false, 20: true, 60: true } },
   };
+  let detailRequest = 0, candidateRequest = 0, portfolioRequest = 0;
   const $ = (id) => document.getElementById(id);
 
   function escapeHtml(value) {
@@ -23,7 +34,7 @@
   }
 
   function api(path) {
-    return fetch(path, { headers: { Accept: "application/json" }, cache: "no-store" }).then(async (response) => {
+    return fetch(path.replace(/^\//, ""), { headers: { Accept: "application/json" }, cache: "no-store" }).then(async (response) => {
       const payload = await response.json();
       if (!response.ok) throw new Error(payload.error || `请求失败 (${response.status})`);
       return payload;
@@ -39,9 +50,12 @@
   function hideError() { $("errorBanner").hidden = true; }
 
   function renderSummary(summary) {
-    $("requestedDate").textContent = summary.requested_date || "--";
+    const labels = reviewLabels(summary);
+    $("requestedDate").textContent = labels.requestedDate;
+    $("factorSource").textContent = labels.factorSource;
+    $("factorTitle").textContent = labels.factorTitle;
     $("signalDate").textContent = summary.signal_date || "--";
-    $("topRuleVersion").textContent = summary.rule_version || "--";
+    $("topRuleVersion").textContent = labels.rule;
     const marketLabel = { a_share: "A 股", hk: "港股", us: "美股" }[summary.market] || summary.market || "--";
     $("marketLabel").textContent = `市场 ${marketLabel}`;
     $("dataRange").textContent = Array.isArray(summary.data_range) && summary.data_range.length === 2
@@ -62,7 +76,7 @@
       : industryInfo.quality === "current-snapshot"
         ? `快照 ${percent(industryInfo.coverage)}`
         : "未绑定";
-    $("subtitle").textContent = `运行 ${summary.run_id} · 固定 ${summary.rule_version || "V0"} · 只读审阅`;
+    $("subtitle").textContent = `运行 ${summary.run_id} · ${labels.rule} · 只读审阅`;
     const industry = $("industry");
     industry.innerHTML = '<option value="all">全部行业</option>';
     for (const value of summary.industries || []) {
@@ -91,7 +105,7 @@
 
   function renderCandidates(rows) {
     state.visible = rows;
-    $("resultCount").textContent = `${rows.length} / ${state.candidates.length} 只`;
+    $("resultCount").textContent = `${rows.length} / ${state.summary?.candidate_count ?? state.candidates.length} 只`;
     const body = $("candidateBody");
     body.innerHTML = rows.map((row) => {
       const selected = Boolean(row.selected);
@@ -124,12 +138,17 @@
   }
 
   function loadCandidates() {
+    const request = ++candidateRequest;
     const query = new URLSearchParams({ search: $("search").value, status: $("status").value, industry: $("industry").value, reason: $("reason").value });
     return api(`/api/candidates?${query}`).then((payload) => {
+      if (request !== candidateRequest) return;
       state.candidates = payload.rows || [];
       renderReasonOptions(payload.reasons || []);
       renderCandidates(state.candidates);
-      if (!state.selectedSymbol && state.candidates.length) selectSymbol(state.candidates[0].symbol);
+      if (!state.candidates.some((row) => String(row.symbol) === String(state.selectedSymbol))) {
+        if (state.candidates.length) selectSymbol(state.candidates[0].symbol);
+        else { state.selectedSymbol = null; clearDetail(); }
+      } else if (state.detail) renderDetail(state.detail);
     });
   }
 
@@ -244,8 +263,12 @@
   }
 
   function loadPortfolio() {
+    const request = ++portfolioRequest, mode = state.mode, portfolioId = state.portfolioId;
     const query = state.portfolioId ? `?${new URLSearchParams({ portfolio_id: state.portfolioId })}` : "";
-    return api(`/api/portfolio${query}`).then((payload) => { state.portfolio = payload; renderPortfolio(payload); return payload; });
+    return api(`/api/portfolio${query}`).then((payload) => {
+      if (request !== portfolioRequest || mode !== state.mode || portfolioId !== state.portfolioId) return;
+      state.portfolio = payload; renderPortfolio(payload); return payload;
+    });
   }
 
   function renderDetail(detail) {
@@ -266,21 +289,43 @@
     renderFactors(candidate);
     renderPerformance(detail);
     renderChart(detail);
+    if (state.mode === "evaluation" && window.location?.hash === "#evaluationSummary") $("evaluationSummary").scrollIntoView({ behavior: "smooth" });
+  }
+
+  function clearDetail() {
+    detailRequest++;
+    state.detail = null;
+    if (state.chart) { state.chart.remove(); state.chart = null; }
+    $("chart").innerHTML = "";
+    $("performanceGrid").innerHTML = "";
+    $("evaluationSummary").hidden = true;
+    $("detailContent").hidden = true;
+    $("detailEmpty").hidden = false;
   }
 
   function selectSymbol(symbol) {
     if (!symbol) return;
+    clearDetail();
+    const request = ++detailRequest, mode = state.mode, portfolioId = state.portfolioId;
     state.selectedSymbol = symbol;
     renderCandidates(state.visible);
     const params = { symbol, mode: state.mode };
     params.timeframe = state.chartSettings.timeframe;
     if (state.portfolioId) params.portfolio_id = state.portfolioId;
-    api(`/api/stock?${new URLSearchParams(params)}`).then(renderDetail).catch(showError);
+    api(`/api/stock?${new URLSearchParams(params)}`).then((detail) => {
+      if (request !== detailRequest || mode !== state.mode || portfolioId !== state.portfolioId || String(symbol) !== String(state.selectedSymbol)) return;
+      hideError(); renderDetail(detail);
+    }).catch((error) => { if (request === detailRequest) showError(error); });
   }
 
   function switchMode(mode) {
     if (state.mode === mode) return;
     state.mode = mode;
+    clearDetail();
+    portfolioRequest++;
+    state.portfolio = null;
+    $("portfolioSummary").hidden = true;
+    ["navChart", "drawdownChart", "portfolioMetricsGrid", "portfolioGrid"].forEach((id) => { $(id).innerHTML = ""; });
     $("selectionMode").classList.toggle("active", mode === "selection");
     $("evaluationMode").classList.toggle("active", mode === "evaluation");
     $("chartNotice").textContent = mode === "selection" ? "选股审阅模式：后端响应在有效信号日截止。" : "事后评估模式：显示建仓点、未来走势和观察周期终点。";
@@ -384,10 +429,14 @@
   $("portfolioSelect").addEventListener("change", () => {
     state.portfolioId = $("portfolioSelect").value || null;
     state.portfolio = null;
+    clearDetail();
+    $("portfolioSummary").hidden = true;
+    if (state.selectedSymbol) selectSymbol(state.selectedSymbol);
     if (state.mode === "evaluation") {
       loadPortfolio().then(() => { if (state.selectedSymbol) selectSymbol(state.selectedSymbol); }).catch(showError);
     }
   });
+  document.querySelectorAll('[href="#evaluationSummary"]').forEach((link) => link.addEventListener("click", () => switchMode("evaluation")));
   $("selectionMode").addEventListener("click", () => switchMode("selection"));
   $("evaluationMode").addEventListener("click", () => switchMode("evaluation"));
   $("previousButton").addEventListener("click", () => move(-1));

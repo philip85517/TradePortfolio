@@ -4,6 +4,8 @@ numpy>=1.24
 PyYAML>=6.0
 # 可选：读取 etf_strategy 的 DuckDB 行情（自动发现）
 duckdb>=1.0
+# 向导按需补齐 A 股历史行情与交易日历
+baostock>=0.9.2
 # 测试
 pytest>=8.0
 

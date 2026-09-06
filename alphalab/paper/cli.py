@@ -640,6 +640,14 @@ def cmd_research_review(args) -> int:
     return 0
 
 
+def cmd_research_workbench(args) -> int:
+    """启动可恢复的股票组合创建向导。"""
+    from ..research.workbench import serve_workbench
+    serve_workbench(directory=args.workspace_dir, db_path=args.db,
+                    runs_dir=args.runs_dir, host=args.host, port=args.port)
+    return 0
+
+
 def cmd_research_list(args) -> int:
     """列出冻结研究运行。"""
     runs = ResearchRunStore(args.runs_dir).list()
@@ -835,6 +843,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_research = sub.add_parser("research", help="历史截面因子研究原型")
     research_sub = p_research.add_subparsers(dest="research_command", required=True)
+    p_workbench = research_sub.add_parser("workbench", help="打开股票组合创建向导：先准备历史数据，再配置模拟")
+    p_workbench.add_argument("--db", default=DEFAULT_RESEARCH_DB)
+    p_workbench.add_argument("--workspace-dir", default=str(REPO_ROOT / "alphalab" / "reports" / "workbench"))
+    p_workbench.add_argument("--runs-dir", default=str(DEFAULT_RESEARCH_RUNS))
+    p_workbench.add_argument("--host", default="127.0.0.1")
+    p_workbench.add_argument("--port", type=int, default=8787)
+    p_workbench.set_defaults(func=cmd_research_workbench)
     p_research_run = research_sub.add_parser("run", help="运行固定 V0 选股与组合前瞻回测")
     p_research_run.add_argument("--as-of", required=True, help="请求的历史日期，例如 2025-07-01")
     p_research_run.add_argument("--rule-version", default="fixed_v0", help="因子插件版本，当前支持 fixed_v0")
