@@ -100,7 +100,7 @@ class WorkbenchHTTPMixin:
                         draft = flow.preview(draft_id, revision)
                         self._send_json({'draft': draft, 'preview': draft['preview']})
                     elif action in {'prepare', 'run'}:
-                        task = (flow.prepare(draft_id, revision) if action == 'prepare'
+                        task = (flow.prepare(draft_id, revision, plan_id=body.get('plan_id')) if action == 'prepare'
                                 else flow.run(draft_id, revision, body.get('idempotency_key')))
                         self._send_json({'task': task, 'draft': flow.get_draft(draft_id)}, status=202)
                     else:

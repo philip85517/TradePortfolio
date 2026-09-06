@@ -23,26 +23,58 @@
     const ready = !changed && value.readiness?.status === 'READY';
     const running = currentTask && ['QUEUED','RUNNING','CANCELLING'].includes(currentTask.status);
     return {ready, running, canConfigure:ready && !pending && !running,
-      canPrepare:!ready && !pending && !running, canViewResult:currentTask?.kind === 'run'};
+      canPrepare:!ready && !pending && !running && (value.readiness?.repair_plan?.executable_count == null || value.readiness.repair_plan.executable_count > 0), canViewResult:currentTask?.kind === 'run'};
   }
-  function coverageHtml(rows) {
+  function diagnosticLabel(value) { return ({identity:'身份',warmup:'预热',signal:'信号',entry:'建仓',holding:'持有',exit:'退出',data_missing:'数据缺失',data_conflict:'数据冲突',market_event:'已确认市场事件',status_unknown:'状态待核实',source_capability:'来源能力不足'}[value] || value || '未标注'); }
+  function coverageHtml(rows, page=0, issues=[]) {
     if (!Array.isArray(rows) || !rows.length) return '<p class="muted">尚未得到逐股覆盖检查，请先处理上方数据问题。</p>';
-    return '<h3>历史数据覆盖与缺口</h3><div class="coverage-list">'+rows.map(row=>{
-      const status={READY:'已就绪',MISSING:'需补齐',INVALID:'需修复数据'}[row.status] || '待检查';
+    return '<h3>历史数据覆盖与缺口</h3><div class="coverage-list">'+rows.slice(page*25,page*25+25).map(row=>{
+      const resolutions=new Set(issues.filter(i=>i.symbol===row.symbol).map(i=>i.resolution));
+      const state=resolutions.has('unsupported')?'UNSUPPORTED':resolutions.has('verify')?'NEEDS_VERIFICATION':row.status;
+      const status={READY:'已就绪',MISSING:'需补齐',INVALID:'需修复数据',NEEDS_VERIFICATION:'需核实交易状态',UNSUPPORTED:'当前能力不支持'}[state] || '待检查';
       const adjustment={hfq:'后复权',qfq:'前复权',raw:'不复权',none:'不复权',mixed:'复权口径不一致'}[row.adjustment] || row.adjustment;
       const missing=row.missing_dates || [];
-      return `<article class="notice ${row.status==='READY'?'success':'danger'}"><strong>${esc(row.symbol)} ${esc(row.name)} · ${esc(status)}</strong><p>已覆盖 ${esc(row.available_sessions ?? 0)} / ${esc(row.required_sessions ?? '待确定')} 个所需交易日${adjustment?' · '+esc(adjustment):''}</p>${missing.length?`<p>缺少 ${missing.length} 个交易日：${missing.map(esc).join('、')}</p>`:''}</article>`;
+      return `<article class="notice ${state==='READY'?'success':'danger'}"><strong>${esc(row.symbol)} ${esc(row.name)} · ${esc(status)}</strong><p>已覆盖 ${esc(row.available_sessions ?? 0)} / ${esc(row.required_sessions ?? '待确定')} 个所需交易日${adjustment?' · '+esc(adjustment):''}</p>${missing.length?`<p>缺少 ${missing.length} 个交易日：${missing.map(esc).join('、')}</p>`:''}</article>`;
     }).join('')+'</div>';
   }
+  function repairLabel(r) {
+    if (r?.status==='READY') return '数据已就绪，无需修复';
+    const plan=r?.repair_plan;
+    if (plan?.executable_count == null) return '补齐所需数据 / 重试';
+    const n=plan.executable_count, kinds=new Set((plan.actions || []).map(a=>['verify','verify_status'].includes(a.kind)?'verify':['download','bars','entry','calendar','universe'].includes(a.kind)?'download':a.kind));
+    if (!n) return '当前来源无法自动解决剩余问题';
+    return `${kinds.size===1 && kinds.has('verify')?'核实交易状态':kinds.size===1 && kinds.has('download')?'修复可处理项':'处理可自动处理项'}（${n} 项）`;
+  }
+  function filterIssues(issues, filters={}) {
+    return issues.filter(i=>(!filters.symbol || String(i.symbol || '').includes(filters.symbol)) && (!filters.category || i.category===filters.category) && (!filters.phase || i.phase===filters.phase));
+  }
+  function issuesHtml(issues, filters={}) {
+    const filtered=filterIssues(issues,filters);
+    return [['download','可自动处理'],['verify','需核实'],['user','需要你处理']].map(([key,label])=>{
+      const rows=filtered.filter(i=>key==='user'?!['download','verify'].includes(i.resolution):i.resolution===key);
+      if (!rows.length) return '';
+      return `<details class="issue-group"><summary>${label} · ${rows.length} 条问题</summary>${rows.map(i=>`<details><summary>${esc(i.symbol)} · ${esc(i.message || i.code || i)}</summary><p>${esc(i.action || '')}</p><p>阶段：${esc(diagnosticLabel(i.phase))} · 类型：${esc(diagnosticLabel(i.category || i.code))}</p><p>异常日期：${(i.date_ranges || []).map(d=>esc(d.start)+' → '+esc(d.end)).join('、') || '未提供'}</p><pre>${esc(JSON.stringify(i.evidence || {},null,2))}</pre></details>`).join('')}</details>`;
+    }).join('') || '<p class="muted">没有符合筛选条件的问题。</p>';
+  }
+  function attemptSummary(t) {
+    const summary=t?.result?.repair_summary;
+    if (summary) return `本轮已处理 ${summary.resolved || 0} 项 · 未变化 ${summary.unchanged || 0} 项 · 请求失败 ${summary.failed || 0} 项。已验证的缓存与草稿保留。`;
+    const attempts=t?.result?.repair_attempts || t?.result?.attempts || t?.progress?.attempts || [];
+    if (!Array.isArray(attempts) || !attempts.length) return ['PARTIAL','FAILED','CANCELLED','INTERRUPTED'].includes(t?.status)?'已验证的缓存与草稿保留；重新检查后继续处理剩余问题。':'';
+    const count=(...states)=>attempts.filter(a=>states.includes(a.outcome || a.status)).length;
+    return `本轮已处理 ${count('resolved','repaired','saved','published')} 项 · 未变化 ${count('unchanged','unresolved')} 项 · 请求失败 ${count('failed')} 项。已验证的缓存与草稿保留。`;
+  }
+  function taskForDraft(currentTask, value) { return currentTask?.id === value.task_id ? currentTask : null; }
   function selectionSymbols(mode, text) { return mode==='manual' ? text.split(/[\s,，;；]+/).filter(Boolean) : []; }
   function unfinishedDrafts(rows) { return rows.filter(row=>!(row.task_kind==='run' && row.task_status==='SUCCEEDED')); }
-  if (typeof module !== 'undefined') module.exports = {validateScope, acceptResponse, coverageHtml, calendarLabel, gates, unfinishedDrafts, selectionSymbols};
+  if (typeof module !== 'undefined') module.exports = {validateScope, acceptResponse, coverageHtml, calendarLabel, gates, unfinishedDrafts, selectionSymbols, repairLabel, filterIssues, issuesHtml, attemptSummary, diagnosticLabel, taskForDraft};
   if (typeof document === 'undefined') return;
   const $ = id => document.getElementById(id);
   const fmt = v => v == null ? '—' : typeof v === 'number' ? v.toLocaleString('zh-CN',{maximumFractionDigits:2}) : String(v);
   const active = t => t && ['QUEUED','RUNNING','CANCELLING'].includes(t.status);
   const names = ['选择范围','准备数据','配置组合','确认运行','查看结果'];
   const defaults = {scope:{market:'a_share',start_date:'2021-03-01',end_date:'2025-06-30',selection_mode:'manual',symbols:[],rule_version:'fixed_v0',top_n:10,quality_mode:'strict'},portfolio:{name:'我的股票组合',initial_cash:100000,weighting:'equal',weights:{},commission_rate:0.0003,slippage_rate:0.001,max_single_weight:1,max_industry_weight:1,min_holdings:1}};
+  let statusUnavailable=false, coveragePage=0, issueFilters={}, readinessRendered=undefined;
   let draft = null, task = null, step = 1, opening = 0, epoch = 0, dirty = false, busy = false, saveTimer, saving = null, pollTimer, requestKey = null;
   async function api(path, method='GET', body) {
     const r = await fetch('/api/wizard'+path,{method,headers:{Accept:'application/json',...(body ? {'Content-Type':'application/json'} : {})},body:body ? JSON.stringify(body) : undefined,cache:'no-store'});
@@ -85,7 +117,8 @@
     if (!draft) return;
     epoch++; dirty=true; requestKey=null; clearError();
     if (scopeChanged) {
-      draft.scope=readScope(); draft.readiness=null;
+      draft.scope=readScope(); draft.readiness=null; draft.task_id=null;
+      task=taskForDraft(task,draft); clearTimeout(pollTimer); statusUnavailable=false;
       if ((draft.scope.selection_mode==='manual' && $('weighting').value==='score') || (draft.scope.selection_mode==='rule' && $('weighting').value==='custom')) $('weighting').value='equal';
     }
     try { draft.portfolio=readPortfolio(); } catch { /* Keep incomplete weight text in browser backup until valid. */ }
@@ -115,7 +148,7 @@
           throw e;
         }
         if (draft?.id!==owner) return;
-        if (acceptResponse(draft,result.draft,sentEpoch,epoch)) { draft=result.draft; dirty=false; localStorage.removeItem(localKey(owner)); }
+        if (acceptResponse(draft,result.draft,sentEpoch,epoch)) { draft=result.draft; task=taskForDraft(task,draft); if (!task) clearTimeout(pollTimer); dirty=false; localStorage.removeItem(localKey(owner)); }
         else { draft.revision=Math.max(draft.revision,result.draft.revision); remember(); }
       }
       $('saveStatus').textContent='已自动保存'; $('loadServer').hidden=true; render();
@@ -131,9 +164,14 @@
     let html=`<div class="notice ${ready?'success':'danger'}"><strong>${ready?'数据已就绪，可以配置组合':'数据尚未就绪，需先处理以下问题'}</strong></div>`;
     const dates=r.dates || {};
     html+=metrics([['请求开始',draft.scope.start_date],['请求结束',draft.scope.end_date],['数据质量',draft.scope.quality_mode==='strict'?'正式研究':'探索研究'],...Object.entries(dates).map(([k,v])=>[({entry_date:'实际建仓日',exit_date:'实际结束日',end_date:'实际结束日',signal_date:'规则信号日',warmup_start:'预热起点',warmup_start_date:'预热起点',requested_start_date:'请求开始日',requested_end_date:'请求结束日',warmup_sessions:'所需预热交易日',calendar_source:'交易日历来源',horizon:'持有交易日数'}[k] || k),k==='calendar_source'?calendarLabel(v):v])]);
-    if (r.issues?.length) html+='<ul>'+r.issues.map(i=>`<li><strong>${esc(i.message || i.code || i)}</strong>${i.action ? `<p>${esc(i.action)}</p>`:''}</li>`).join('')+'</ul>';
+    html+=metrics([['已就绪股票（只）',(r.coverage || []).filter(x=>x.status==='READY').length],['待核实问题（条）',(r.issues || []).filter(x=>x.resolution==='verify').length],['可执行动作（项）',r.repair_plan?.executable_count ?? '待确定'],['需选择／不支持（条）',(r.issues || []).filter(x=>['user','unsupported'].includes(x.resolution)).length]]);
+    if (r.repair_plan?.executable_count===0 && !ready) html+='<div class="notice">当前来源无法自动解决剩余问题。请重新检查或返回修改范围；修改股票或日期会改变实验样本。</div>';
+    const options=(key)=>[...new Set((r.issues || []).map(i=>i[key]).filter(Boolean))].map(v=>`<option value="${esc(v)}" ${issueFilters[key]===v?'selected':''}>${esc(diagnosticLabel(v))}</option>`).join('');
+    if (r.issues?.length) html+=`<div class="form-grid"><label>股票筛选<input id="issueSymbol" value="${esc(issueFilters.symbol || '')}" placeholder="六位代码或部分代码"></label><label>问题类型<select id="issueCategory"><option value="">全部类型</option>${options('category')}</select></label><label>研究阶段<select id="issuePhase"><option value="">全部阶段</option>${options('phase')}</select></label></div><div id="issueGroups">${issuesHtml(r.issues,issueFilters)}</div>`;
+    if (r.repair_plan?.actions?.length) html+=details(r.repair_plan.actions,'查看本轮自动处理动作');
     if (r.warnings?.length) html+='<div class="notice">'+r.warnings.map(x=>esc(x.message || x)).join('<br>')+'</div>';
-    html+=coverageHtml(r.coverage);
+    const pages=Math.max(1,Math.ceil((r.coverage || []).length/25)); coveragePage=Math.min(coveragePage,pages-1);
+    html+=coverageHtml(r.coverage,coveragePage,r.issues || [])+`<div class="actions"><button type="button" data-page="${coveragePage-1}" ${coveragePage===0?'disabled':''}>上一页</button><span>第 ${coveragePage+1} / ${pages} 页 · 每页 25 只股票</span><button type="button" data-page="${coveragePage+1}" ${coveragePage+1>=pages?'disabled':''}>下一页</button><button type="button" id="exportDiagnostics">导出原始诊断</button></div>`;
     $('readiness').innerHTML=html;
   }
   function renderPreview() {
@@ -148,34 +186,38 @@
     if (!t) return '';
     const labels={QUEUED:'等待执行',RUNNING:'正在执行',SUCCEEDED:'已完成',PARTIAL:'部分完成，仍有数据缺口',FAILED:'执行失败',CANCELLED:'已取消',INTERRUPTED:'服务已重启，任务中断',CANCELLING:'正在取消'};
     const elapsed=Math.max(0,Math.round((Date.parse(t.updated_at || new Date().toISOString())-Date.parse(t.created_at))/1000));
-    return `<div class="notice ${['FAILED','PARTIAL','INTERRUPTED'].includes(t.status)?'danger':''}"><strong>${esc(labels[t.status] || t.status)}</strong><p>${esc(t.stage || '等待后台处理')}</p><small>已用时 ${Number.isFinite(elapsed)?elapsed:0} 秒 · ${active(t)?'暂无可靠剩余时间估计':'状态已保存'}</small>${t.error?`<p>${esc(t.error.message || t.error)}</p>`:''}</div>`;
+    return `<div class="notice ${['FAILED','PARTIAL','INTERRUPTED'].includes(t.status)?'danger':''}"><strong>${esc(labels[t.status] || t.status)}</strong><p>${esc(t.stage || '等待后台处理')}</p><small>已用时 ${Number.isFinite(elapsed)?elapsed:0} 秒 · ${active(t)?'暂无可靠剩余时间估计':'状态已保存'}</small><p>${esc(attemptSummary(t))}</p>${t.error?`<p>${esc(t.error.message || t.error)}</p>`:''}</div>`;
   }
   function render() {
     if (!draft) return;
-    const permissions=gates(draft,task,dirty,busy), {ready,running}=permissions, preview=ready && Boolean(draft.preview);
+    const permissions=gates(draft,task,dirty,busy || statusUnavailable), {ready,running}=permissions, preview=ready && Boolean(draft.preview);
     $('steps').innerHTML=names.map((n,i)=>`<button type="button" data-step="${i+1}" ${i+1===step?'aria-current="step"':''} ${(i===2&&!ready)||(i===3&&!preview)||(i===4&&!permissions.canViewResult)?'disabled':''}>${i+1}. ${n}<small>${i===1?(ready?'可继续':'需检查'):i===2?(!ready?'等待数据就绪':preview?'预览已完成':'待配置'):i===3?(!preview?'等待预览':'可提交'):i===4?(task?.kind==='run'?'已创建任务':'等待运行'): '范围在先'}</small></button>`).join('');
     for(let i=1;i<=5;i++) $('step'+i).hidden=i!==step;
-    $('toPortfolio').disabled=!ready || busy || running; $('toConfirm').disabled=!preview || busy || running;
+    $('toPortfolio').disabled=!permissions.canConfigure; $('toConfirm').disabled=!preview || busy || running;
     $('dataGate').textContent=ready?'当前范围已通过所选质量模式的检查。':'历史数据全部通过当前模式检查后才能继续；补数部分成功时仍需处理剩余缺口。';
     $('check').disabled=busy || running;
     $('prepare').disabled=!permissions.canPrepare;
-    $('prepare').textContent=ready?'数据已就绪，无需补数':'补齐所需数据 / 重试';
-    $('run').disabled=busy || running || !preview;
+    $('prepare').textContent=repairLabel(draft.readiness);
+    if (statusUnavailable) { $('prepare').disabled=true; $('check').disabled=true; $('run').disabled=true; }
+    $('refreshTask').hidden=!statusUnavailable; $('taskConnection').hidden=!statusUnavailable;
+    $('exploreChoice').hidden=draft.scope.quality_mode==='exploratory' || !(draft.readiness?.issues || []).some(i=>i.resolution==='user' || String(i.code).includes('PIT'));
+    $('applyExploratory').disabled=busy || running || statusUnavailable || !$('acceptExploratory').checked;
+    $('run').disabled=busy || running || statusUnavailable || !preview;
     $('cancelPrepare').hidden=!(task?.kind==='prepare' && running);
-    $('prepareTask').innerHTML=task?.kind==='prepare'?renderTask(task):'';
+    $('prepareTask').innerHTML=task?.kind==='prepare'?renderTask(task)+(task.result?.repair_attempts?.length?details(task.result.repair_attempts,'本轮处理记录与未解决原因'):''):'';
     $('runTask').innerHTML=task?.kind==='run'?renderTask(task):'<p>尚未启动运行，请先完成配置与确认。</p>';
     $('retryRun').hidden=!(task?.kind==='run' && ['FAILED','CANCELLED','INTERRUPTED'].includes(task.status));
     $('recoverTask').hidden=!(task?.kind==='run' && ['FAILED','CANCELLED','INTERRUPTED'].includes(task.status));
-    renderReadiness(); renderPreview();
+    if (readinessRendered!==draft.readiness) { readinessRendered=draft.readiness; coveragePage=0; renderReadiness(); } renderPreview();
     $('confirmation').innerHTML=metrics([['组合名称',draft.portfolio.name],['初始本金',draft.portfolio.initial_cash],['研究区间',draft.scope.start_date+' → '+draft.scope.end_date],['持有方式','买入并持有至结束日'],['范围',draft.scope.selection_mode==='manual' ? draft.scope.symbols.join(', ') : 'fixed_v0 · '+draft.scope.top_n+' 只'],['数据质量',draft.scope.quality_mode==='strict'?'正式研究':'探索研究'],['佣金',draft.portfolio.commission_rate*100+'%'],['滑点',draft.portfolio.slippage_rate*100+'%'],['权重方式',({equal:'等权',score:'规则评分',custom:'自定义'}[draft.portfolio.weighting])],['最低持仓数',draft.portfolio.min_holdings],['单股权重上限',draft.portfolio.max_single_weight==null?'不限制':draft.portfolio.max_single_weight*100+'%'],['行业权重上限',draft.portfolio.max_industry_weight==null?'不限制':draft.portfolio.max_industry_weight*100+'%']])+(draft.scope.quality_mode==='exploratory'?'<div class="notice danger">本次结果为探索研究，保留数据检查所列历史身份与行业快照限制。</div>':'')+metrics(Object.entries(draft.readiness?.dates || {}).filter(([key])=>['signal_date','entry_date','exit_date','warmup_start_date','horizon','calendar_source'].includes(key)).map(([key,value])=>[({signal_date:'规则信号日',entry_date:'实际建仓日',exit_date:'实际结束日',warmup_start_date:'预热起点',horizon:'持有交易日数',calendar_source:'交易日历来源'}[key]),key==='calendar_source'?calendarLabel(value):value]));
     const result=task?.kind==='run' && task.status==='SUCCEEDED' ? task.result : null;
     $('results').innerHTML=result?.run_id?`<div class="notice success"><h3>运行已保存</h3><p>冻结配置及结果可从最近运行重新打开。</p><a href="/research/review/${encodeURIComponent(result.run_id)}/">打开净值、收益、回撤与持仓审阅 →</a></div>`+metrics([['总收益率',result.summary?.total_return == null ? '—' : (result.summary.total_return*100).toFixed(2)+'%'],['绝对盈亏',result.summary?.profit_loss],['期末权益',result.summary?.ending_equity]])+details(result.summary || {},'运行摘要'):'';
-    document.querySelectorAll('#scopeForm input,#scopeForm select,#scopeForm textarea,#portfolioForm input,#portfolioForm select,#portfolioForm textarea').forEach(el=>el.disabled=running || busy);
+    document.querySelectorAll('#scopeForm input,#scopeForm select,#scopeForm textarea,#portfolioForm input,#portfolioForm select,#portfolioForm textarea').forEach(el=>el.disabled=running || busy || statusUnavailable);
     syncChoices();
   }
   function go(n) { step=n; render(); $('step'+n).querySelector('h2').focus(); }
   async function command(kind) {
-    if (busy) return;
+    if (busy || statusUnavailable || active(task)) return;
     clearError();
     const validation=validateScope(readScope()); if (validation) { go(1); throw new Error(validation); }
     await save(); if(dirty) return;
@@ -187,7 +229,7 @@
         requestKey=localStorage.getItem(key) || draft.id+':'+draft.revision+':'+(crypto.randomUUID ? crypto.randomUUID() : Date.now());
         localStorage.setItem(key,requestKey);
       }
-      const p=await api('/drafts/'+encodeURIComponent(id)+'/'+kind,'POST',{revision:draft.revision,...(kind==='run'?{idempotency_key:requestKey}:{})});
+      const p=await api('/drafts/'+encodeURIComponent(id)+'/'+kind,'POST',{revision:draft.revision,...(kind==='run'?{idempotency_key:requestKey}:{}),...(kind==='prepare' && draft.readiness?.repair_plan?.plan_id?{plan_id:draft.readiness.repair_plan.plan_id}:{})});
       if (!acceptResponse(draft,p.draft,sentEpoch,epoch)) return;
       draft=p.draft; if (p.preview) draft.preview=p.preview;
       if(p.task) {task=p.task; poll();}
@@ -206,21 +248,21 @@
         const fresh=await api('/drafts/'+encodeURIComponent(owner));
         if(!dirty && acceptResponse(draft,fresh.draft,sentEpoch,epoch)) draft=fresh.draft;
       }
-      render();
+      statusUnavailable=false; clearError(); render();
       if(active(task)) pollTimer=setTimeout(poll,1500);
-    } catch(e) { if(draft?.id===owner) { error(new Error('读取任务进度失败，正在重连。'+e.message)); pollTimer=setTimeout(poll,4000); } }
+    } catch(e) { if(draft?.id===owner && task?.id===id) { statusUnavailable=true; render(); error(new Error('状态暂不可获取，已保留当前草稿。可重新获取状态。'+e.message)); pollTimer=setTimeout(poll,4000); } }
   }
   async function openDraft(id) {
     const request=++opening; clearError(); const p=await api('/drafts/'+encodeURIComponent(id));
     if(request!==opening)return;
-    epoch++; draft=p.draft; task=null; dirty=false; requestKey=null;
+    epoch++; draft=p.draft; task=null; statusUnavailable=false; readinessRendered=undefined; dirty=false; requestKey=null;
     fill();
     const saved=localStorage.getItem(localKey(id));
     if(saved) { try { const b=JSON.parse(saved); draft.scope=b.scope; draft.portfolio=b.portfolio; draft.readiness=null; draft.preview=null; dirty=true; fill(); if(b.weightsText!=null)$('weights').value=b.weightsText; $('saveStatus').textContent='已恢复本机未保存输入，请重试保存'; $('retrySave').hidden=false; } catch {} }
     else {$('saveStatus').textContent='已恢复服务端草稿'; $('retrySave').hidden=true;}
     history.replaceState(null,'','/wizard?draft='+encodeURIComponent(id)); $('home').hidden=true; $('editor').hidden=false;
     step=draft.preview?4:draft.readiness?.status==='READY'?3:draft.readiness?2:1;
-    if(draft.task_id) { const response=await api('/tasks/'+encodeURIComponent(draft.task_id)); if(request!==opening)return; task=response.task; if(task.kind==='run')step=5; else if(active(task))step=2; poll(); }
+    if(draft.task_id) { task={id:draft.task_id,status:'QUEUED',kind:'prepare'}; statusUnavailable=true; step=2; await poll(); if(request!==opening)return; if(task.kind==='run')step=5; }
     go(step);
   }
   async function home() {
@@ -245,6 +287,11 @@
   $('scopeForm').addEventListener('submit',e=>{e.preventDefault();command('check').catch(error);});
   $('portfolioForm').addEventListener('submit',e=>{e.preventDefault();command('preview').catch(error);});
   for(const [id,n] of Object.entries({editScope:1,toPortfolio:3,backData:2,toConfirm:4,backPortfolio:3,returnConfig:2})) action(id,()=>go(n));
+  action('refreshTask',poll);
+  $('acceptExploratory').addEventListener('change',render);
+  action('applyExploratory',async()=>{if(!$('acceptExploratory').checked)return; document.querySelector('[name=quality][value=exploratory]').checked=true; $('acceptExploratory').checked=false; changed(true); await command('check');});
+  $('readiness').addEventListener('change',e=>{const key={issueSymbol:'symbol',issueCategory:'category',issuePhase:'phase'}[e.target.id]; if(key){issueFilters[key]=e.target.value; $('issueGroups').innerHTML=issuesHtml(draft.readiness?.issues || [],issueFilters);}});
+  $('readiness').addEventListener('click',e=>{const b=e.target.closest('[data-page]'); if(b && !b.disabled){coveragePage=Number(b.dataset.page); renderReadiness(); $('readiness').querySelector('[data-page]')?.focus();} if(e.target.id==='exportDiagnostics'){const url=URL.createObjectURL(new Blob([JSON.stringify(draft.readiness,null,2)],{type:'application/json'})); const a=document.createElement('a'); a.href=url; a.download='data-diagnostics.json'; a.click(); URL.revokeObjectURL(url);}});
   action('check',()=>command('check')); action('prepare',()=>command('prepare')); action('run',()=>command('run'));
   action('retryRun',()=>{requestKey=null;localStorage.removeItem('alphalab.wizard.submit.'+draft.id+'.'+draft.revision);return command('run');});
   action('recoverTask',async()=>{const p=await api('/drafts','POST',{source_task_id:task.id});await openDraft(p.draft.id);});

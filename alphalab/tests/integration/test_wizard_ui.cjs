@@ -51,3 +51,45 @@ test('rule selection never sends hidden manual codes while manual selection reta
  assert.equal(h.selectionSymbols('rule','000001, 600000').length,0);
  assert.equal(h.selectionSymbols('manual','000001, 600000').join(','),'000001,600000');
 });
+test('repair gates honor server actions and keep legacy compatibility',()=>{
+ const h=helpers();
+ assert.equal(h.gates({readiness:{status:'BLOCKED',repair_plan:{executable_count:0}}},null,false,false).canPrepare,false);
+ assert.equal(h.gates({readiness:{status:'BLOCKED',repair_plan:{executable_count:2}}},null,false,false).canPrepare,true);
+ assert.match(h.repairLabel({repair_plan:{executable_count:2,actions:[{kind:'verify'}]}}),/核实交易状态.*2/);
+ assert.match(h.repairLabel({repair_plan:{executable_count:1,actions:[{kind:'download'}]}}),/修复可处理项.*1/);
+});
+test('large report groups and filters evidence without losing raw diagnostics',()=>{
+ const h=helpers(); const issues=Array.from({length:306},(_,i)=>({symbol:String(i%154).padStart(6,'0'),resolution:i%2?'download':'verify',phase:'entry',code:'MISSING',message:'<unsafe>',date_ranges:[{start:'2021-03-02',end:'2021-03-03'}],evidence:{source:'fixture'}}));
+ assert.equal(h.filterIssues(issues,{symbol:'000001'}).length,2);
+ const html=h.issuesHtml(issues,{}); assert.match(html,/可自动处理/); assert.match(html,/需核实/); assert.match(html,/2021-03-02/); assert.doesNotMatch(html,/<unsafe>/);
+ const rows=Array.from({length:154},(_,i)=>({symbol:String(i).padStart(6,'0'),status:'READY'}));
+ assert.equal((h.coverageHtml(rows).match(/<article/g)||[]).length,25);
+ assert.match(h.coverageHtml(rows,6),/000153/);
+ assert.match(h.attemptSummary({status:'PARTIAL',result:{attempts:[{outcome:'repaired'},{outcome:'unchanged'},{outcome:'failed'}]}}),/已处理 1.*未变化 1.*请求失败 1/);
+});
+
+test('backend repair kinds and persisted summaries are presented accurately',()=>{
+ const h=helpers();
+ assert.match(h.repairLabel({repair_plan:{executable_count:3,actions:[{kind:'verify_status'}]}}),/核实交易状态.*3/);
+ assert.match(h.repairLabel({repair_plan:{executable_count:2,actions:[{kind:'bars'},{kind:'entry'}]}}),/修复可处理项.*2/);
+ assert.match(h.attemptSummary({result:{repair_summary:{resolved:2,unchanged:3,failed:1}}}),/已处理 2.*未变化 3.*请求失败 1/);
+ assert.match(h.attemptSummary({result:{repair_attempts:[{status:'resolved'},{status:'unresolved'}]}}),/已处理 1.*未变化 1/);
+});
+test('issue labels and coverage distinguish unverified status from repairable data',()=>{
+ const h=helpers();
+ assert.equal(h.diagnosticLabel('source_capability'),'来源能力不足');
+ assert.equal(h.diagnosticLabel('holding'),'持有');
+ const issues=[{symbol:'000001',resolution:'verify',phase:'holding',category:'status_unknown'}];
+ assert.match(h.issuesHtml(issues),/阶段：持有 · 类型：状态待核实/);
+ const html=h.coverageHtml([{symbol:'000001',status:'INVALID'}],0,issues);
+ assert.match(html,/需核实交易状态/); assert.doesNotMatch(html,/需修复数据/);
+ assert.match(h.coverageHtml([{symbol:'000001',status:'INVALID'}],0,[{symbol:'000001',resolution:'unsupported'}]),/当前能力不支持/);
+});
+
+test('scope invalidation detaches previous task summaries without mutating saved attempts',()=>{
+ const h=helpers(), previous={id:'old',status:'PARTIAL',result:{repair_attempts:[{status:'resolved'}]}};
+ assert.equal(h.taskForDraft(previous,{task_id:null}),null);
+ assert.equal(h.taskForDraft(previous,{task_id:'new'}),null);
+ assert.equal(h.taskForDraft(previous,{task_id:'old'}),previous);
+ assert.equal(previous.result.repair_attempts[0].status,'resolved');
+});

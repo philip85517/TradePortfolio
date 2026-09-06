@@ -237,14 +237,30 @@ class ResearchWorkflow:
         thread.start()
         return task
 
-    def prepare(self, draft_id, revision):
+    def prepare(self, draft_id, revision, plan_id=None):
         with self._lock:
             draft = self._current(draft_id, revision)
             for task in self._all('tasks'):
                 if (task['draft_id'] == draft_id and task['kind'] == 'prepare'
                     and task['revision'] == revision and task['status'] in {'QUEUED', 'RUNNING'}):
                     return task
-            draft.update(readiness=None, preview=None)
+        fresh = self.backend.inspect(deepcopy(draft['scope']))
+        plan = fresh.get('repair_plan')
+        with self._lock:
+            draft = self._current(draft_id, revision)
+            if plan_id is not None and (not plan or plan['plan_id'] != plan_id):
+                draft.update(readiness=self._readiness(fresh), preview=None)
+                self._put('drafts', draft)
+                raise WorkflowError('修复计划已变化，请重新检查后继续', 'REPAIR_PLAN_CHANGED', 2)
+            if plan is not None and not plan.get('executable_count'):
+                draft.update(readiness=self._readiness(fresh), preview=None)
+                self._put('drafts', draft)
+                raise WorkflowError('当前没有可自动处理项，请查看检查结果中的处理方式', 'NO_REPAIR_ACTIONS', 2)
+            for task in self._all('tasks'):
+                if (task['draft_id'] == draft_id and task['kind'] == 'prepare'
+                    and task['revision'] == revision and task['status'] in {'QUEUED','RUNNING'}):
+                    return task
+            draft.update(readiness=self._readiness(fresh) if plan is not None else None, preview=None)
             return self._new_task(draft, 'prepare', uuid4().hex)
 
     def run(self, draft_id, revision, idempotency_key):
@@ -314,8 +330,16 @@ class ResearchWorkflow:
                 progress('检查研究数据' if self.get_task(task_id)['kind'] == 'prepare' else '运行历史模拟')
                 task = self.get_task(task_id)
                 if task['kind'] == 'prepare':
+                    expected = (draft.get('readiness') or {}).get('repair_plan')
+                    if expected:
+                        fresh = self.backend.inspect(deepcopy(draft['scope']))
+                        if fresh.get('repair_plan', {}).get('plan_id') != expected['plan_id']:
+                            raise WorkflowError('修复计划已变化，请重新检查后继续', 'REPAIR_PLAN_CHANGED', 2)
                     result = self.backend.prepare(deepcopy(draft['scope']), progress, cancelled)
                     status = 'SUCCEEDED' if result.get('status') == 'READY' else 'PARTIAL'
+                    summary = result.get('repair_summary', {})
+                    if summary.get('failed') and not summary.get('resolved'):
+                        status = 'FAILED'
                 else:
                     result = self.backend.run(deepcopy(draft['scope']), deepcopy(draft['portfolio']),
                                               deepcopy(draft['readiness']), self.runs_dir)
