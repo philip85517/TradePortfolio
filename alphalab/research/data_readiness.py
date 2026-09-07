@@ -21,7 +21,7 @@ def make_issue(code, message, action, *, symbol=None, dates=(), phase='identity'
     identity = dict(code=code, symbol=symbol, phase=phase, date_ranges=ranges)
     category = {'download': 'data_missing', 'verify': 'status_unknown',
                 'unsupported': 'market_event', 'none': 'market_event', 'user': 'source_capability'}[resolution]
-    if code in {'INVALID_BARS', 'ADJUSTMENT_UNAVAILABLE'}:
+    if code in {'INVALID_BARS', 'ADJUSTMENT_UNAVAILABLE', 'ADJUSTMENT_STANDARDIZATION_REQUIRED'}:
         category = 'data_conflict'
     actions = {'verify': '先核实这些日期的交易状态；不会将零成交量自动认定为停牌',
                'unsupported': '当前回测不支持此市场事件；补数无法解决。修改范围会改变实验样本',

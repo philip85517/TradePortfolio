@@ -524,7 +524,7 @@ class WizardResearchBackend:
             adjustments = set(part.get('adjustment', pd.Series(['unknown'])).astype(str).str.lower())
             result['coverage'][-1]['adjustment'] = next(iter(adjustments)) if len(adjustments) == 1 else 'mixed'
             result['coverage'][-1]['price_sources'] = sorted(part.price_source.dropna().astype(str).unique()) if 'price_source' in part else []
-            if len(adjustments) != 1 or adjustments & {'unknown', 'none', 'nan', ''}:
+            if adjustments != {'hfq'}:
                 from .inspection_snapshot import frame_fingerprint
                 from .source_capabilities import load_adjustment_limitation
                 basis = frame_fingerprint(part[[c for c in ('symbol','date','open','high','low','close','adjustment') if c in part]])
@@ -535,6 +535,10 @@ class WizardResearchBackend:
                 if limitation:
                     issue('SOURCE_ADJUSTMENT_UNAVAILABLE', f'{symbol} 来源未提供请求的后复权口径，需核实证券身份或更换来源',
                           '查看原始响应；来源条件改变后可显式重新核实，禁止修改复权标签', dates=part.date, phase='prices', evidence=limitation)
+                elif adjustments == {'qfq'}:
+                    issue('ADJUSTMENT_STANDARDIZATION_REQUIRED', f'{symbol} 当前为前复权，需统一为经校验的后复权',
+                          resolution='download', dates=part.date, phase='prices',
+                          evidence={'current_adjustment': 'qfq', 'target_adjustment': 'hfq', 'policy': 'uniform-hfq-v1'})
                 else:
                     issue('ADJUSTMENT_UNAVAILABLE', f'{symbol} 复权口径未知或不一致', dates=part.date, phase='prices', evidence={'adjustments': sorted(adjustments)})
             result['issues'].extend(liquidity_issues(part, symbol, rule, dates, policy=POLICY_VERSION))
@@ -553,7 +557,7 @@ class WizardResearchBackend:
                 transition = transition_issue(symbol, dates['signal_date'], dates['exit_date'])
                 if transition:
                     result['issues'].append(transition)
-            price_codes = {'INVALID_BARS', 'ADJUSTMENT_UNAVAILABLE', 'UNTRADABLE', 'MISSING_FACTOR_FIELD', 'SUSPENDED', 'TRADING_STATUS_UNKNOWN', 'SOURCE_ADJUSTMENT_UNAVAILABLE'}
+            price_codes = {'INVALID_BARS', 'ADJUSTMENT_UNAVAILABLE', 'ADJUSTMENT_STANDARDIZATION_REQUIRED', 'UNTRADABLE', 'MISSING_FACTOR_FIELD', 'SUSPENDED', 'TRADING_STATUS_UNKNOWN', 'SOURCE_ADJUSTMENT_UNAVAILABLE'}
             if any(i['code'] in price_codes and i.get('severity','blocking') == 'blocking' for i in result['issues'][issue_count:]):
                 result['coverage'][-1]['status'] = 'INVALID'
         current_symbol = None
@@ -563,7 +567,7 @@ class WizardResearchBackend:
         result['adjustment_summary'] = adjustment_summary(result['coverage'])
         checkpoint(f'逐股检查 {len(symbols)}/{len(symbols)} 只')
         from .inspection_snapshot import frame_fingerprint
-        result['data_identity'] = json_hash({'version': 'inspection-v4', 'suspension_policy': POLICY_VERSION, 'identity_policy': IDENTITY_VERSION,
+        result['data_identity'] = json_hash({'version': 'inspection-v5', 'adjustment_policy': 'uniform-hfq-v1', 'suspension_policy': POLICY_VERSION, 'identity_policy': IDENTITY_VERSION,
             'data': frame_fingerprint(data, cancelled=cancelled, progress=checkpoint),
             'history': frame_fingerprint(history, cancelled=cancelled), 'dates': dates, 'scope': scope,
             'sources': sources})
@@ -640,6 +644,7 @@ class WizardResearchBackend:
             data_quality_mode=scope.get('quality_mode', 'strict'),
             portfolios=(PortfolioSpec('strategy', name=name),),
             wizard_metadata={'scope': scope, 'portfolio': portfolio, 'dates': readiness['dates'],
+                             'adjustment_policy': 'uniform-hfq-v1', 'adjustment_summary': readiness.get('adjustment_summary'),
                              'data_identity': readiness['data_identity'], 'warnings': readiness['warnings'],
                              'benchmark_disabled_reason': '向导不以缺失未来数据的股票池构造基准，以避免幸存者偏差',
                              'holding_method': 'buy_and_hold', 'price_basis': 'adjusted returns anchored to raw entry open when available'})

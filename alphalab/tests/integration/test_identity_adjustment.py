@@ -79,8 +79,62 @@ def test_fixed_rule_and_real_entry_lots_are_invariant_under_constant_price_scale
     config=portfolio();config.update(weighting='equal',min_holdings=1)
     first=backend.preview(request,config,backend.inspect(request))
     adapter.bars.loc[adapter.bars.symbol.eq('000001'),['open','high','low','close']]*=7.
-    adapter.bars.loc[adapter.bars.symbol.eq('000001'),'adjustment']='qfq'
     second=backend.preview(request,config,backend.inspect(request))
     assert [h['symbol'] for h in second['holdings']]==[h['symbol'] for h in first['holdings']]
     assert second['holdings'][0]['shares']==first['holdings'][0]['shares']
     assert second['cash_residual']==pytest.approx(first['cash_residual'])
+
+
+def test_qfq_is_planned_for_verified_hfq_replacement(tmp_path):
+    backend,adapter=make_backend(tmp_path)
+    adapter.bars.loc[adapter.bars.symbol.eq('600000'),'adjustment']='qfq'
+    ready=backend.inspect(scope())
+    issue=next(i for i in ready['issues'] if i['code']=='ADJUSTMENT_STANDARDIZATION_REQUIRED')
+    assert issue['symbol']=='600000'
+    assert issue['resolution']=='download'
+    assert ready['status']=='BLOCKED'
+    action=next(a for a in ready['repair_plan']['actions'] if a['symbol']=='600000')
+    assert action['kind']=='bars'
+    assert action['start']==ready['dates']['warmup_start_date']
+    assert action['end']==ready['dates']['exit_date']
+    assert ready['adjustment_summary']['target']=='hfq'
+    assert ready['adjustment_summary']['remaining_symbols']==['600000']
+
+
+def test_uniform_repair_publishes_new_prices_and_retains_original_source(tmp_path):
+    from etf_strategy.src.market_data_store import normalize_bars
+    backend,adapter=make_backend(tmp_path)
+    adapter.bars.loc[adapter.bars.symbol.eq('600000'),'adjustment']='qfq'
+    class Provider:
+        def fetch_ohlcv(self,request):
+            data=adapter.load(request.start.date(),request.end.date(),symbols=[request.symbol])
+            data[['open','high','low','close']]*=5
+            data['adjustment']='hfq';data['ts']=data.date;data['timeframe']='1d'
+            return normalize_bars(data)
+    backend.provider=Provider()
+    ready=backend.prepare(scope(),lambda _:None,lambda:False)
+    assert ready['status']=='READY',ready['issues']
+    assert ready['adjustment_summary']['stock_counts']=={'hfq':2}
+    assert ready['adjustment_summary']['remaining_symbols']==[]
+    assert set(adapter.bars[adapter.bars.symbol.eq('600000')].adjustment)=={'qfq'}
+    _,data,_=backend._inspect(scope())
+    assert data.loc[data.symbol.eq('600000'),'close'].iloc[0]==52.5
+
+
+def test_qfq_source_refusal_stops_ordinary_uniform_retries(tmp_path):
+    from etf_strategy.src.market_data_store import normalize_bars
+    backend,adapter=make_backend(tmp_path)
+    adapter.bars.loc[adapter.bars.symbol.eq('600000'),'adjustment']='qfq'
+    calls=[]
+    class Provider:
+        def fetch_ohlcv(self,request):
+            calls.append(request.symbol)
+            data=adapter.load(request.start.date(),request.end.date(),symbols=[request.symbol])
+            data['ts']=data.date;data['timeframe']='1d'
+            return normalize_bars(data)
+    backend.provider=Provider()
+    ready=backend.prepare(scope(),lambda _:None,lambda:False)
+    assert any(i['code']=='SOURCE_ADJUSTMENT_UNAVAILABLE' for i in ready['issues'])
+    assert ready['repair_plan']['executable_count']==0
+    backend.prepare(scope(),lambda _:None,lambda:False)
+    assert calls==['600000']

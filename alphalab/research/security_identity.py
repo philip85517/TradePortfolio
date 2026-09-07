@@ -52,12 +52,13 @@ def transition_issue(symbol, signal, exit_date):
 
 def adjustment_summary(coverage):
     counts = dict(sorted(Counter(r.get('adjustment', 'unknown') for r in coverage).items()))
-    return {'stock_counts': counts,
+    return {'stock_counts': counts, 'target': 'hfq', 'policy': 'uniform-hfq-v1',
+            'remaining_symbols': [r['symbol'] for r in coverage if r.get('adjustment') != 'hfq'],
             'mixed_symbols': [r['symbol'] for r in coverage if r.get('adjustment') == 'mixed'],
             'unknown_symbols': [r['symbol'] for r in coverage if r.get('adjustment', 'unknown') not in {'qfq','hfq','mixed'}],
             'source_stock_counts': dict(sorted(Counter(source for r in coverage for source in r.get('price_sources', [])).items())),
             'execution_basis': '建仓数量以未复权开盘价为锚；研究收益使用单股连续复权序列',
-            'limitation': '不同股票使用前/后复权不等于同一股票混用口径。当前规则依赖收益率和均线关系，只有同股序列之间为固定正比例时才具有尺度不变性；标签一致不能证明算法、因子或跨来源收益一致。不可直接比较复权价格高低，也不能把复权价当作实际成交报价。'}
+            'limitation': '研究行情统一为后复权。前复权数据须重新获取并校验后复权序列，不能只改标签；不合格响应保留原数据并阻断研究。未复权成交价独立保存，用于实际本金与整手数量计算。旧运行保持原有冻结口径。'}
 
 
 def pit_evidence(history, symbols, required_fields):

@@ -30,8 +30,8 @@
     if (!Array.isArray(rows) || !rows.length) return '<p class="muted">尚未得到逐股覆盖检查，请先处理上方数据问题。</p>';
     return '<h3>历史数据覆盖与缺口</h3><div class="coverage-list">'+rows.slice(page*25,page*25+25).map(row=>{
       const resolutions=new Set(issues.filter(i=>i.symbol===row.symbol && !['info','warning'].includes(i.severity)).map(i=>i.resolution));
-      const state=resolutions.has('unsupported')?'UNSUPPORTED':resolutions.has('verify')?'NEEDS_VERIFICATION':row.status;
-      const status={READY:'已就绪',MISSING:'需补齐',INVALID:'需修复数据',NEEDS_VERIFICATION:'需核实交易状态',UNSUPPORTED:'当前能力不支持'}[state] || '待检查';
+      const state=resolutions.has('unsupported')?'UNSUPPORTED':resolutions.has('verify')?'NEEDS_VERIFICATION':issues.some(i=>i.symbol===row.symbol && i.code==='ADJUSTMENT_STANDARDIZATION_REQUIRED')?'NEEDS_ADJUSTMENT':row.status;
+      const status={READY:'已就绪',NEEDS_ADJUSTMENT:'待统一后复权',MISSING:'需补齐',INVALID:'需修复数据',NEEDS_VERIFICATION:'需核实交易状态',UNSUPPORTED:'当前能力不支持'}[state] || '待检查';
       const adjustment={hfq:'后复权',qfq:'前复权',raw:'不复权',none:'不复权',mixed:'复权口径不一致'}[row.adjustment] || row.adjustment;
       const missing=row.missing_dates || [];
       return `<article class="notice ${state==='READY'?'success':'danger'}"><strong>${esc(row.symbol)} ${esc(row.name)} · ${esc(status)}</strong><p>已覆盖 ${esc(row.available_sessions ?? 0)} / ${esc(row.required_sessions ?? '待确定')} 个所需交易日${adjustment?' · '+esc(adjustment):''}</p>${missing.length?`<p>缺少 ${missing.length} 个交易日：${missing.map(esc).join('、')}</p>`:''}</article>`;
@@ -74,7 +74,12 @@
   function adjustmentHtml(summary) {
     if (!summary) return '';
     const labels={qfq:'前复权',hfq:'后复权',none:'未复权',mixed:'单股混用',unknown:'口径未知'};
-    return '<section class="notice"><h3>复权口径与来源</h3><p>'+Object.entries(summary.stock_counts || {}).map(([key,n])=>`${esc(labels[key] || key)}：${esc(n)} 只`).join(' · ')+`</p><p>单股混用：${esc((summary.mixed_symbols || []).length)} 只 · 未复权／未知：${esc((summary.unknown_symbols || []).length)} 只</p><p>${esc(summary.execution_basis)}</p><p>${esc(summary.limitation)}</p><details><summary>查看数据来源</summary>`+Object.entries(summary.source_stock_counts || {}).map(([key,n])=>`<p>${esc(key)}：${esc(n)} 只</p>`).join('')+'</details></section>';
+    return '<section class="notice"><h3>复权口径与来源</h3>'+ (summary.target ? `<p><strong>统一目标：后复权 · 待统一 ${esc((summary.remaining_symbols || []).length)} 只</strong></p>` : '') + '<p>'+ Object.entries(summary.stock_counts || {}).map(([key,n])=>`${esc(labels[key] || key)}：${esc(n)} 只`).join(' · ')+`</p><p>单股混用：${esc((summary.mixed_symbols || []).length)} 只 · 未复权／未知：${esc((summary.unknown_symbols || []).length)} 只</p><p>${esc(summary.execution_basis)}</p><p>${esc(summary.limitation)}</p><details><summary>查看数据来源</summary>`+Object.entries(summary.source_stock_counts || {}).map(([key,n])=>`<p>${esc(key)}：${esc(n)} 只</p>`).join('')+'</details></section>';
+  }
+  function pendingReadinessHtml(t) {
+    if (t?.kind !== 'prepare' || !['QUEUED','RUNNING','CANCELLING'].includes(t.status)) return '';
+    const summary=t.configuration?.readiness?.adjustment_summary;
+    return '<div class="notice"><strong>'+ (summary?.target==='hfq' && summary.remaining_symbols?.length ? '正在统一后复权数据' : '正在准备历史数据') + '</strong><p>完成后自动重新校验。以下为本轮开始时的统计，不代表当前已就绪。</p></div>'+adjustmentHtml(summary);
   }
   function liquidationHtml(summary) {
     if (summary?.liquidation_status !== 'OPEN_POSITION') return '';
@@ -84,7 +89,7 @@
   function taskForDraft(currentTask, value) { return currentTask?.id === value.task_id ? currentTask : null; }
   function selectionSymbols(mode, text) { return mode==='manual' ? text.split(/[\s,，;；]+/).filter(Boolean) : []; }
   function unfinishedDrafts(rows) { return rows.filter(row=>!(row.task_kind==='run' && row.task_status==='SUCCEEDED')); }
-  if (typeof module !== 'undefined') module.exports = {validateScope, acceptResponse, coverageHtml, calendarLabel, gates, unfinishedDrafts, selectionSymbols, repairLabel, filterIssues, issuesHtml, attemptSummary, diagnosticLabel, taskForDraft, taskTiming, liquidationHtml, adjustmentHtml};
+  if (typeof module !== 'undefined') module.exports = {validateScope, acceptResponse, coverageHtml, calendarLabel, gates, unfinishedDrafts, selectionSymbols, repairLabel, filterIssues, issuesHtml, attemptSummary, diagnosticLabel, taskForDraft, taskTiming, liquidationHtml, adjustmentHtml, pendingReadinessHtml};
   if (typeof document === 'undefined') return;
   const $ = id => document.getElementById(id);
   const fmt = v => v == null ? '—' : typeof v === 'number' ? v.toLocaleString('zh-CN',{maximumFractionDigits:2}) : String(v);
@@ -176,7 +181,7 @@
   function details(value,label='检查详情') { return `<details><summary>${esc(label)}</summary><pre>${esc(JSON.stringify(value,null,2))}</pre></details>`; }
   function renderReadiness() {
     const r=draft.readiness;
-    if (!r) { $('readiness').innerHTML='<div class="notice">尚未检查，或研究范围已修改。请重新检查数据。</div>'; return; }
+    if (!r) { $('readiness').innerHTML=pendingReadinessHtml(task) || '<div class="notice">尚未检查，或研究范围已修改。请重新检查数据。</div>'; return; }
     const ready=r.status==='READY';
     let html=`<div class="notice ${ready?'success':'danger'}"><strong>${ready?'数据已就绪，可以配置组合':'数据尚未就绪，需先处理以下问题'}</strong></div>`;
     html+=adjustmentHtml(r.adjustment_summary);

@@ -126,3 +126,16 @@ test('adjustment overview distinguishes per-stock scale from mixed series and pr
  assert.match(html,/前复权.*365/);assert.match(html,/后复权.*4540/);assert.match(html,/单股混用.*0/);assert.match(html,/未复权开盘价/);assert.match(html,/&lt;cache&gt;/);
  assert.equal(h.adjustmentHtml(null),'');
 });
+
+test('uniform adjustment target and pending stock have explicit labels', () => {
+ const h=helpers(); const summary=h.adjustmentHtml({target:'hfq',remaining_symbols:['000001'],stock_counts:{qfq:1}});
+ assert.match(summary,/统一目标：后复权/);assert.match(summary,/待统一 1 只/);
+ const html=h.coverageHtml([{symbol:'000001',status:'INVALID',adjustment:'qfq'}],0,[{symbol:'000001',code:'ADJUSTMENT_STANDARDIZATION_REQUIRED',resolution:'download',severity:'blocking'}]);
+ assert.match(html,/待统一后复权/);
+});
+
+test('running uniform migration shows frozen target without claiming readiness', () => {
+ const h=helpers();const task={kind:'prepare',status:'RUNNING',configuration:{readiness:{adjustment_summary:{target:'hfq',remaining_symbols:['000001'],stock_counts:{qfq:1}}}}};
+ const html=h.pendingReadinessHtml(task);assert.match(html,/正在统一/);assert.match(html,/本轮开始时/);assert.match(html,/待统一 1 只/);assert.doesNotMatch(html,/可以配置组合/);
+ assert.equal(h.pendingReadinessHtml({...task,status:'SUCCEEDED'}),'');assert.equal(h.pendingReadinessHtml({...task,kind:'run'}),'');
+});
