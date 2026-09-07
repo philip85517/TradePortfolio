@@ -14,8 +14,11 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+from copy import deepcopy
+import threading
 
 import pandas as pd
+import numpy as np
 
 from ..utils import json_hash, parse_date
 from .data_binding import auto_bind_research_db, DataBindingError
@@ -25,6 +28,7 @@ from .engine import (DuckDBMarketDataAdapter, HistoricalResearchLab, InMemoryMar
                      _validate_universe_quality)
 from .plugins import FixedV0Plugin, factor_definition, validate_plugin_output
 from .data_readiness import make_issue, liquidity_issues, finalize_readiness
+from .suspension_policy import POLICY_VERSION, prepare_view, apply_candidate_policy, suspended_rows
 
 
 def _merge_history(existing, incoming):
@@ -115,16 +119,28 @@ class FrozenBinding:
             con.register('frozen_metadata', metadata)
             con.execute('DROP TABLE IF EXISTS market_universe')
             con.execute('CREATE TABLE market_universe AS SELECT * FROM frozen_metadata')
+            if 'tradestatus' in data:
+                states = data[['symbol', 'date', 'adjustment', 'tradestatus']].copy()
+                con.register('frozen_states', states)
+                con.execute('CREATE TABLE frozen_trading_status AS SELECT * FROM frozen_states')
+            con.register('frozen_selection', self.adapter.selection_bars)
+            con.execute('CREATE TABLE frozen_selection_bars AS SELECT * FROM frozen_selection')
+            if not self.adapter.history.empty:
+                con.register('frozen_history', self.adapter.history)
+                con.execute('CREATE TABLE frozen_universe_history AS SELECT * FROM frozen_history')
         return ['market_data.duckdb']
 
 
 class WizardResearchBackend:
+    supports_inspection_progress = True
     def __init__(self, db_path='auto', cache_dir=None, *, calendar=None, provider=None, adapter=None):
         self.db_path = db_path
         self.cache_dir = Path(cache_dir or Path(__file__).resolve().parents[2] / '.alphalab/wizard-data')
         self.calendar = calendar
         self.provider = provider
         self.adapter = adapter
+        self._inspection_lock = threading.RLock()
+        self._inspection_cache = None
 
     def _validate_scope(self, scope):
         if scope.get('market', 'a_share') != 'a_share':
@@ -280,11 +296,97 @@ class WizardResearchBackend:
             data['execution_open'] = data['execution_open'].fillna(values) if 'execution_open' in data else values
         return data, history, sources
 
-    def _inspect(self, scope):
-        result, data, history = self._inspect_raw(scope)
-        return finalize_readiness(result), data, history
+    def _repair_source_identity(self):
+        return {'provider': 'baostock' if self.provider is None else type(self.provider).__module__ + '.' + type(self.provider).__qualname__,
+                'protocol': 'daily-adjustment-v1', 'database': str(self.db_path)}
 
-    def _inspect_raw(self, scope):
+    def retry_source(self, scope, symbol, progress=None, cancelled=None):
+        from .source_capabilities import clear_adjustment_limitation, record_adjustment_limitation
+        from .data_repair import validate_and_publish, save_attempt, retry_transient, AdjustmentUnavailable
+        from etf_strategy.src.market_data_providers import FetchRequest
+        progress = progress or (lambda message: None)
+        cancelled = cancelled or (lambda: False)
+        def checkpoint(message):
+            if cancelled():
+                raise InterruptedError('已取消来源核实；原有限制证据保留')
+            progress(message)
+        current = self.inspect(scope, progress=progress, cancelled=cancelled)
+        issue = next((i for i in current['issues'] if i['code'] == 'SOURCE_ADJUSTMENT_UNAVAILABLE' and i['symbol'] == symbol), None)
+        if issue is None:
+            raise ValueError('当前没有此股票的来源限制记录，请重新检查')
+        evidence = issue['evidence']
+        start, end = evidence['start'], evidence['end']
+        action = {'kind': 'reverify_source', 'symbol': symbol, 'start': start, 'end': end,
+                  'requested_adjustment': evidence['requested_adjustment']}
+        record = {'action': action, 'query': action, 'before_identity': current.get('data_identity')}
+        try:
+            checkpoint(f'向来源重新请求 {symbol} 的后复权行情；原有限制证据保留')
+            def execute():
+                if self.provider is None:
+                    self._provision_symbol(symbol, start, end, cancelled)
+                else:
+                    frame = self.provider.fetch_ohlcv(FetchRequest('a_share', symbol, '1d', pd.Timestamp(start), pd.Timestamp(end), options={'adjust': 'hfq'}))
+                    checkpoint(f'校验 {symbol} 重新核实的来源响应')
+                    validate_and_publish(frame, self.cache_dir / 'market_data.duckdb', symbol, start, end, cancelled=cancelled)
+            retry_transient(execute, cancelled, progress)
+            clear_adjustment_limitation(self.cache_dir, evidence['source_identity'], symbol,
+                start, end, evidence['requested_adjustment'], data_identity=evidence['data_identity'])
+            record['status'] = 'resolved'
+        except AdjustmentUnavailable as exc:
+            updated = record_adjustment_limitation(self.cache_dir, evidence['source_identity'], symbol,
+                start, end, exc.requested_adjustment, exc.returned_adjustment,
+                data_identity=evidence['data_identity'], response_evidence=exc.response_evidence)
+            record.update(status='unsupported', result=updated, error=str(exc))
+        except InterruptedError:
+            record['status'] = 'cancelled'
+            raise
+        except Exception as exc:
+            record.update(status='failed', error=str(exc))
+            raise
+        finally:
+            record['execution_record'] = str(save_attempt(self.cache_dir, record))
+        return record
+
+    def _source_revision(self):
+        from .data_binding import (default_research_db_candidates, default_research_universe_cache_path,
+                                   default_research_industry_cache_path)
+        from .inspection_snapshot import file_revisions
+        paths = list(default_research_db_candidates()) if str(self.db_path) == 'auto' else [Path(self.db_path)]
+        paths.extend([default_research_universe_cache_path(), default_research_industry_cache_path()])
+        for parent in {p.parent for p in paths}:
+            paths.extend(parent.glob('*.duckdb'))
+        paths.extend(self.cache_dir.glob('*.duckdb'))
+        paths.extend(self.cache_dir.glob('*.json'))
+        paths.extend((self.cache_dir / 'source_capabilities').glob('*.json'))
+        paths.extend(Path(str(p)+'.wal') for p in list(paths) if p.suffix == '.duckdb')
+        return file_revisions(paths)
+
+    def _inspect(self, scope, progress=None, cancelled=None):
+        progress = progress or (lambda message: None)
+        cancelled = cancelled or (lambda: False)
+        def checkpoint(message):
+            if cancelled():
+                raise InterruptedError('已取消数据检查；已验证缓存保留')
+            progress(message)
+        from .inspection_snapshot import frame_fingerprint
+        with self._inspection_lock:
+            checkpoint('加载历史数据和元数据')
+            # Mutable injected test adapters have no durable revision contract.
+            revision = self._source_revision() if self.adapter is None and self.calendar is None else None
+            key = json_hash({'scope': scope, 'files': revision}) if revision is not None else None
+            if key is not None and self._inspection_cache and self._inspection_cache[0] == key:
+                checkpoint('复用已验证快照；数据版本未变化')
+                _, result, data, history = self._inspection_cache
+                return deepcopy(result), data.copy(), history.copy()
+            result, data, history = self._inspect_raw(scope, checkpoint, cancelled)
+            result = finalize_readiness(result)
+            if key is not None:
+                if self._source_revision() != revision:
+                    raise ValueError('DATA_CHANGED：检查期间数据已变化，请重新检查')
+                self._inspection_cache = (key, deepcopy(result), data.copy(), history.copy())
+            return result, data, history
+
+    def _inspect_raw(self, scope, checkpoint=lambda message:None, cancelled=lambda:False):
         result = {'status': 'BLOCKED', 'issues': [], 'dates': {}, 'coverage': [],
                   'data_identity': None, 'binding': {}, 'requirement_id': json_hash(scope),
                   'warnings': []}
@@ -308,6 +410,7 @@ class WizardResearchBackend:
         except Exception as exc:
             issue('SOURCE_UNAVAILABLE', f'读取历史数据失败：{exc}')
             return result, pd.DataFrame(), pd.DataFrame()
+        checkpoint('校验历史身份和研究范围')
         strict = scope.get('quality_mode', 'strict') == 'strict'
         rule = scope.get('selection_mode') == 'rule'
         symbols = list(scope.get('symbols', []))
@@ -331,11 +434,15 @@ class WizardResearchBackend:
         if not rule:
             result['warnings'].append('手选股票清单存在事后选择偏差，不代表无偏历史股票池')
         signal = pd.Timestamp(dates['signal_date'])
+        research_view = prepare_view(data, signal, dates['entry_date'], dates['exit_date']) if not data.empty else data
+        result['suspension_policy'] = POLICY_VERSION
         selected_symbols = set() if rule else set(symbols)
+        checkpoint('计算信号日候选；仅使用历史可见数据')
         if rule and not data.empty:
-            before = data[data.date <= signal]
+            before = research_view[research_view.date <= signal]
             try:
                 candidates, _ = FixedV0Plugin().score(before.copy(deep=True))
+                candidates = apply_candidate_policy(candidates, before, signal)
                 selected_symbols = set(candidates[candidates.eligible].sort_values(
                     ['total_score', 'symbol'], ascending=[False, True]).head(int(scope.get('top_n', 10))).symbol)
             except (ValueError, KeyError, TypeError):
@@ -345,12 +452,24 @@ class WizardResearchBackend:
         if rule:
             result['warnings'].append('规则仅要求选中股票覆盖完整持有区间；未选中股票保留信号日前筛选证据。向导不计算全股票池基准，避免缺失或退市造成幸存者偏差。')
         all_expected = {pd.Timestamp(d) for d in required}
-        for symbol in symbols:
+        groups = {str(symbol): part for symbol, part in data.groupby('symbol', sort=False)} if not data.empty else {}
+        histories = {str(symbol): part for symbol, part in history.groupby('symbol', sort=False)} if not history.empty else {}
+        known_symbols = set(histories)
+        prices = data.reindex(columns=['open','high','low','close']).apply(pd.to_numeric, errors='coerce')
+        invalid_prices = (~np.isfinite(prices)).any(axis=1) | prices.le(0).any(axis=1)
+        invalid_prices |= prices.high.lt(prices[['open','close','low']].max(axis=1)) | prices.low.gt(prices[['open','close','high']].min(axis=1))
+        explained = suspended_rows(data) & pd.to_numeric(research_view.get('valuation_close', pd.Series(index=data.index,dtype=float)),errors='coerce').gt(0)
+        invalid_prices &= ~explained
+        duplicate_prices = data.duplicated(['symbol','date'],keep=False) if not data.empty else pd.Series(dtype=bool)
+        empty = pd.DataFrame()
+        for index, symbol in enumerate(symbols):
+            if index % 25 == 0:
+                checkpoint(f'逐股检查 {index}/{len(symbols)} 只')
             current_symbol = symbol
             issue_count = len(result['issues'])
-            part = data[data.symbol.astype(str).eq(symbol)] if not data.empty else pd.DataFrame()
-            metadata_row = part.ffill().iloc[-1] if not part.empty else pd.Series(dtype=object)
-            history_rows = history[history.symbol.astype(str).eq(symbol)] if not history.empty else pd.DataFrame()
+            part = groups.get(symbol, empty)
+            metadata_row = part.reindex(columns=['listed_date','delisted_date']).ffill().iloc[-1] if not part.empty else pd.Series(dtype=object)
+            history_rows = histories.get(symbol, empty)
             listed = pd.to_datetime(metadata_row.get('listed_date'), errors='coerce')
             delisted = pd.to_datetime(metadata_row.get('delisted_date'), errors='coerce')
             # BaoStock stock-basic intervals describe listing, whereas arbitrary
@@ -362,7 +481,11 @@ class WizardResearchBackend:
                 if pd.isna(delisted):
                     delisted = pd.to_datetime(listing_history.iloc[0].get('effective_to'), errors='coerce')
             selected = symbol in selected_symbols
+            entry_rows = part[part.date.eq(pd.Timestamp(dates['entry_date']))] if not part.empty else part
+            entry_paused = not entry_rows.empty and bool(suspended_rows(entry_rows).iloc[0])
             expected = all_expected if selected or not rule else {d for d in all_expected if d <= signal}
+            if selected and entry_paused:
+                expected = {d for d in expected if d <= pd.Timestamp(dates['entry_date'])}
             if pd.notna(listed):
                 expected = {d for d in expected if d >= listed}
             if pd.notna(delisted):
@@ -371,6 +494,9 @@ class WizardResearchBackend:
             missing = sorted(expected - actual)
             if rule and not selected:
                 part = part[part.date <= signal] if not part.empty else part
+            elif entry_paused:
+                part = part[part.date <= pd.Timestamp(dates['entry_date'])]
+
             result['coverage'].append({'symbol': symbol, 'name': str(part.iloc[-1].get('name', symbol)) if not part.empty else symbol,
                 'status': 'MISSING' if missing else 'READY', 'selected': selected, 'required_sessions': len(expected),
                 'listed_date': str(listed.date()) if pd.notna(listed) else None,
@@ -381,45 +507,57 @@ class WizardResearchBackend:
             if part.empty:
                 continue
             anchors = pd.to_numeric(part.get('execution_open', pd.Series(dtype=float)), errors='coerce').dropna()
-            if selected and self.adapter is None and (anchors.empty or not anchors.map(math.isfinite).all() or (anchors <= 0).any()):
+            if selected and not entry_paused and self.adapter is None and (anchors.empty or not anchors.map(math.isfinite).all() or (anchors <= 0).any()):
                 issue('EXECUTION_PRICE_UNAVAILABLE', f'{symbol} 缺少建仓日未复权开盘价，无法核算真实整手和本金')
                 if result['coverage'][-1]['status'] == 'READY':
                     result['coverage'][-1]['status'] = 'ENTRY_PRICE_MISSING'
-            prices = part[['open', 'high', 'low', 'close']].apply(pd.to_numeric, errors='coerce')
-            invalid = (~prices.apply(lambda col: col.map(math.isfinite))).any(axis=1) | (prices <= 0).any(axis=1)
-            invalid |= prices.high < prices[['open', 'close']].max(axis=1)
-            invalid |= prices.low > prices[['open', 'close']].min(axis=1)
-            if invalid.any() or part.duplicated(['symbol', 'date']).any():
-                issue('INVALID_BARS', f'{symbol} 存在重复、非法或不完整 OHLC', dates=part.loc[invalid | part.duplicated(['symbol','date'], keep=False), 'date'], phase='prices')
+            invalid = invalid_prices.reindex(part.index) | duplicate_prices.reindex(part.index)
+            if invalid.any():
+                issue('INVALID_BARS', f'{symbol} 存在重复、非法或不完整 OHLC', dates=part.loc[invalid, 'date'], phase='prices')
             adjustments = set(part.get('adjustment', pd.Series(['unknown'])).astype(str).str.lower())
             result['coverage'][-1]['adjustment'] = next(iter(adjustments)) if len(adjustments) == 1 else 'mixed'
             if len(adjustments) != 1 or adjustments & {'unknown', 'none', 'nan', ''}:
-                issue('ADJUSTMENT_UNAVAILABLE', f'{symbol} 复权口径未知或不一致', dates=part.date, phase='prices', evidence={'adjustments': sorted(adjustments)})
-            result['issues'].extend(liquidity_issues(part, symbol, rule, dates))
+                from .inspection_snapshot import frame_fingerprint
+                from .source_capabilities import load_adjustment_limitation
+                basis = frame_fingerprint(part[[c for c in ('symbol','date','open','high','low','close','adjustment') if c in part]])
+                result['coverage'][-1]['adjustment_identity'] = basis
+                start = max(dates['warmup_start_date'], str(listed.date())) if pd.notna(listed) else dates['warmup_start_date']
+                end = str(max(expected).date()) if expected else dates['signal_date']
+                limitation = load_adjustment_limitation(self.cache_dir, self._repair_source_identity(), symbol, start, end, 'hfq', data_identity=basis)
+                if limitation:
+                    issue('SOURCE_ADJUSTMENT_UNAVAILABLE', f'{symbol} 来源未提供请求的后复权口径，需核实证券身份或更换来源',
+                          '查看原始响应；来源条件改变后可显式重新核实，禁止修改复权标签', dates=part.date, phase='prices', evidence=limitation)
+                else:
+                    issue('ADJUSTMENT_UNAVAILABLE', f'{symbol} 复权口径未知或不一致', dates=part.date, phase='prices', evidence={'adjustments': sorted(adjustments)})
+            result['issues'].extend(liquidity_issues(part, symbol, rule, dates, policy=POLICY_VERSION))
             # A historical identity must resolve by listing dates or an effective snapshot.
-            in_history = not history.empty and symbol in set(history.symbol.astype(str))
+            in_history = symbol in known_symbols
             if not in_history and pd.isna(listed):
                 issue('IDENTITY_UNAVAILABLE', f'{symbol} 缺少可验证的上市日期和名称')
             if pd.notna(listed) and listed > pd.Timestamp(dates['signal_date']):
                 issue('NOT_LISTED', f'{symbol} 在信号日尚未上市')
-            if selected and pd.notna(delisted) and delisted <= pd.Timestamp(dates['exit_date']):
+            if selected and not entry_paused and pd.notna(delisted) and delisted <= pd.Timestamp(dates['exit_date']):
                 issue('DELISTED', f'{symbol} 在持有区间内退市；V1 不支持退市清算')
-            price_codes = {'INVALID_BARS', 'ADJUSTMENT_UNAVAILABLE', 'UNTRADABLE', 'MISSING_FACTOR_FIELD', 'SUSPENDED', 'TRADING_STATUS_UNKNOWN'}
-            if any(i['code'] in price_codes for i in result['issues'][issue_count:]):
+            price_codes = {'INVALID_BARS', 'ADJUSTMENT_UNAVAILABLE', 'UNTRADABLE', 'MISSING_FACTOR_FIELD', 'SUSPENDED', 'TRADING_STATUS_UNKNOWN', 'SOURCE_ADJUSTMENT_UNAVAILABLE'}
+            if any(i['code'] in price_codes and i.get('severity','blocking') == 'blocking' for i in result['issues'][issue_count:]):
                 result['coverage'][-1]['status'] = 'INVALID'
         current_symbol = None
         if not symbols:
             issue('EMPTY_UNIVERSE', '没有可解析的历史股票范围')
         result['symbols'] = symbols
-        result['data_identity'] = json_hash({'data': _jsonable(data.sort_values(['symbol', 'date']).to_dict('records')) if not data.empty else [],
-            'history': _jsonable(history.to_dict('records')), 'dates': dates, 'scope': scope})
+        checkpoint(f'逐股检查 {len(symbols)}/{len(symbols)} 只')
+        from .inspection_snapshot import frame_fingerprint
+        result['data_identity'] = json_hash({'version': 'inspection-v3', 'suspension_policy': POLICY_VERSION,
+            'data': frame_fingerprint(data, cancelled=cancelled, progress=checkpoint),
+            'history': frame_fingerprint(history, cancelled=cancelled), 'dates': dates, 'scope': scope,
+            'sources': sources})
         result['readiness_id'] = json_hash({'requirement': result['requirement_id'], 'data': result['data_identity']})
-        if not result['issues']:
+        if not any(i.get('severity','blocking') == 'blocking' for i in result['issues']):
             result['status'] = 'READY'
         return _jsonable(result), data, history
 
-    def inspect(self, scope):
-        return self._inspect(scope)[0]
+    def inspect(self, scope, progress=None, cancelled=None):
+        return self._inspect(scope, progress=progress, cancelled=cancelled)[0]
 
     def _freeze(self, scope, readiness):
         if not readiness or readiness.get('status') != 'READY':
@@ -427,6 +565,7 @@ class WizardResearchBackend:
         current, data, history = self._inspect(scope)
         if current['status'] != 'READY' or current['data_identity'] != readiness.get('data_identity') or current['requirement_id'] != readiness.get('requirement_id'):
             raise ValueError('DATA_CHANGED：数据或范围已变化，请重新检查数据')
+        data = prepare_view(data, current['dates']['signal_date'], current['dates']['entry_date'], current['dates']['exit_date'])
         selection_bars = data[data.date <= pd.Timestamp(current['dates']['signal_date'])].copy()
         if scope.get('selection_mode') == 'rule':
             selection_bars, _ = _apply_universe_mode(selection_bars, parse_date(current['dates']['signal_date']), 'point-in-time', history if not history.empty else None)
@@ -436,6 +575,8 @@ class WizardResearchBackend:
         if 'execution_open' in data:
             for symbol, part in data.groupby('symbol'):
                 entry = part[part.date.eq(pd.Timestamp(current['dates']['entry_date']))]
+                if not entry.empty and suspended_rows(entry).iloc[0]:
+                    continue
                 anchors = pd.to_numeric(part.execution_open, errors='coerce').dropna()
                 if not anchors.empty and not entry.empty:
                     anchor = float(anchors.iloc[-1])
@@ -473,7 +614,7 @@ class WizardResearchBackend:
         name = str(portfolio.get('name', '')).strip()
         if not name:
             raise ValueError('请填写组合名称')
-        return ResearchSpec(requested_date=readiness['dates']['signal_date'],
+        return ResearchSpec(requested_date=readiness['dates']['signal_date'], suspension_policy=POLICY_VERSION,
             horizons=(readiness['dates']['horizon'],), top_n=len(readiness['symbols']) if manual else int(scope.get('top_n', 10)),
             initial_cash=cash, commission_rate=commission, slippage_rate=slippage,
             rule_version='manual_v1' if manual else 'fixed_v0', portfolio_weighting=weighting,
@@ -498,6 +639,7 @@ class WizardResearchBackend:
         before = data[data.date <= pd.Timestamp(signal)]
         plugin = ManualSelectionPlugin() if spec.rule_version == 'manual_v1' else FrozenRulePlugin(adapter.selection_bars)
         candidates, funnel = plugin.score(before.copy(deep=True))
+        candidates = apply_candidate_policy(candidates, adapter.selection_bars if spec.rule_version == 'fixed_v0' else before, signal, min_effective_samples=61 if spec.rule_version == 'fixed_v0' else 1)
         factor = factor_definition(plugin)
         candidates = validate_plugin_output(candidates, before, plugin_id=plugin.plugin_id, min_history_days=plugin.min_history_days)
         candidates, _ = _prepare_plugin_candidates(candidates, funnel, before, factor)
@@ -542,7 +684,7 @@ class WizardResearchBackend:
     def _prepare(self, scope, progress, cancelled, rounds):
         self._validate_scope(scope)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
-        from .data_repair import validate_and_publish, save_attempt, retry_transient
+        from .data_repair import validate_and_publish, save_attempt, retry_transient, AdjustmentUnavailable
         bootstrap_attempts = []
         def checkpoint(message):
             if cancelled():
@@ -569,17 +711,17 @@ class WizardResearchBackend:
                 bootstrap({'kind': 'calendar', 'symbol': None, 'start': str(start), 'end': str(end)}, lambda: self._provision_calendar(start, end))
         dates, _ = self._dates(scope)
         checkpoint('检查本地数据和历史上市身份')
-        ready, _, history = self._inspect(scope)
+        ready, _, history = self._inspect(scope, progress=progress, cancelled=cancelled)
         if ready['status'] == 'READY':
             return ready
         if self.adapter is None and any(a['kind'] == 'universe' for a in ready['repair_plan']['actions']):
             checkpoint('获取 BaoStock 上市与退市历史（不声称提供历史行业）')
             bootstrap({'kind': 'universe', 'symbol': None}, self._provision_universe)
-            ready = self.inspect(scope)
+            ready = self.inspect(scope, progress=progress, cancelled=cancelled)
         if scope.get('selection_mode') == 'rule' and not ready.get('symbols'):
             return ready
         from etf_strategy.src.market_data_providers import FetchRequest
-        from .data_repair import validate_and_publish, save_attempt, retry_transient
+        from .data_repair import validate_and_publish, save_attempt, retry_transient, AdjustmentUnavailable
         failures, attempts = [], bootstrap_attempts.copy()
         initial_plan = ready['repair_plan']
         for action in initial_plan['actions']:
@@ -617,6 +759,13 @@ class WizardResearchBackend:
                             self._provision_entry(symbol, dates['entry_date'])
                 retry_transient(execute, cancelled, progress)
                 record['status'] = 'completed'
+            except AdjustmentUnavailable as exc:
+                from .source_capabilities import record_adjustment_limitation
+                item = next((i for i in ready['coverage'] if i['symbol'] == symbol), {})
+                evidence = record_adjustment_limitation(self.cache_dir, self._repair_source_identity(), symbol,
+                    start, end, exc.requested_adjustment, exc.returned_adjustment,
+                    data_identity=item.get('adjustment_identity', ''), response_evidence=exc.response_evidence)
+                record.update(status='unsupported', result=evidence, error=str(exc))
             except InterruptedError:
                 record['status'] = 'cancelled'
                 save_attempt(self.cache_dir, record)
@@ -630,7 +779,7 @@ class WizardResearchBackend:
             record['execution_record'] = str(save_attempt(self.cache_dir, record))
             attempts.append(record)
         checkpoint('重新验证逐股覆盖、交易状态、复权和历史身份')
-        result = self.inspect(scope)
+        result = self.inspect(scope, progress=progress, cancelled=cancelled)
         unresolved = {(a['symbol'], a['kind']) for a in result['repair_plan']['actions']}
         for record in attempts:
             action = record['action']
@@ -646,6 +795,7 @@ class WizardResearchBackend:
         result['repair_summary'] = {'attempted': len(attempts),
             'resolved': sum(a['status'] == 'resolved' for a in attempts),
             'failed': sum(a['status'] == 'failed' for a in attempts),
+            'unsupported': sum(a['status'] == 'unsupported' for a in attempts),
             'unchanged': sum(a['status'] == 'unresolved' for a in attempts)}
         prior = {(a['symbol'], a['kind']) for a in initial_plan['actions']}
         # Newly discovered holdings/entry anchors may need another phase, never repeat unchanged work.

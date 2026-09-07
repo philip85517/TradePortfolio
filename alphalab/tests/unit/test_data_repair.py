@@ -210,3 +210,39 @@ def test_missing_quantities_do_not_borrow_other_dates(tmp_path):
     saved = load_bars(path)
     assert pd.isna(saved.iloc[1]['volume'])
     assert pd.isna(saved.iloc[1]['amount'])
+
+
+@pytest.mark.parametrize('returned', ['none', 'qfq'])
+def test_adjustment_unavailable_carries_query_and_response_without_overwriting(tmp_path, returned):
+    path = tmp_path / 'bars.duckdb'
+    publish(bars(), path)
+    with pytest.raises(ValueError) as caught:
+        publish(bars().assign(adjustment=returned), path)
+    error = caught.value
+    assert type(error).__name__ == 'AdjustmentUnavailable'
+    assert error.requested_adjustment == 'hfq'
+    assert error.returned_adjustment == [returned]
+    assert error.query == dict(symbol='600000.SH', start='2026-08-01', end='2026-08-10', requested_adjustment='hfq')
+    assert error.response_evidence == [dict(date='2026-08-03', returned_adjustment=returned)]
+    assert load_bars(path)['adjustment'].tolist() == ['hfq']
+
+
+@pytest.mark.parametrize('frame', [bars().assign(adjustment=None), bars().assign(adjustment='unknown'),
+    bars().assign(adjustment='none', close=-1), bars().assign(adjustment='none', ts='bad-date')])
+def test_invalid_response_is_not_persistent_adjustment_limitation(tmp_path, frame):
+    with pytest.raises(ValueError) as caught:
+        publish(frame, tmp_path / 'bars.duckdb')
+    assert type(caught.value).__name__ != 'AdjustmentUnavailable'
+
+
+def test_adjustment_mismatch_does_not_retry_even_with_old_transport_context(tmp_path):
+    calls = []
+    def operation():
+        calls.append(1)
+        try:
+            raise TimeoutError('previous independent request timed out')
+        except TimeoutError:
+            publish(bars().assign(adjustment='none'), tmp_path / 'bars.duckdb')
+    with pytest.raises(data_repair.AdjustmentUnavailable):
+        data_repair.retry_transient(operation, lambda: False, lambda _: None)
+    assert len(calls) == 1

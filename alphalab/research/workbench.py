@@ -95,7 +95,11 @@ class WorkbenchHTTPMixin:
                 elif len(parts) == 3 and self.command == 'POST':
                     action = parts[2]
                     if action == 'check':
-                        self._send_json({'draft': flow.check(draft_id, revision)})
+                        task = flow.start_check(draft_id, revision)
+                        self._send_json({'task': task, 'draft': flow.get_draft(draft_id)}, status=202)
+                    elif action == 'retry_source':
+                        task = flow.retry_source(draft_id, revision, body.get('symbol'))
+                        self._send_json({'task': task, 'draft': flow.get_draft(draft_id)}, status=202)
                     elif action == 'preview':
                         draft = flow.preview(draft_id, revision)
                         self._send_json({'draft': draft, 'preview': draft['preview']})

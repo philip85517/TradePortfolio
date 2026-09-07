@@ -29,7 +29,7 @@
   function coverageHtml(rows, page=0, issues=[]) {
     if (!Array.isArray(rows) || !rows.length) return '<p class="muted">尚未得到逐股覆盖检查，请先处理上方数据问题。</p>';
     return '<h3>历史数据覆盖与缺口</h3><div class="coverage-list">'+rows.slice(page*25,page*25+25).map(row=>{
-      const resolutions=new Set(issues.filter(i=>i.symbol===row.symbol).map(i=>i.resolution));
+      const resolutions=new Set(issues.filter(i=>i.symbol===row.symbol && !['info','warning'].includes(i.severity)).map(i=>i.resolution));
       const state=resolutions.has('unsupported')?'UNSUPPORTED':resolutions.has('verify')?'NEEDS_VERIFICATION':row.status;
       const status={READY:'已就绪',MISSING:'需补齐',INVALID:'需修复数据',NEEDS_VERIFICATION:'需核实交易状态',UNSUPPORTED:'当前能力不支持'}[state] || '待检查';
       const adjustment={hfq:'后复权',qfq:'前复权',raw:'不复权',none:'不复权',mixed:'复权口径不一致'}[row.adjustment] || row.adjustment;
@@ -50,24 +50,36 @@
   }
   function issuesHtml(issues, filters={}) {
     const filtered=filterIssues(issues,filters);
-    return [['download','可自动处理'],['verify','需核实'],['user','需要你处理']].map(([key,label])=>{
-      const rows=filtered.filter(i=>key==='user'?!['download','verify'].includes(i.resolution):i.resolution===key);
+    return [['download','可自动处理'],['verify','需核实'],['user','需要你处理'],['warning','提示（不阻断）'],['info','说明（不阻断）']].map(([key,label])=>{
+      const rows=filtered.filter(i=>['info','warning'].includes(key)?i.severity===key:!['info','warning'].includes(i.severity) && (key==='user'?!['download','verify'].includes(i.resolution):i.resolution===key));
       if (!rows.length) return '';
-      return `<details class="issue-group"><summary>${label} · ${rows.length} 条问题</summary>${rows.map(i=>`<details><summary>${esc(i.symbol)} · ${esc(i.message || i.code || i)}</summary><p>${esc(i.action || '')}</p><p>阶段：${esc(diagnosticLabel(i.phase))} · 类型：${esc(diagnosticLabel(i.category || i.code))}</p><p>异常日期：${(i.date_ranges || []).map(d=>esc(d.start)+' → '+esc(d.end)).join('、') || '未提供'}</p><pre>${esc(JSON.stringify(i.evidence || {},null,2))}</pre></details>`).join('')}</details>`;
+      return `<details class="issue-group ${key==='info'?'info':key==='warning'?'warning':'danger'}"><summary>${label} · ${rows.length} 条问题</summary>${rows.map(i=>`<details><summary>${esc(i.symbol)} · ${esc(i.message || i.code || i)}</summary><p>${esc(i.action || '')}</p>${i.code==='SOURCE_ADJUSTMENT_UNAVAILABLE'?`<button type="button" data-retry-source="${esc(i.symbol)}">重新核实来源</button><p>向当前来源重新请求此股票的数据，验证响应后更新检查结果。</p>`:''}<p>阶段：${esc(diagnosticLabel(i.phase))} · 类型：${esc(diagnosticLabel(i.category || i.code))}</p><p>异常日期：${(i.date_ranges || []).map(d=>esc(d.start)+' → '+esc(d.end)).join('、') || '未提供'}</p><pre>${esc(JSON.stringify(i.evidence || {},null,2))}</pre></details>`).join('')}</details>`;
     }).join('') || '<p class="muted">没有符合筛选条件的问题。</p>';
   }
   function attemptSummary(t) {
     const summary=t?.result?.repair_summary;
-    if (summary) return `本轮已处理 ${summary.resolved || 0} 项 · 未变化 ${summary.unchanged || 0} 项 · 请求失败 ${summary.failed || 0} 项。已验证的缓存与草稿保留。`;
+    if (summary) return `来源不支持 ${summary.unsupported ?? (t?.result?.repair_attempts || []).filter(a=>a.status==='unsupported').length} 项 · 本轮已处理 ${summary.resolved || 0} 项 · 未变化 ${summary.unchanged || 0} 项 · 请求失败 ${summary.failed || 0} 项。已验证的缓存与草稿保留。`;
     const attempts=t?.result?.repair_attempts || t?.result?.attempts || t?.progress?.attempts || [];
     if (!Array.isArray(attempts) || !attempts.length) return ['PARTIAL','FAILED','CANCELLED','INTERRUPTED'].includes(t?.status)?'已验证的缓存与草稿保留；重新检查后继续处理剩余问题。':'';
     const count=(...states)=>attempts.filter(a=>states.includes(a.outcome || a.status)).length;
-    return `本轮已处理 ${count('resolved','repaired','saved','published')} 项 · 未变化 ${count('unchanged','unresolved')} 项 · 请求失败 ${count('failed')} 项。已验证的缓存与草稿保留。`;
+    return `本轮已处理 ${count('resolved','repaired','saved','published')} 项 · 未变化 ${count('unchanged','unresolved')} 项 · 来源不支持 ${count('unsupported')} 项 · 请求失败 ${count('failed')} 项。已验证的缓存与草稿保留。`;
+  }
+  function taskTiming(t, now=Date.now()) {
+    const running=['QUEUED','RUNNING','CANCELLING'].includes(t.status);
+    const seconds=(a,b)=>Math.max(0,Math.floor((a-Date.parse(b))/1000)) || 0;
+    const heartbeatAge=seconds(now,t.heartbeat_at || t.updated_at);
+    const progressAge=seconds(now,t.progress_at || t.updated_at);
+    return {elapsed:seconds(running?now:Date.parse(t.updated_at),t.created_at),heartbeatAge,progressAge,stale:running && (heartbeatAge>10 || progressAge>15)};
+  }
+  function liquidationHtml(summary) {
+    if (summary?.liquidation_status !== 'OPEN_POSITION') return '';
+    const values=[['已实现盈亏',summary.realized_profit_loss],['未实现盈亏',summary.unrealized_profit_loss],['未平仓估值',summary.unrealized_holdings_value],['期末现金',summary.realized_cash]];
+    return '<div class="notice warning"><strong>结束日停牌，仍有未平仓持仓</strong><p>期末权益及总收益包含未实现估值，不代表全部卖出；停牌持仓未收取卖出费用。</p>'+values.map(([label,value])=>`<p>${label}：${esc(value == null ? '—' : Number(value).toLocaleString('zh-CN',{maximumFractionDigits:2}))}</p>`).join('')+'</div>';
   }
   function taskForDraft(currentTask, value) { return currentTask?.id === value.task_id ? currentTask : null; }
   function selectionSymbols(mode, text) { return mode==='manual' ? text.split(/[\s,，;；]+/).filter(Boolean) : []; }
   function unfinishedDrafts(rows) { return rows.filter(row=>!(row.task_kind==='run' && row.task_status==='SUCCEEDED')); }
-  if (typeof module !== 'undefined') module.exports = {validateScope, acceptResponse, coverageHtml, calendarLabel, gates, unfinishedDrafts, selectionSymbols, repairLabel, filterIssues, issuesHtml, attemptSummary, diagnosticLabel, taskForDraft};
+  if (typeof module !== 'undefined') module.exports = {validateScope, acceptResponse, coverageHtml, calendarLabel, gates, unfinishedDrafts, selectionSymbols, repairLabel, filterIssues, issuesHtml, attemptSummary, diagnosticLabel, taskForDraft, taskTiming, liquidationHtml};
   if (typeof document === 'undefined') return;
   const $ = id => document.getElementById(id);
   const fmt = v => v == null ? '—' : typeof v === 'number' ? v.toLocaleString('zh-CN',{maximumFractionDigits:2}) : String(v);
@@ -164,7 +176,7 @@
     let html=`<div class="notice ${ready?'success':'danger'}"><strong>${ready?'数据已就绪，可以配置组合':'数据尚未就绪，需先处理以下问题'}</strong></div>`;
     const dates=r.dates || {};
     html+=metrics([['请求开始',draft.scope.start_date],['请求结束',draft.scope.end_date],['数据质量',draft.scope.quality_mode==='strict'?'正式研究':'探索研究'],...Object.entries(dates).map(([k,v])=>[({entry_date:'实际建仓日',exit_date:'实际结束日',end_date:'实际结束日',signal_date:'规则信号日',warmup_start:'预热起点',warmup_start_date:'预热起点',requested_start_date:'请求开始日',requested_end_date:'请求结束日',warmup_sessions:'所需预热交易日',calendar_source:'交易日历来源',horizon:'持有交易日数'}[k] || k),k==='calendar_source'?calendarLabel(v):v])]);
-    html+=metrics([['已就绪股票（只）',(r.coverage || []).filter(x=>x.status==='READY').length],['待核实问题（条）',(r.issues || []).filter(x=>x.resolution==='verify').length],['可执行动作（项）',r.repair_plan?.executable_count ?? '待确定'],['需选择／不支持（条）',(r.issues || []).filter(x=>['user','unsupported'].includes(x.resolution)).length]]);
+    html+=metrics([['已就绪股票（只）',(r.coverage || []).filter(x=>x.status==='READY').length],['待核实问题（条）',(r.issues || []).filter(x=>!['info','warning'].includes(x.severity) && x.resolution==='verify').length],['可执行动作（项）',r.repair_plan?.executable_count ?? '待确定'],['需选择／不支持（条）',(r.issues || []).filter(x=>!['info','warning'].includes(x.severity) && ['user','unsupported'].includes(x.resolution)).length]]);
     if (r.repair_plan?.executable_count===0 && !ready) html+='<div class="notice">当前来源无法自动解决剩余问题。请重新检查或返回修改范围；修改股票或日期会改变实验样本。</div>';
     const options=(key)=>[...new Set((r.issues || []).map(i=>i[key]).filter(Boolean))].map(v=>`<option value="${esc(v)}" ${issueFilters[key]===v?'selected':''}>${esc(diagnosticLabel(v))}</option>`).join('');
     if (r.issues?.length) html+=`<div class="form-grid"><label>股票筛选<input id="issueSymbol" value="${esc(issueFilters.symbol || '')}" placeholder="六位代码或部分代码"></label><label>问题类型<select id="issueCategory"><option value="">全部类型</option>${options('category')}</select></label><label>研究阶段<select id="issuePhase"><option value="">全部阶段</option>${options('phase')}</select></label></div><div id="issueGroups">${issuesHtml(r.issues,issueFilters)}</div>`;
@@ -184,9 +196,9 @@
   }
   function renderTask(t) {
     if (!t) return '';
-    const labels={QUEUED:'等待执行',RUNNING:'正在执行',SUCCEEDED:'已完成',PARTIAL:'部分完成，仍有数据缺口',FAILED:'执行失败',CANCELLED:'已取消',INTERRUPTED:'服务已重启，任务中断',CANCELLING:'正在取消'};
-    const elapsed=Math.max(0,Math.round((Date.parse(t.updated_at || new Date().toISOString())-Date.parse(t.created_at))/1000));
-    return `<div class="notice ${['FAILED','PARTIAL','INTERRUPTED'].includes(t.status)?'danger':''}"><strong>${esc(labels[t.status] || t.status)}</strong><p>${esc(t.stage || '等待后台处理')}</p><small>已用时 ${Number.isFinite(elapsed)?elapsed:0} 秒 · ${active(t)?'暂无可靠剩余时间估计':'状态已保存'}</small><p>${esc(attemptSummary(t))}</p>${t.error?`<p>${esc(t.error.message || t.error)}</p>`:''}</div>`;
+    const labels={QUEUED:'等待执行',RUNNING:'正在执行',SUCCEEDED:'已完成',PARTIAL:'部分完成，仍有研究阻断',FAILED:'执行失败',CANCELLED:'已取消',INTERRUPTED:'服务已重启，任务中断',CANCELLING:'正在取消'};
+    const {elapsed,heartbeatAge,progressAge,stale}=taskTiming(t);
+    return `<div class="notice ${['FAILED','PARTIAL','INTERRUPTED'].includes(t.status)?'danger':''}"><strong>${esc(labels[t.status] || t.status)}</strong><p>${esc(t.stage === '仍有数据缺口，请处理后继续' ? '仍有研究阻断，请查看对应处理方式' : (t.stage || '等待后台处理'))}</p><small>已用时 ${Number.isFinite(elapsed)?elapsed:0} 秒 · ${active(t)?`最近心跳 ${heartbeatAge} 秒前 · 最近进度 ${progressAge} 秒前`:'状态已保存'}</small>${stale?'<p class="progress-warning">进度暂不可确认；可刷新状态或取消任务。心跳仅表示服务仍在响应。</p>':''}<p>${esc(attemptSummary(t))}</p>${t.error?`<p>${esc(t.error.message || t.error)}</p>`:''}</div>`;
   }
   function render() {
     if (!draft) return;
@@ -199,24 +211,25 @@
     $('prepare').disabled=!permissions.canPrepare;
     $('prepare').textContent=repairLabel(draft.readiness);
     if (statusUnavailable) { $('prepare').disabled=true; $('check').disabled=true; $('run').disabled=true; }
-    $('refreshTask').hidden=!statusUnavailable; $('taskConnection').hidden=!statusUnavailable;
-    $('exploreChoice').hidden=draft.scope.quality_mode==='exploratory' || !(draft.readiness?.issues || []).some(i=>i.resolution==='user' || String(i.code).includes('PIT'));
+    $('refreshTask').hidden=!(statusUnavailable || running); $('taskConnection').hidden=!statusUnavailable;
+    $('exploreChoice').hidden=draft.scope.quality_mode==='exploratory' || !(draft.readiness?.issues || []).some(i=>!['info','warning'].includes(i.severity) && (i.resolution==='user' || String(i.code).includes('PIT')));
     $('applyExploratory').disabled=busy || running || statusUnavailable || !$('acceptExploratory').checked;
     $('run').disabled=busy || running || statusUnavailable || !preview;
-    $('cancelPrepare').hidden=!(task?.kind==='prepare' && running);
-    $('prepareTask').innerHTML=task?.kind==='prepare'?renderTask(task)+(task.result?.repair_attempts?.length?details(task.result.repair_attempts,'本轮处理记录与未解决原因'):''):'';
+    $('cancelPrepare').textContent=task?.kind==='check'?'取消检查':task?.kind==='retry_source'?'取消来源核实':'取消数据准备';
+    $('cancelPrepare').hidden=!(['check','prepare','retry_source'].includes(task?.kind) && running);
+    $('prepareTask').innerHTML=['check','prepare','retry_source'].includes(task?.kind)?renderTask(task)+(task.result?.repair_attempts?.length?details(task.result.repair_attempts,'本轮处理记录与未解决原因'):''):'';
     $('runTask').innerHTML=task?.kind==='run'?renderTask(task):'<p>尚未启动运行，请先完成配置与确认。</p>';
     $('retryRun').hidden=!(task?.kind==='run' && ['FAILED','CANCELLED','INTERRUPTED'].includes(task.status));
     $('recoverTask').hidden=!(task?.kind==='run' && ['FAILED','CANCELLED','INTERRUPTED'].includes(task.status));
     if (readinessRendered!==draft.readiness) { readinessRendered=draft.readiness; coveragePage=0; renderReadiness(); } renderPreview();
     $('confirmation').innerHTML=metrics([['组合名称',draft.portfolio.name],['初始本金',draft.portfolio.initial_cash],['研究区间',draft.scope.start_date+' → '+draft.scope.end_date],['持有方式','买入并持有至结束日'],['范围',draft.scope.selection_mode==='manual' ? draft.scope.symbols.join(', ') : 'fixed_v0 · '+draft.scope.top_n+' 只'],['数据质量',draft.scope.quality_mode==='strict'?'正式研究':'探索研究'],['佣金',draft.portfolio.commission_rate*100+'%'],['滑点',draft.portfolio.slippage_rate*100+'%'],['权重方式',({equal:'等权',score:'规则评分',custom:'自定义'}[draft.portfolio.weighting])],['最低持仓数',draft.portfolio.min_holdings],['单股权重上限',draft.portfolio.max_single_weight==null?'不限制':draft.portfolio.max_single_weight*100+'%'],['行业权重上限',draft.portfolio.max_industry_weight==null?'不限制':draft.portfolio.max_industry_weight*100+'%']])+(draft.scope.quality_mode==='exploratory'?'<div class="notice danger">本次结果为探索研究，保留数据检查所列历史身份与行业快照限制。</div>':'')+metrics(Object.entries(draft.readiness?.dates || {}).filter(([key])=>['signal_date','entry_date','exit_date','warmup_start_date','horizon','calendar_source'].includes(key)).map(([key,value])=>[({signal_date:'规则信号日',entry_date:'实际建仓日',exit_date:'实际结束日',warmup_start_date:'预热起点',horizon:'持有交易日数',calendar_source:'交易日历来源'}[key]),key==='calendar_source'?calendarLabel(value):value]));
     const result=task?.kind==='run' && task.status==='SUCCEEDED' ? task.result : null;
-    $('results').innerHTML=result?.run_id?`<div class="notice success"><h3>运行已保存</h3><p>冻结配置及结果可从最近运行重新打开。</p><a href="/research/review/${encodeURIComponent(result.run_id)}/">打开净值、收益、回撤与持仓审阅 →</a></div>`+metrics([['总收益率',result.summary?.total_return == null ? '—' : (result.summary.total_return*100).toFixed(2)+'%'],['绝对盈亏',result.summary?.profit_loss],['期末权益',result.summary?.ending_equity]])+details(result.summary || {},'运行摘要'):'';
+    $('results').innerHTML=result?.run_id?`<div class="notice success"><h3>运行已保存</h3><p>冻结配置及结果可从最近运行重新打开。</p><a href="/research/review/${encodeURIComponent(result.run_id)}/">打开净值、收益、回撤与持仓审阅 →</a></div>`+metrics([['总收益率',result.summary?.total_return == null ? '—' : (result.summary.total_return*100).toFixed(2)+'%'],['绝对盈亏',result.summary?.profit_loss],['期末权益',result.summary?.ending_equity]])+liquidationHtml(result.summary)+details(result.summary || {},'运行摘要'):'';
     document.querySelectorAll('#scopeForm input,#scopeForm select,#scopeForm textarea,#portfolioForm input,#portfolioForm select,#portfolioForm textarea').forEach(el=>el.disabled=running || busy || statusUnavailable);
     syncChoices();
   }
   function go(n) { step=n; render(); $('step'+n).querySelector('h2').focus(); }
-  async function command(kind) {
+  async function command(kind, extra={}) {
     if (busy || statusUnavailable || active(task)) return;
     clearError();
     const validation=validateScope(readScope()); if (validation) { go(1); throw new Error(validation); }
@@ -229,7 +242,7 @@
         requestKey=localStorage.getItem(key) || draft.id+':'+draft.revision+':'+(crypto.randomUUID ? crypto.randomUUID() : Date.now());
         localStorage.setItem(key,requestKey);
       }
-      const p=await api('/drafts/'+encodeURIComponent(id)+'/'+kind,'POST',{revision:draft.revision,...(kind==='run'?{idempotency_key:requestKey}:{}),...(kind==='prepare' && draft.readiness?.repair_plan?.plan_id?{plan_id:draft.readiness.repair_plan.plan_id}:{})});
+      const p=await api('/drafts/'+encodeURIComponent(id)+'/'+kind,'POST',{revision:draft.revision,...extra,...(kind==='run'?{idempotency_key:requestKey}:{}),...(kind==='prepare' && draft.readiness?.repair_plan?.plan_id?{plan_id:draft.readiness.repair_plan.plan_id}:{})});
       if (!acceptResponse(draft,p.draft,sentEpoch,epoch)) return;
       draft=p.draft; if (p.preview) draft.preview=p.preview;
       if(p.task) {task=p.task; poll();}
@@ -284,6 +297,7 @@
   $('runList').addEventListener('click',e=>{const b=e.target.closest('[data-copy-run]');if(b)api('/drafts','POST',{source_run_id:b.dataset.copyRun}).then(p=>openDraft(p.draft.id)).catch(error);});
   $('steps').addEventListener('click',e=>{const b=e.target.closest('[data-step]');if(b && !b.disabled)go(Number(b.dataset.step));});
   $('scopeForm').addEventListener('input',()=>changed(true)); $('portfolioForm').addEventListener('input',()=>changed(false));
+  setInterval(()=>{if(active(task)){ const panel=task.kind==='run'?'runTask':'prepareTask'; $(panel).innerHTML=renderTask(task); }},1000);
   $('scopeForm').addEventListener('submit',e=>{e.preventDefault();command('check').catch(error);});
   $('portfolioForm').addEventListener('submit',e=>{e.preventDefault();command('preview').catch(error);});
   for(const [id,n] of Object.entries({editScope:1,toPortfolio:3,backData:2,toConfirm:4,backPortfolio:3,returnConfig:2})) action(id,()=>go(n));
@@ -291,7 +305,7 @@
   $('acceptExploratory').addEventListener('change',render);
   action('applyExploratory',async()=>{if(!$('acceptExploratory').checked)return; document.querySelector('[name=quality][value=exploratory]').checked=true; $('acceptExploratory').checked=false; changed(true); await command('check');});
   $('readiness').addEventListener('change',e=>{const key={issueSymbol:'symbol',issueCategory:'category',issuePhase:'phase'}[e.target.id]; if(key){issueFilters[key]=e.target.value; $('issueGroups').innerHTML=issuesHtml(draft.readiness?.issues || [],issueFilters);}});
-  $('readiness').addEventListener('click',e=>{const b=e.target.closest('[data-page]'); if(b && !b.disabled){coveragePage=Number(b.dataset.page); renderReadiness(); $('readiness').querySelector('[data-page]')?.focus();} if(e.target.id==='exportDiagnostics'){const url=URL.createObjectURL(new Blob([JSON.stringify(draft.readiness,null,2)],{type:'application/json'})); const a=document.createElement('a'); a.href=url; a.download='data-diagnostics.json'; a.click(); URL.revokeObjectURL(url);}});
+  $('readiness').addEventListener('click',e=>{const retry=e.target.closest('[data-retry-source]'); if(retry){command('retry_source',{symbol:retry.dataset.retrySource}).catch(error); return;} const b=e.target.closest('[data-page]'); if(b && !b.disabled){coveragePage=Number(b.dataset.page); renderReadiness(); $('readiness').querySelector('[data-page]')?.focus();} if(e.target.id==='exportDiagnostics'){const url=URL.createObjectURL(new Blob([JSON.stringify(draft.readiness,null,2)],{type:'application/json'})); const a=document.createElement('a'); a.href=url; a.download='data-diagnostics.json'; a.click(); URL.revokeObjectURL(url);}});
   action('check',()=>command('check')); action('prepare',()=>command('prepare')); action('run',()=>command('run'));
   action('retryRun',()=>{requestKey=null;localStorage.removeItem('alphalab.wizard.submit.'+draft.id+'.'+draft.revision);return command('run');});
   action('recoverTask',async()=>{const p=await api('/drafts','POST',{source_task_id:task.id});await openDraft(p.draft.id);});

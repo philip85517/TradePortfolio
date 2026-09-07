@@ -18,6 +18,18 @@ import pandas as pd
 from etf_strategy.src.market_data_store import load_bars, upsert_bars
 
 
+class AdjustmentUnavailable(ValueError):
+    """A valid source response did not honor the requested price adjustment."""
+
+    def __init__(self, symbol, start, end, requested, response_evidence):
+        self.requested_adjustment = requested
+        self.response_evidence = response_evidence
+        self.returned_adjustment = sorted({row['returned_adjustment'] for row in response_evidence})
+        self.query = dict(symbol=symbol, start=str(start), end=str(end), requested_adjustment=requested)
+        super().__init__(f'来源不支持请求复权口径／证券身份待核实：{symbol} '
+                         f'{start}～{end} 请求 {requested}，返回 {", ".join(self.returned_adjustment)}')
+
+
 def _checkpoint(cancelled):
     if cancelled():
         raise InterruptedError('已取消；已验证数据保留')
@@ -50,8 +62,8 @@ def validate_and_publish(frame, target_path, symbol, start, end, *, cancelled=la
         raise ValueError('行情标的与请求不一致')
     if not data['timeframe'].eq('1d').fillna(False).all():
         raise ValueError('来源未返回日线行情')
-    if not data['adjustment'].eq('hfq').fillna(False).all():
-        raise ValueError('行情必须使用一致的后复权口径 hfq')
+    if not data['adjustment'].isin(['hfq', 'qfq', 'none']).all():
+        raise ValueError('行情复权口径无效或缺失')
     # Legacy BaoStock marks only qfq as adjusted; the explicit hfq metadata
     # above is authoritative for this response, so normalize its boolean flag.
     data['adjusted'] = True
@@ -72,6 +84,10 @@ def validate_and_publish(frame, target_path, symbol, start, end, *, cancelled=la
     if ((data['high'] < data[['open', 'close', 'low']].max(axis=1)) |
             (data['low'] > data[['open', 'close', 'high']].min(axis=1))).any():
         raise ValueError('行情 OHLC 价格关系不一致')
+    if not data['adjustment'].eq('hfq').all():
+        evidence = [{'date': day.strftime('%Y-%m-%d'), 'returned_adjustment': adjustment}
+                    for day, adjustment in zip(days, data['adjustment'])]
+        raise AdjustmentUnavailable(symbol, start, end, 'hfq', evidence)
     if 'volume' not in data:
         data['volume'] = float('nan')
     target = Path(target_path)
@@ -151,6 +167,8 @@ def _transient(error):
     seen = set()
     while error is not None and id(error) not in seen:
         seen.add(id(error))
+        if isinstance(error, AdjustmentUnavailable):
+            return False
         if isinstance(error, (TimeoutError, ConnectionError)):
             return True
         # HTTP libraries and subprocess providers wrap transport errors differently.

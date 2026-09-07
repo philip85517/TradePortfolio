@@ -296,3 +296,23 @@ def test_review_rejects_modified_hashed_artifact(tmp_path):
 
     with pytest.raises(ValueError, match="内容哈希不匹配"):
         load_review_run(state.run.run_dir.parent, state.run.manifest["run_id"])
+
+
+def test_review_evaluation_preserves_unliquidated_accounting_and_stale_nav(tmp_path):
+    state = _state(tmp_path)
+    accounting = dict(liquidation_status='OPEN_POSITION', unrealized_holdings_value=700.,
+                      unrealized_profit_loss=150., realized_profit_loss=50., realized_cash=500.,
+                      open_positions={'300468': 10.})
+    state._portfolio_performance(state._primary_portfolio_id())['3'].update(accounting)
+    for frame in [state.run.nav_frame, state.run.portfolio_nav_frame]:
+        frame['stale_symbols'] = '300468'
+        frame['max_valuation_stale_days'] = 2
+    detail = state.stock_detail('300468', mode='evaluation')
+    for key, value in accounting.items():
+        assert detail['portfolio_performance']['3'].get(key) == value
+    portfolio = state.portfolio_detail()
+    assert portfolio['performance']['3']['liquidation_status'] == 'OPEN_POSITION'
+    assert portfolio['nav'][-1]['stale_symbols'] == '300468'
+    assert portfolio['nav'][-1]['max_valuation_stale_days'] == 2
+    selection = state.stock_detail('300468', mode='selection')
+    assert selection['portfolio_performance'] == {}

@@ -223,45 +223,69 @@ class ResearchWorkflow:
         with self._lock:
             return self._get('tasks', task_id)
 
-    def _new_task(self, draft, kind, key):
+    def _new_task(self, draft, kind, key, configuration=None, source_symbol=None):
+        configuration = configuration or draft
         task = {'id': uuid4().hex, 'draft_id': draft['id'], 'revision': draft['revision'],
                 'scope_key': _digest(draft['scope']), 'kind': kind, 'idempotency_key': key,
+                'source_symbol': source_symbol,
                 'status': 'QUEUED', 'stage': '等待执行', 'error': None, 'result': None,
-                'configuration': {key: deepcopy(draft[key]) for key in ('scope', 'portfolio', 'readiness')},
+                'configuration': {key: deepcopy(configuration[key]) for key in ('scope', 'portfolio', 'readiness')},
                 'created_at': _now(), 'updated_at': _now()}
         self._put('tasks', task)
         draft.update(task_id=task['id'], updated_at=_now())
         self._put('drafts', draft)
-        thread = threading.Thread(target=self._execute, args=(task['id'], deepcopy(draft)), daemon=True)
+        thread = threading.Thread(target=self._execute, args=(task['id'], deepcopy(configuration)), daemon=True)
         self._threads.append(thread)
         thread.start()
         return task
+
+    def _inspect(self, scope, progress, cancelled):
+        if getattr(self.backend, 'supports_inspection_progress', False):
+            return self.backend.inspect(deepcopy(scope), progress=progress, cancelled=cancelled)
+        return self.backend.inspect(deepcopy(scope))
+
+    def start_check(self, draft_id, revision):
+        with self._lock:
+            draft = self._current(draft_id, revision)
+            for task in self._all('tasks'):
+                if (task['draft_id'] == draft_id and task['revision'] == revision
+                    and task['kind'] in {'check', 'prepare', 'retry_source'} and task['status'] in {'QUEUED', 'RUNNING'}):
+                    return task
+            draft.update(readiness=None, preview=None)
+            return self._new_task(draft, 'check', uuid4().hex)
+
+    def retry_source(self, draft_id, revision, symbol):
+        with self._lock:
+            draft = self._current(draft_id, revision)
+            if not isinstance(symbol, str) or len(symbol) != 6 or not symbol.isdigit():
+                raise WorkflowError('请选择有效股票的来源限制记录', 'INVALID_SOURCE_RETRY', 2)
+            for task in self._all('tasks'):
+                if task['draft_id'] == draft_id and task['status'] in {'QUEUED', 'RUNNING'}:
+                    if task['kind'] == 'retry_source' and task['revision'] == revision and task.get('source_symbol') == symbol:
+                        return task
+                    raise WorkflowError('当前任务仍在执行，请等待完成后重新核实来源', 'TASK_ACTIVE', 2)
+            issues = (draft.get('readiness') or {}).get('issues', [])
+            if not any(i.get('code') == 'SOURCE_ADJUSTMENT_UNAVAILABLE' and i.get('symbol') == symbol for i in issues):
+                raise WorkflowError('当前没有此股票的来源限制记录，请重新检查', 'INVALID_SOURCE_RETRY', 2)
+            draft.update(readiness=None, preview=None)
+            return self._new_task(draft, 'retry_source', uuid4().hex, source_symbol=symbol)
 
     def prepare(self, draft_id, revision, plan_id=None):
         with self._lock:
             draft = self._current(draft_id, revision)
             for task in self._all('tasks'):
-                if (task['draft_id'] == draft_id and task['kind'] == 'prepare'
+                if (task['draft_id'] == draft_id and task['kind'] in {'check', 'prepare', 'retry_source'}
                     and task['revision'] == revision and task['status'] in {'QUEUED', 'RUNNING'}):
                     return task
-        fresh = self.backend.inspect(deepcopy(draft['scope']))
-        plan = fresh.get('repair_plan')
-        with self._lock:
-            draft = self._current(draft_id, revision)
+            plan = (draft.get('readiness') or {}).get('repair_plan')
             if plan_id is not None and (not plan or plan['plan_id'] != plan_id):
-                draft.update(readiness=self._readiness(fresh), preview=None)
-                self._put('drafts', draft)
                 raise WorkflowError('修复计划已变化，请重新检查后继续', 'REPAIR_PLAN_CHANGED', 2)
             if plan is not None and not plan.get('executable_count'):
-                draft.update(readiness=self._readiness(fresh), preview=None)
-                self._put('drafts', draft)
                 raise WorkflowError('当前没有可自动处理项，请查看检查结果中的处理方式', 'NO_REPAIR_ACTIONS', 2)
-            for task in self._all('tasks'):
-                if (task['draft_id'] == draft_id and task['kind'] == 'prepare'
-                    and task['revision'] == revision and task['status'] in {'QUEUED','RUNNING'}):
-                    return task
-            draft.update(readiness=self._readiness(fresh) if plan is not None else None, preview=None)
-            return self._new_task(draft, 'prepare', uuid4().hex)
+            # Freeze the approved plan before invalidating readiness for concurrent previews.
+            frozen = deepcopy(draft)
+            draft.update(readiness=None, preview=None)
+            return self._new_task(draft, 'prepare', uuid4().hex, configuration=frozen)
 
     def run(self, draft_id, revision, idempotency_key):
         if not isinstance(idempotency_key, str) or not idempotency_key or len(idempotency_key) > 200:
@@ -305,8 +329,8 @@ class ResearchWorkflow:
     def cancel(self, task_id):
         with self._lock:
             task = self._get('tasks', task_id)
-            if task['kind'] != 'prepare':
-                raise WorkflowError('模拟已冻结提交，请等待结果；仅数据准备可以取消', 'NOT_CANCELLABLE', 4)
+            if task['kind'] not in {'check', 'prepare', 'retry_source'}:
+                raise WorkflowError('模拟已冻结提交，请等待结果；仅数据检查和准备可以取消', 'NOT_CANCELLABLE', 4)
             if task['status'] in {'QUEUED', 'RUNNING'}:
                 task.update(status='CANCELLED', stage='已取消，已完成的有效缓存保留', updated_at=_now())
                 self._put('tasks', task)
@@ -321,20 +345,54 @@ class ResearchWorkflow:
                 if cancelled():
                     raise _Cancelled()
                 task = self._get('tasks', task_id)
-                task.update(status='RUNNING', stage=str(message), updated_at=_now())
+                task.update(status='RUNNING', stage=str(message), updated_at=_now(),
+                            heartbeat_at=_now(), progress_at=_now(), started_at=task.get('started_at') or _now())
                 self._put('tasks', task)
 
         # One backend operation at a time keeps mutable provider caches consistent.
         with self._worker_lock:
+            stopped = threading.Event()
+            def heartbeat():
+                while not stopped.wait(2):
+                    with self._lock:
+                        task = self._get('tasks', task_id)
+                        if task['status'] != 'RUNNING':
+                            return
+                        task['heartbeat_at'] = _now()
+                        self._put('tasks', task)
+            ticker = threading.Thread(target=heartbeat, daemon=True)
+            ticker.start()
             try:
-                progress('检查研究数据' if self.get_task(task_id)['kind'] == 'prepare' else '运行历史模拟')
+                progress('检查研究数据' if self.get_task(task_id)['kind'] in {'check', 'prepare', 'retry_source'} else '运行历史模拟')
                 task = self.get_task(task_id)
-                if task['kind'] == 'prepare':
+                if task['kind'] == 'retry_source':
+                    progress('重新核实来源限制记录')
+                    if getattr(self.backend, 'supports_inspection_progress', False):
+                        attempt = self.backend.retry_source(deepcopy(draft['scope']), task['source_symbol'], progress=progress, cancelled=cancelled)
+                    else:
+                        attempt = self.backend.retry_source(deepcopy(draft['scope']), task['source_symbol'])
+                    progress('来源重新核实已完成，重新检查数据')
+                    result = self._inspect(draft['scope'], progress, cancelled)
+                    if isinstance(attempt, dict):
+                        result['repair_attempts'] = [attempt]
+                    status = 'SUCCEEDED'
+                elif task['kind'] == 'check':
+                    result = self._inspect(draft['scope'], progress, cancelled)
+                    status = 'SUCCEEDED'
+                elif task['kind'] == 'prepare':
                     expected = (draft.get('readiness') or {}).get('repair_plan')
-                    if expected:
-                        fresh = self.backend.inspect(deepcopy(draft['scope']))
-                        if fresh.get('repair_plan', {}).get('plan_id') != expected['plan_id']:
+                    fresh = self._inspect(draft['scope'], progress, cancelled)
+                    plan = fresh.get('repair_plan')
+                    if (expected and (not plan or plan.get('plan_id') != expected['plan_id'])) or (plan is not None and not plan.get('executable_count')):
+                        with self._lock:
+                            current = self._get('drafts', draft['id'])
+                            if _digest(current['scope']) == task['scope_key'] and current.get('task_id') == task_id and not cancelled():
+                                current.update(readiness=self._readiness(fresh), preview=None, updated_at=_now())
+                                self._put('drafts', current)
+                        if expected and (not plan or plan.get('plan_id') != expected['plan_id']):
                             raise WorkflowError('修复计划已变化，请重新检查后继续', 'REPAIR_PLAN_CHANGED', 2)
+                        raise WorkflowError('当前没有可自动处理项，请查看检查结果中的处理方式', 'NO_REPAIR_ACTIONS', 2)
+                    progress('修复计划已核验，开始处理')
                     result = self.backend.prepare(deepcopy(draft['scope']), progress, cancelled)
                     status = 'SUCCEEDED' if result.get('status') == 'READY' else 'PARTIAL'
                     summary = result.get('repair_summary', {})
@@ -348,11 +406,11 @@ class ResearchWorkflow:
                     if cancelled():
                         return
                     task = self._get('tasks', task_id)
-                    task.update(status=status, result=result, stage='已完成' if status == 'SUCCEEDED' else '仍有数据缺口，请处理后继续', updated_at=_now())
+                    task.update(status=status, result=result, stage='已完成' if status == 'SUCCEEDED' else '仍有研究阻断，请查看对应处理方式', updated_at=_now())
                     self._put('tasks', task)
                     current = self._get('drafts', draft['id'])
                     if _digest(current['scope']) == task['scope_key'] and current.get('task_id') == task_id:
-                        if task['kind'] == 'prepare':
+                        if task['kind'] in {'check', 'prepare', 'retry_source'}:
                             current.update(readiness=self._readiness(result), preview=None)
                         current['updated_at'] = _now()
                         self._put('drafts', current)
@@ -363,5 +421,8 @@ class ResearchWorkflow:
                     if cancelled():
                         return
                     task = self._get('tasks', task_id)
-                    task.update(status='FAILED', error=str(exc), stage='执行失败；配置和已完成缓存保留，可重试', updated_at=_now())
+                    task.update(status='FAILED', error=str(exc), error_code=getattr(exc, 'code', None), stage='执行失败；配置和已完成缓存保留，可重试', updated_at=_now())
                     self._put('tasks', task)
+            finally:
+                stopped.set()
+                ticker.join()

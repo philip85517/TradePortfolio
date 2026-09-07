@@ -93,3 +93,30 @@ test('scope invalidation detaches previous task summaries without mutating saved
  assert.equal(h.taskForDraft(previous,{task_id:'old'}),previous);
  assert.equal(previous.result.repair_attempts[0].status,'resolved');
 });
+
+test('running elapsed time advances independently of progress and stale heartbeat stays explicit',()=>{
+ const h=helpers(), task={status:'RUNNING',created_at:'2026-09-07T00:00:00Z',updated_at:'2026-09-07T00:00:01Z',heartbeat_at:'2026-09-07T00:00:05Z',progress_at:'2026-09-07T00:00:01Z'};
+ assert.equal(h.taskTiming(task,Date.parse('2026-09-07T00:00:30Z')).elapsed,30);
+ assert.equal(h.taskTiming(task,Date.parse('2026-09-07T00:00:30Z')).stale,true);
+ assert.equal(h.taskTiming({...task,status:'SUCCEEDED'},Date.parse('2026-09-07T00:01:00Z')).elapsed,1);
+});
+test('supported market events are separated from blocking issues',()=>{
+ const h=helpers(), issues=[{severity:'info',resolution:'unsupported',message:'确认停牌'},{severity:'warning',resolution:'user',message:'陈旧估值'}];
+ const html=h.issuesHtml(issues);
+ assert.match(html,/说明（不阻断）/); assert.match(html,/提示（不阻断）/);
+ assert.doesNotMatch(html,/需要你处理|issue-group danger/);
+ assert.doesNotMatch(h.coverageHtml([{symbol:'000001',status:'READY'}],0,[{symbol:'000001',severity:'info',resolution:'unsupported'}]),/当前能力不支持/);
+});
+
+test('unsupported source offers explicit symbol retry while ordinary issues do not',()=>{
+ const h=helpers();
+ const html=h.issuesHtml([{symbol:'302132',code:'SOURCE_ADJUSTMENT_UNAVAILABLE',resolution:'unsupported',message:'来源不支持'}]);
+ assert.match(html,/重新核实来源/); assert.match(html,/data-retry-source="302132"/);
+ assert.doesNotMatch(h.issuesHtml([{symbol:'000001',code:'TRADING_STATUS_UNKNOWN'}]),/data-retry-source/);
+});
+
+test('unliquidated wizard result separates realized cash and valuation', () => {
+ const h=helpers();const html=h.liquidationHtml({liquidation_status:'OPEN_POSITION',realized_profit_loss:20,unrealized_profit_loss:30,unrealized_holdings_value:1000,realized_cash:2000});
+ assert.match(html,/仍有未平仓/);assert.match(html,/已实现盈亏/);assert.match(html,/未实现盈亏/);assert.match(html,/不代表全部卖出/);
+ assert.equal(h.liquidationHtml({liquidation_status:'LIQUIDATED'}),'');assert.equal(h.liquidationHtml({}), '');
+});

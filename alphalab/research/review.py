@@ -438,6 +438,12 @@ class ReviewState:
                     "commission_paid": result.get("commission_paid"),
                     "slippage_paid": result.get("slippage_paid"),
                     "cash_residual": result.get("cash_residual"),
+                    "liquidation_status": result.get("liquidation_status"),
+                    "unrealized_holdings_value": result.get("unrealized_holdings_value"),
+                    "unrealized_profit_loss": result.get("unrealized_profit_loss"),
+                    "realized_profit_loss": result.get("realized_profit_loss"),
+                    "realized_cash": result.get("realized_cash"),
+                    "open_positions": result.get("open_positions"),
                     "evaluated_date": result.get("evaluated_date"),
                 }
             portfolio_payload = _records(portfolio_rows)[0] if not portfolio_rows.empty else None

@@ -203,7 +203,8 @@ def test_rename_during_preparation_retains_valid_data_result(tmp_path):
     assert reopened['readiness']['status'] == 'READY'
 
 
-def test_restart_marks_interrupted_jobs_without_losing_draft(tmp_path):
+@pytest.mark.parametrize('kind', ['prepare', 'check'])
+def test_restart_marks_interrupted_jobs_without_losing_draft(tmp_path, kind):
     import json
     import subprocess
     import sys
@@ -211,13 +212,18 @@ def test_restart_marks_interrupted_jobs_without_losing_draft(tmp_path):
 import json, sys, threading, time
 from pathlib import Path
 from alphalab.tests.integration.test_workflow import service, configured, SampleBackend
-backend=SampleBackend(); backend.release=threading.Event()
+class SlowBackend(SampleBackend):
+    def inspect(self, scope):
+        if sys.argv[2] == 'check': time.sleep(30)
+        return super().inspect(scope)
+backend=SlowBackend(); backend.release=threading.Event()
 flow=service(Path(sys.argv[1]),backend); draft=configured(flow)
-task=flow.prepare(draft['id'],draft['revision'])
+method=flow.start_check if sys.argv[2] == 'check' else flow.prepare
+task=method(draft['id'],draft['revision'])
 print(json.dumps({'draft_id':draft['id'],'task_id':task['id']}),flush=True)
 time.sleep(30)
 """
-    process=subprocess.Popen([sys.executable,'-c',script,str(tmp_path)],stdout=subprocess.PIPE,text=True)
+    process=subprocess.Popen([sys.executable,'-c',script,str(tmp_path),kind],stdout=subprocess.PIPE,text=True)
     try:
         saved=json.loads(process.stdout.readline())
     finally:
@@ -325,7 +331,9 @@ def test_http_real_research_run_and_frozen_review(tmp_path):
         draft=request('/api/wizard/drafts',{},'POST')['draft']; path='/api/wizard/drafts/'+draft['id']
         request_scope={**scope(),'symbols':['000001','600000'],'start_date':'2025-06-02','end_date':'2025-06-06'}
         draft=request(path,{'revision':draft['revision'],'scope':request_scope},'PATCH')['draft']
-        checked=request(path+'/check',{'revision':draft['revision']},'POST')['draft']
+        check_task=request(path+'/check',{'revision':draft['revision']},'POST')['task']
+        assert finish(flow, check_task['id'])['status']=='SUCCEEDED'
+        checked=request(path)['draft']
         assert checked['readiness']['status']=='READY'
         preview=request(path+'/preview',{'revision':draft['revision']},'POST')['preview']
         assert len(preview['holdings'])==2
@@ -387,3 +395,132 @@ def test_editing_completed_portfolio_restores_unfinished_draft(tmp_path):
     changed=flow.update_draft(draft['id'],draft['revision'],portfolio={'initial_cash':123456})
     assert changed['task_id'] is None and changed['preview'] is None
     assert flow.get_task(task['id'])['configuration']['portfolio']['initial_cash']==100000
+
+
+def test_async_check_reports_progress_and_can_cancel_without_publishing(tmp_path):
+    entered, release = threading.Event(), threading.Event()
+    class SlowCheck(SampleBackend):
+        supports_inspection_progress = True
+        def inspect(self, scope, progress=None, cancelled=None):
+            progress('逐股检查 25 / 100')
+            entered.set()
+            release.wait(3)
+            assert cancelled()
+            return super().inspect(scope)
+    flow = service(tmp_path, SlowCheck()); draft = configured(flow)
+    try:
+        task = flow.start_check(draft['id'], draft['revision'])
+        assert entered.wait(1)
+        running = flow.get_task(task['id'])
+        assert running['stage'] == '逐股检查 25 / 100'
+        assert running['heartbeat_at'] and running['started_at']
+        assert flow.start_check(draft['id'], draft['revision'])['id'] == task['id']
+        assert flow.cancel(task['id'])['status'] == 'CANCELLED'
+    finally:
+        release.set(); flow.close()
+    restored = service(tmp_path)
+    assert restored.get_draft(draft['id'])['readiness'] is None
+    assert restored.get_task(task['id'])['status'] == 'CANCELLED'
+    restored.close()
+
+
+def test_async_check_legacy_backend_publishes_blocked_report_as_completed(tmp_path):
+    flow = service(tmp_path); draft = configured(flow)
+    task = flow.start_check(draft['id'], draft['revision'])
+    assert finish(flow, task['id'])['status'] == 'SUCCEEDED'
+    assert flow.get_draft(draft['id'])['readiness']['status'] == 'BLOCKED'
+    flow.close()
+
+
+def test_prepare_validates_changed_plan_in_worker_without_blocking_submission(tmp_path):
+    entered, release = threading.Event(), threading.Event()
+    class PlanBackend(SampleBackend):
+        def inspect(self, scope):
+            entered.set(); release.wait(3)
+            return {**super().inspect(scope), 'repair_plan': {'plan_id': 'new', 'executable_count': 1}}
+        def prepare(self, *args):
+            raise AssertionError('stale plan must never execute')
+    flow = service(tmp_path, PlanBackend()); draft = configured(flow)
+    with flow._lock:
+        draft['readiness'] = {'repair_plan': {'plan_id': 'approved', 'executable_count': 1}}
+        flow._put('drafts', draft)
+    try:
+        started = time.monotonic()
+        task = flow.prepare(draft['id'], draft['revision'], plan_id='approved')
+        assert time.monotonic() - started < .5
+        assert entered.wait(1)
+        release.set()
+        failed = finish(flow, task['id'])
+        assert failed['status'] == 'FAILED'
+        assert failed['error_code'] == 'REPAIR_PLAN_CHANGED'
+        assert flow.get_draft(draft['id'])['readiness']['repair_plan']['plan_id'] == 'new'
+    finally:
+        release.set(); flow.close()
+
+
+@pytest.mark.parametrize('action', ['check', 'retry_source'])
+def test_http_check_returns_before_inspection_and_keeps_cancel_available(tmp_path, action):
+    import json
+    from urllib.request import Request, urlopen
+    from alphalab.research.workbench import create_workbench_server
+    entered, release = threading.Event(), threading.Event()
+    class SlowBackend(SampleBackend):
+        def retry_source(self, scope, symbol):
+            entered.set(); release.wait(3)
+        def inspect(self, scope):
+            entered.set(); release.wait(3)
+            return super().inspect(scope)
+    flow = service(tmp_path, SlowBackend()); draft = configured(flow)
+    if action == 'retry_source':
+        draft['readiness'] = {'status': 'BLOCKED', 'issues': [{'code': 'SOURCE_ADJUSTMENT_UNAVAILABLE', 'symbol': '600000'}]}
+        flow._put('drafts', draft)
+    server = create_workbench_server(flow)
+    worker = threading.Thread(target=server.serve_forever, daemon=True); worker.start()
+    base = 'http://127.0.0.1:' + str(server.server_address[1])
+    def post(path, payload):
+        req = Request(base + path, data=json.dumps(payload).encode(),
+                      headers={'Content-Type': 'application/json'}, method='POST')
+        with urlopen(req, timeout=1) as response:
+            return response.status, json.load(response)
+    try:
+        status, response = post('/api/wizard/drafts/' + draft['id'] + '/' + action, {'revision': draft['revision'], 'symbol': '600000'})
+        assert status == 202 and entered.wait(1)
+        task = response['task']
+        status, response = post('/api/wizard/tasks/' + task['id'] + '/cancel', {})
+        assert response['task']['status'] == 'CANCELLED'
+        assert flow.get_draft(draft['id'])['readiness'] is None
+    finally:
+        release.set(); server.shutdown(); server.server_close(); worker.join(2); flow.close()
+
+
+def test_source_retry_is_explicit_revision_guarded_and_asynchronous(tmp_path):
+    entered, release = threading.Event(), threading.Event()
+    class SourceBackend(SampleBackend):
+        def retry_source(self, scope, symbol):
+            assert symbol == '600000'
+            assert scope['quality_mode'] == 'strict'
+            entered.set(); release.wait(3)
+            self.identity = 'retry-version'
+    backend = SourceBackend(); flow = service(tmp_path, backend); draft = configured(flow)
+    draft = flow.update_draft(draft['id'], draft['revision'], scope={'quality_mode': 'strict'})
+    with flow._lock:
+        draft['readiness'] = {'status': 'BLOCKED', 'issues': [{'code': 'SOURCE_ADJUSTMENT_UNAVAILABLE', 'symbol': '600000'}]}
+        flow._put('drafts', draft)
+    try:
+        with pytest.raises(ValueError, match='版本'):
+            flow.retry_source(draft['id'], draft['revision'] - 1, '600000')
+        with pytest.raises(ValueError, match='来源'):
+            flow.retry_source(draft['id'], draft['revision'], '000001')
+        before = time.monotonic()
+        task = flow.retry_source(draft['id'], draft['revision'], '600000')
+        assert time.monotonic() - before < .5
+        assert entered.wait(1)
+        assert flow.get_draft(draft['id'])['readiness'] is None
+        release.set()
+        assert finish(flow, task['id'])['status'] == 'SUCCEEDED'
+        current = flow.get_draft(draft['id'])
+        assert current['readiness']['data_identity'] == 'retry-version'
+        assert current['readiness']['status'] == 'BLOCKED'
+        assert current['scope']['quality_mode'] == 'strict'
+    finally:
+        release.set(); flow.close()

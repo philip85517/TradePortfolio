@@ -18,6 +18,7 @@ import pandas as pd
 
 from ..utils import code_commit, json_hash, parse_date
 from .plugins import ResearchFactorPlugin, factor_definition, resolve_plugin, validate_plugin_output
+from .suspension_policy import POLICY_VERSION, prepare_view, apply_candidate_policy, suspended_rows
 
 
 class ResearchDataAdapter(Protocol):
@@ -52,6 +53,7 @@ class ResearchSpec:
     portfolios: tuple["PortfolioSpec", ...] = ()
     target_weights: dict[str, float] = field(default_factory=dict)
     wizard_metadata: dict[str, Any] = field(default_factory=dict)
+    suspension_policy: str = "legacy"
 
 
 @dataclass(frozen=True)
@@ -95,6 +97,12 @@ class HorizonPerformance:
     commission_paid: float | None = None
     slippage_paid: float | None = None
     cash_residual: float | None = None
+    liquidation_status: str | None = None
+    unrealized_holdings_value: float | None = None
+    unrealized_profit_loss: float | None = None
+    realized_profit_loss: float | None = None
+    realized_cash: float | None = None
+    open_positions: dict[str, float] | None = None
 
 
 @dataclass
@@ -202,6 +210,21 @@ class DuckDBMarketDataAdapter:
                 """,
                 [market, start_date, end_date, *symbol_params],
             ).fetch_df()
+            if "frozen_trading_status" in tables and not data.empty:
+                # Optional frozen evidence survives the OHLCV store's deliberate
+                # column projection. Match the original adjustment basis and fail
+                # on ambiguous evidence instead of multiplying market bars.
+                states = con.execute(
+                    f"""SELECT symbol, date, adjustment, tradestatus
+                        FROM frozen_trading_status
+                        WHERE date >= ? AND date <= ? {symbol_clause}""",
+                    [start_date, end_date, *symbol_params],
+                ).fetch_df()
+                data = _normalise_dates(data)
+                states["date"] = pd.to_datetime(states["date"]).dt.normalize()
+                states["symbol"] = states["symbol"].astype(str)
+                states["adjustment"] = states["adjustment"].astype(str)
+                data = data.merge(states, on=["symbol", "date", "adjustment"], how="left", validate="many_to_one")
             if "market_universe" in tables and not data.empty:
                 universe_columns = {
                     str(row[0]) for row in con.execute("DESCRIBE market_universe").fetchall()
@@ -314,6 +337,8 @@ class HistoricalResearchLab:
             raise
 
     def _run(self, spec: ResearchSpec, context: dict[str, Any]) -> ResearchReport:
+        if spec.suspension_policy not in {"legacy", POLICY_VERSION}:
+            raise ValueError("未知 suspension_policy")
         requested = parse_date(spec.requested_date)
         context["requested"] = requested
         if spec.top_n <= 0:
@@ -352,6 +377,8 @@ class HistoricalResearchLab:
         if data.empty:
             raise ValueError("指定 universe 模式下没有可用股票")
         _validate_universe_quality(universe_diagnostics, spec.data_quality_mode)
+        if spec.suspension_policy == POLICY_VERSION:
+            data = prepare_view(data, signal_date)
         data_quality = _quality_summary(data, signal_date)
         context["diagnostics"]["data_quality"] = data_quality
         _validate_quality_mode(data_quality, spec.data_quality_mode)
@@ -373,6 +400,10 @@ class HistoricalResearchLab:
             plugin_id=factor["plugin_id"],
             min_history_days=factor["min_history_days"],
         )
+        if spec.suspension_policy == POLICY_VERSION:
+            candidates = apply_candidate_policy(candidates, before, signal_date,
+                min_effective_samples=61 if spec.rule_version == "fixed_v0" else 1)
+            funnel["rule_eligible"] = int(candidates.eligible.sum())
         candidates, funnel = _prepare_plugin_candidates(candidates, funnel, before, factor)
         selected = candidates[candidates["eligible"]].sort_values(
             ["total_score", "symbol"], ascending=[False, True], kind="mergesort"
@@ -381,7 +412,7 @@ class HistoricalResearchLab:
         if not selected.empty:
             candidates.loc[candidates["symbol"].isin(selected["symbol"]), "selected"] = True
 
-        entry_date = _next_market_date(after)
+        entry_date = (after.date.min().date() if not after.empty else None) if spec.suspension_policy == POLICY_VERSION else _next_market_date(after)
         portfolio_specs = _resolve_portfolio_specs(spec)
         portfolios: dict[str, pd.DataFrame] = {}
         portfolio_performance: dict[str, dict[int, HorizonPerformance]] = {}
@@ -440,6 +471,7 @@ class HistoricalResearchLab:
 
         diagnostics = {
             "market": spec.market,
+            "suspension_policy": spec.suspension_policy,
             "universe_mode": spec.universe_mode,
             "selection_rule": "amount_20d >= 30000000 and close > ma60; score = pct(return_60d)*0.6 + pct(return_20d)*0.3 + pct(amount_20d)*0.1",
             "factor": factor,
@@ -1082,7 +1114,10 @@ def _score_fixed_v0(before: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, int]]
     for symbol, group in before.groupby("symbol", sort=True):
         group = group.sort_values("date")
         reasons: list[str] = []
-        clean = group.drop_duplicates("date", keep="last")
+        clean = group.drop_duplicates("date", keep="last").copy()
+        if "valuation_close" in clean:
+            paused = suspended_rows(clean)
+            clean.loc[paused, "close"] = clean.loc[paused, "valuation_close"]
         valid = clean[clean["close"].notna() & (clean["close"] > 0)].copy()
         history_count = len(valid)
         if history_count < 120:
@@ -1290,12 +1325,17 @@ def _build_portfolio(
 
     selected = selected.sort_values(["rank", "symbol"], kind="mergesort").reset_index(drop=True)
     entry_rows: list[dict[str, Any]] = []
+    suspended_entries: set[str] = set()
     for _, row in selected.iterrows():
         part = after[(after["symbol"] == row["symbol"]) & (after["date"] == pd.Timestamp(entry_date))]
-        if part.empty or pd.isna(part.iloc[0]["open"]):
+        paused = spec.suspension_policy == POLICY_VERSION and not part.empty and suspended_rows(part).iloc[0]
+        if paused:
+            suspended_entries.add(str(row["symbol"]))
+            reasons[str(row["symbol"])] = "建仓日停牌，买入未成交，预定权重保留现金"
+        if not paused and (part.empty or pd.isna(part.iloc[0]["open"])):
             reasons[str(row["symbol"])] = "缺少建仓日开盘价"
             continue
-        entry_price = float(part.iloc[0]["open"]) * (1.0 + spec.slippage_rate)
+        entry_price = np.nan if paused else float(part.iloc[0]["open"]) * (1.0 + spec.slippage_rate)
         entry_rows.append(
             {
                 "symbol": row["symbol"],
@@ -1343,6 +1383,8 @@ def _build_portfolio(
 
     rows: list[dict[str, Any]] = []
     for row, weight in zip(entry_rows, weights, strict=True):
+        if str(row["symbol"]) in suspended_entries:
+            continue
         allocated = spec.initial_cash * float(weight) / (1.0 + spec.commission_rate)
         raw_shares = allocated / row["entry_price"] if row["entry_price"] > 0 else 0.0
         shares = float(np.floor(raw_shares / spec.lot_size) * spec.lot_size)
@@ -1505,7 +1547,13 @@ def _evaluate_forward(
             )
             for h in horizons
         }, empty_nav
-    available_dates = sorted(after.loc[after["close"].notna(), "date"].drop_duplicates())
+    phase_aware = spec.suspension_policy == POLICY_VERSION
+    if phase_aware:
+        if "valuation_close" not in after:
+            after = prepare_view(after, spec.requested_date, entry_date)
+        available_dates = sorted(after["date"].drop_duplicates())
+    else:
+        available_dates = sorted(after.loc[after["close"].notna(), "date"].drop_duplicates())
     try:
         entry_index = available_dates.index(pd.Timestamp(entry_date))
     except ValueError:
@@ -1543,7 +1591,7 @@ def _evaluate_forward(
             continue
         window_dates = available_dates[entry_index : target_index + 1]
         prices = after[after["date"].isin(window_dates)].pivot_table(
-            index="date", columns="symbol", values="close", aggfunc="last"
+            index="date", columns="symbol", values="valuation_close" if phase_aware else "close", aggfunc="last"
         ).reindex(window_dates)
         entry_prices = portfolio.set_index("symbol")["entry_price"]
         shares = portfolio.set_index("symbol")["shares"]
@@ -1603,7 +1651,11 @@ def _evaluate_forward(
         # 终点卖出成本单独计入净收益；净值路径按收盘市值计算。
         exit_cost_factor = (1.0 - spec.slippage_rate) * (1.0 - spec.commission_rate)
         exit_prices = selected_prices.iloc[-1].astype(float)
-        net_exit_values = exit_prices * shares * exit_cost_factor
+        exit_paused = pd.Series(False, index=shares.index)
+        if phase_aware:
+            terminal = after[after.date.eq(window_dates[-1])]
+            exit_paused = terminal.assign(_paused=suspended_rows(terminal)).set_index("symbol")["_paused"].reindex(shares.index).fillna(False)
+        net_exit_values = exit_prices * shares * np.where(exit_paused, 1.0, exit_cost_factor)
         all_stock_returns = {
             str(symbol): float(value)
             for symbol, value in (net_exit_values / buy_values - 1.0).items()
@@ -1642,14 +1694,15 @@ def _evaluate_forward(
             else None
         )
         buy_notional = raw_entry_prices * shares
-        exit_notional = exit_prices * shares * (1.0 - spec.slippage_rate)
+        exit_notional = exit_prices * shares * (1.0 - spec.slippage_rate) * (~exit_paused)
         commission_paid = float(
             (entry_prices * shares).mul(spec.commission_rate).sum() + exit_notional.mul(spec.commission_rate).sum()
         )
         slippage_paid = float(
             (entry_prices - raw_entry_prices).mul(shares).sum()
-            + (exit_prices * spec.slippage_rate).mul(shares).sum()
+            + (exit_prices * spec.slippage_rate).mul(shares).mul(~exit_paused).sum()
         )
+        valuation_metadata = _valuation_metadata(after, shares.index) if phase_aware else {}
         for current_date, current_equity, current_return, current_drawdown in zip(
             equity.index, equity, daily_return, drawdown, strict=True
         ):
@@ -1660,6 +1713,7 @@ def _evaluate_forward(
                     "equity": float(current_equity),
                     "daily_return": float(current_return),
                     "drawdown": float(current_drawdown),
+                    **(valuation_metadata.get(current_date, {"stale_symbols": "", "max_valuation_stale_days": 0}) if phase_aware else {}),
                 }
             )
         performance[horizon] = HorizonPerformance(
@@ -1683,14 +1737,35 @@ def _evaluate_forward(
             commission_paid=commission_paid,
             slippage_paid=slippage_paid,
             cash_residual=cash_residual,
+            liquidation_status=("OPEN_POSITION" if exit_paused.any() else "LIQUIDATED") if phase_aware else None,
+            unrealized_holdings_value=float(net_exit_values[exit_paused].sum()) if phase_aware else None,
+            unrealized_profit_loss=float((net_exit_values - buy_values)[exit_paused].sum()) if phase_aware else None,
+            realized_profit_loss=float((net_exit_values - buy_values)[~exit_paused].sum()) if phase_aware else None,
+            realized_cash=float(cash_residual + net_exit_values[~exit_paused].sum()) if phase_aware else None,
+            open_positions={str(k): float(v) for k, v in shares[exit_paused].items()} if phase_aware else None,
         )
-    return performance, pd.DataFrame(rows, columns=["date", "horizon", "equity", "daily_return", "drawdown"])
+    return performance, pd.DataFrame(rows, columns=["date", "horizon", "equity", "daily_return", "drawdown"] + (["stale_symbols", "max_valuation_stale_days"] if phase_aware else []))
+
+
+def _valuation_metadata(after, symbols):
+    """Group held-symbol stale facts once, not a whole-market scan per NAV day."""
+    stale = after[after.symbol.isin(symbols) & after.valuation_stale_days.gt(0)]
+    return {current_date: {
+        "stale_symbols": ",".join(sorted(part.symbol.astype(str))),
+        "max_valuation_stale_days": int(part.valuation_stale_days.max()),
+    } for current_date, part in stale.groupby("date", sort=False)}
 
 
 def _quality_summary(data: pd.DataFrame, signal_date: date) -> dict[str, Any]:
-    prices = data[["open", "high", "low", "close"]]
+    # A known suspension has no executable OHLC requirement when an adjusted
+    # valuation anchor exists. Keep the stored bars and diagnostics raw elsewhere.
+    quality_data = data
+    if "valuation_close" in data:
+        explained = suspended_rows(data) & data.valuation_close.gt(0) & np.isfinite(data.valuation_close)
+        quality_data = data.loc[~explained]
+    prices = quality_data[["open", "high", "low", "close"]]
     selection = data[data["date"] <= pd.Timestamp(signal_date)]
-    selection_prices = selection[["open", "high", "low", "close"]]
+    selection_prices = quality_data.loc[quality_data["date"] <= pd.Timestamp(signal_date), ["open", "high", "low", "close"]]
     invalid_ohlc = int(
         ((prices["high"] < prices[["open", "close"]].max(axis=1)) | (prices["low"] > prices[["open", "close"]].min(axis=1))).fillna(False).sum()
     )

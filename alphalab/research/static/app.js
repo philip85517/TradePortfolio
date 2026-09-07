@@ -8,7 +8,26 @@
       rule: manual ? "手选股票" : summary.rule_version || "--", factorSource: manual ? "手选股票" : "FIXED V0 FACTORS",
       factorTitle: manual ? "持仓与筛选信息" : "因子拆解"};
   }
-  if (typeof module !== "undefined") module.exports = {reviewLabels};
+  function portfolioStatus(results) {
+    if (results.some((item) => item.liquidation_status === "OPEN_POSITION")) return "估值完成 · 尚未清算";
+    const complete = results.filter((item) => item.status === "COMPLETE");
+    if (!complete.length) return "不可评估";
+    return complete.every((item) => item.liquidation_status === "LIQUIDATED") ? "已全部清算" : "已完成";
+  }
+
+  function performanceCardHtml(result, title, initialCash) {
+    const open = result.liquidation_status === "OPEN_POSITION";
+    const accounting = result.liquidation_status ? `<small>${open ? "尚未清算" : "已全部清算"} · 已实现盈亏 ${number(result.realized_profit_loss)} · 未实现盈亏 ${number(result.unrealized_profit_loss)}</small><small>现金 ${number(result.realized_cash)} · 未实现持仓估值 ${number(result.unrealized_holdings_value)}</small>${open ? `<small>未退出持仓 ${Object.keys(result.open_positions || {}).map(escapeHtml).join("、") || "--"}</small>` : ""}` : "";
+    return `<div class="performance-card"><span>${escapeHtml(title)} · ${open ? "估值收益" : "组合收益"}</span><strong>${percent(result.total_return)}</strong><small>${initialCash == null ? "" : `本金 ${number(initialCash, 0)} · `}${open ? "估值盈亏" : "盈亏"} ${number(result.profit_loss)} · 最大回撤 ${percent(result.max_drawdown)}</small><small>成本前 ${percent(result.gross_return)} · 胜率 ${percent(result.holding_win_rate)}</small>${accounting}</div>`;
+  }
+
+  function staleValuationHtml(rows) {
+    const stale = rows.filter((row) => Number(row.max_valuation_stale_days) > 0 || row.stale_symbols);
+    if (!stale.length) return "";
+    return `<details class="muted"><summary>历史价格估值：${stale.length} 条记录（不代表当日可成交）</summary>${stale.map((row) => `<div>${escapeHtml(row.date)} · ${escapeHtml(row.horizon)} 日周期 · ${escapeHtml(row.stale_symbols || "--")} · 估值已陈旧 ${number(row.max_valuation_stale_days, 0)} 天</div>`).join("")}</details>`;
+  }
+
+  if (typeof module !== "undefined") module.exports = {reviewLabels, portfolioStatus, performanceCardHtml, staleValuationHtml};
   if (typeof document === "undefined") return;
 
   const state = {
@@ -171,8 +190,12 @@
     panel.hidden = false;
     const cards = Object.values(detail.performance || {});
     const portfolioCards = Object.values(detail.portfolio_performance || {});
-    const stockHtml = cards.map((item) => `<div class="performance-card"><span>${item.horizon} 日个股收益</span><strong>${percent(item.stock_return)}</strong><small>组合贡献 ${percent(item.contribution)} · ${item.status}</small></div>`).join("");
-    const portfolioHtml = portfolioCards.map((item) => `<div class="performance-card"><span>${item.horizon} 日组合收益 / 成本前</span><strong>${percent(item.total_return)}</strong><small>成本前 ${percent(item.gross_return)} · 最大回撤 ${percent(item.max_drawdown)} · 胜率 ${percent(item.holding_win_rate)}</small></div>`).join("");
+    const stockHtml = cards.map((item) => {
+      const portfolio = (detail.portfolio_performance || {})[String(item.horizon)] || {};
+      const open = Object.hasOwn(portfolio.open_positions || {}, detail.symbol || detail.candidate?.symbol);
+      return `<div class="performance-card"><span>${escapeHtml(item.horizon)} 日个股${open ? "估值收益" : "收益"}</span><strong>${percent(item.stock_return)}</strong><small>组合贡献 ${percent(item.contribution)} · ${open ? "未能退出，未实现持仓" : escapeHtml(item.status)}</small></div>`;
+    }).join("");
+    const portfolioHtml = portfolioCards.map((item) => performanceCardHtml(item, `${item.horizon} 日组合`)).join("");
     $("performanceGrid").innerHTML = stockHtml + portfolioHtml || `<div class="muted">该股票没有可用的前瞻结果。</div>`;
   }
 
@@ -202,16 +225,16 @@
     }
     const portfolioHtml = (payload.portfolios || []).map((portfolio) => {
       const result = (portfolio.performance || {})[primaryHorizon] || {};
-      const profit = result.profit_loss === null || result.profit_loss === undefined ? "--" : number(result.profit_loss);
-      return `<div class="performance-card"><span>${escapeHtml(portfolio.name || portfolio.portfolio_id)} · ${primaryHorizon}日</span><strong>${percent(result.total_return)}</strong><small>本金 ${number(portfolio.initial_cash, 0)} · 盈亏 ${profit}</small></div>`;
+      return performanceCardHtml(result, `${portfolio.name || portfolio.portfolio_id} · ${primaryHorizon}日`, portfolio.initial_cash);
     }).join("");
     $("portfolioMetricsGrid").innerHTML = metricValues.map(([label, value]) => `<div class="performance-card"><span>${label}</span><strong>${escapeHtml(value)}</strong></div>`).join("") + portfolioHtml;
-    $("portfolioStatusBadge").textContent = complete.length ? "已完成" : "不可评估";
+    $("portfolioStatusBadge").textContent = portfolioStatus(Object.values(performance));
     $("portfolioStatusBadge").className = `badge ${complete.length ? "accent" : ""}`;
     $("portfolioGrid").innerHTML = holdings.length
       ? holdings.map((holding) => `<div class="performance-card"><span>#${holding.rank ?? "--"} · ${escapeHtml(holding.symbol)}</span><strong>${escapeHtml(holding.name || "--")}</strong><small>目标权重 ${percent(holding.target_weight)} · 建仓 ${holding.entry_date || "--"}</small></div>`).join("")
       : `<div class="muted">当前运行没有可建仓持仓。</div>`;
     renderPortfolioChart($("navChart"), payload.nav || [], "equity", (value) => number(value, 0), payload.benchmark_nav || []);
+    $("navChart").innerHTML += staleValuationHtml(payload.nav || []);
     renderPortfolioChart($("drawdownChart"), payload.nav || [], "drawdown", (value) => percent(value), payload.benchmark_nav || []);
   }
 

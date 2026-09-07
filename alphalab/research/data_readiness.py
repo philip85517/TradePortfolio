@@ -1,12 +1,13 @@
 """Date-specific evidence and server-owned recovery plans for research inputs."""
 from __future__ import annotations
 
+import numpy as np
 import pandas as pd
 from ..utils import json_hash
 
 
 def make_issue(code, message, action, *, symbol=None, dates=(), phase='identity',
-               resolution=None, evidence=None):
+               resolution=None, evidence=None, severity='blocking'):
     defaults = {
         'CALENDAR_UNAVAILABLE': 'download', 'IDENTITY_UNAVAILABLE': 'download',
         'MISSING_BARS': 'download', 'INVALID_BARS': 'download',
@@ -19,7 +20,7 @@ def make_issue(code, message, action, *, symbol=None, dates=(), phase='identity'
     ranges = [{'start': d, 'end': d} for d in days]
     identity = dict(code=code, symbol=symbol, phase=phase, date_ranges=ranges)
     category = {'download': 'data_missing', 'verify': 'status_unknown',
-                'unsupported': 'market_event', 'user': 'source_capability'}[resolution]
+                'unsupported': 'market_event', 'none': 'market_event', 'user': 'source_capability'}[resolution]
     if code in {'INVALID_BARS', 'ADJUSTMENT_UNAVAILABLE'}:
         category = 'data_conflict'
     actions = {'verify': '先核实这些日期的交易状态；不会将零成交量自动认定为停牌',
@@ -27,24 +28,28 @@ def make_issue(code, message, action, *, symbol=None, dates=(), phase='identity'
                'download': '仅修复计划中的缺口，完成后重新校验'}
     return {**identity, 'issue_id': json_hash(identity), 'message': message,
             'action': actions.get(resolution, action), 'category': category,
-            'resolution': resolution, 'severity': 'blocking',
+            'resolution': resolution, 'severity': severity,
             'affected_rows': len(days), 'evidence': evidence or {},
-            'blocking_scope': 'research'}
+            'blocking_scope': 'research' if severity == 'blocking' else 'none'}
 
 
-def liquidity_issues(part, symbol, rule, dates):
+def liquidity_issues(part, symbol, rule, dates, *, policy='legacy'):
     """Never infer suspension from zero volume; coalesce verified event fields."""
     volume = pd.to_numeric(part.get('volume', pd.Series(index=part.index, dtype=float)), errors='coerce')
     amount = pd.to_numeric(part.get('amount', pd.Series(index=part.index, dtype=float)), errors='coerce')
     status = part.get('tradestatus', pd.Series('', index=part.index)).fillna('').astype(str).str.replace(r'\.0$', '', regex=True)
-    bad_volume = volume.isna() | ~volume.map(lambda x: pd.notna(x) and float('-inf') < x < float('inf')) | volume.le(0)
-    bad_amount = (amount.isna() | ~amount.map(lambda x: pd.notna(x) and float('-inf') < x < float('inf')) | amount.lt(0)) if rule else pd.Series(False, index=part.index)
+    bad_volume = ~np.isfinite(volume.to_numpy(dtype=float, na_value=np.nan)) | volume.le(0).fillna(True)
+    bad_amount = (~np.isfinite(amount.to_numpy(dtype=float, na_value=np.nan)) | amount.lt(0).fillna(True)) if rule else pd.Series(False, index=part.index)
+    if not (bad_volume.any() or bad_amount.any() or status.eq('0').any()):
+        return []
     masks = [('SUSPENDED', status.eq('0'), 'unsupported', '来源确认停牌；当前 V1 不支持停牌处理'),
              ('TRADING_STATUS_UNKNOWN', bad_volume & ~status.isin(['0','1']), 'verify', '成交量无效，需核实交易状态'),
              ('UNTRADABLE', bad_volume & status.eq('1'), 'download', '正常交易日成交量无效'),
              ('MISSING_FACTOR_FIELD', bad_amount & ~status.eq('0') & ~(bad_volume & ~status.isin(['0','1'])), 'download', '缺少规则所需有效成交额')]
     out = []
     for code, mask, resolution, label in masks:
+        if not mask.any():
+            continue
         rows = part[mask]
         for phase, group in rows.groupby(rows.date.map(lambda d: 'warmup' if str(d.date()) < dates['signal_date'] else 'signal' if str(d.date()) == dates['signal_date'] else 'entry' if str(d.date()) == dates['entry_date'] else 'exit' if str(d.date()) == dates['exit_date'] else 'holding')):
             evidence = {'status_source': 'provider' if code != 'TRADING_STATUS_UNKNOWN' else 'unverified',
@@ -52,8 +57,16 @@ def liquidity_issues(part, symbol, rule, dates):
                         'rows': [{'date': str(row.date.date()), 'tradestatus': str(row.get('tradestatus', 'unknown')),
                                   'volume': None if pd.isna(row.get('volume')) else float(row.volume),
                                   'amount': None if pd.isna(row.get('amount')) else float(row.amount)} for _, row in group.iterrows()]}
-            out.append(make_issue(code, f'{symbol} {label}（{len(group)} 个交易日）', '', symbol=symbol,
-                                  dates=group.date, phase=phase, resolution=resolution, evidence=evidence))
+            known_event = code == 'SUSPENDED' and policy == 'phase-aware-v1'
+            action = {'warmup': '已确认停牌；按市场交易日窗口计入零成交，保留原始空值',
+                      'signal': '信号日停牌，不具备本次候选资格',
+                      'entry': '建仓日停牌，买入未成交，预定权重资金保留现金',
+                      'holding': '持有期间停牌，禁止成交；使用最近可靠估值并标注陈旧天数',
+                      'exit': '结束日停牌，无法退出；保留未实现持仓并分别展示估值与已实现收益'}[phase] if known_event else ''
+            event_label = '来源确认停牌' if known_event else label
+            out.append(make_issue(code, f'{symbol} {event_label}（{len(group)} 个交易日）', action, symbol=symbol,
+                                  dates=group.date, phase=phase, resolution='none' if known_event else resolution,
+                                  severity='info' if known_event else 'blocking', evidence=evidence))
     return out
 
 
@@ -62,6 +75,8 @@ def finalize_readiness(result):
     dates = result.get('dates', {})
     coverage = {r['symbol']: r for r in result.get('coverage', [])}
     for issue in result['issues']:
+        if issue.get('severity', 'blocking') != 'blocking':
+            continue
         resolution = issue.get('resolution')
         if resolution not in {'download', 'verify'}:
             continue

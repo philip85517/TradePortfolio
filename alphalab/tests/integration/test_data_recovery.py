@@ -25,9 +25,10 @@ def test_confirmed_suspension_is_one_non_downloadable_event(tmp_path):
     events = [i for i in ready['issues'] if i['symbol'] == '000001']
     assert len(events) == 1
     assert events[0]['code'] == 'SUSPENDED'
-    assert events[0]['resolution'] == 'unsupported'
+    assert events[0]['resolution'] == 'none'
+    assert events[0]['severity'] == 'info'
     assert ready['repair_plan']['executable_count'] == 0
-    assert ready['status'] == 'BLOCKED'
+    assert ready['status'] == 'READY'
 
 
 def test_delisted_gap_does_not_request_nonexistent_future_bars(tmp_path):
@@ -74,12 +75,13 @@ def test_status_verification_persists_event_and_stops_download_loop(tmp_path):
     assert any(i['code'] == 'SUSPENDED' for i in ready['issues'])
     assert ready['repair_plan']['executable_count'] == 0
     assert ready['repair_summary']['attempted'] == 1
-    assert backend.prepare(scope(), lambda _: None, lambda: False)['repair_summary']['attempted'] == 0
+    assert backend.prepare(scope(), lambda _: None, lambda: False)['status'] == 'READY'
 
 
 def test_empty_plan_does_not_create_task_and_stale_plan_rejected(tmp_path):
     import pytest
     from alphalab.research.workflow import ResearchWorkflow
+    from alphalab.tests.integration.test_workflow import finish
     backend, adapter = make_backend(tmp_path/'cache')
     flow = ResearchWorkflow(tmp_path/'workflow', backend=backend)
     try:
@@ -90,10 +92,17 @@ def test_empty_plan_does_not_create_task_and_stale_plan_rejected(tmp_path):
         plan = checked['readiness']['repair_plan']['plan_id']
         with pytest.raises(ValueError, match='没有可自动'):
             flow.prepare(draft['id'], draft['revision'], plan_id=plan)
-        adapter.bars.loc[adapter.bars.symbol.eq('000001'), 'close'] = -1
-        with pytest.raises(ValueError, match='计划已变化'):
-            flow.prepare(draft['id'], draft['revision'], plan_id=plan)
         assert not flow._all('tasks')
+        # An executable approved plan is revalidated by the worker, before downloads.
+        adapter.bars.loc[adapter.bars.symbol.eq('000001'), 'close'] = -1
+        checked = flow.check(draft['id'], draft['revision'])
+        plan = checked['readiness']['repair_plan']['plan_id']
+        assert checked['readiness']['repair_plan']['executable_count'] > 0
+        adapter.bars.loc[adapter.bars.symbol.eq('000001'), 'close'] = -2
+        task = flow.prepare(draft['id'], draft['revision'], plan_id=plan)
+        task = finish(flow, task['id'])
+        assert task['status'] == 'FAILED' and task['error_code'] == 'REPAIR_PLAN_CHANGED'
+        assert flow.get_draft(draft['id'])['readiness']['repair_plan']['plan_id'] != plan
     finally:
         flow.close()
 
@@ -168,3 +177,108 @@ def test_first_cache_repair_preserves_original_source_quantities(tmp_path):
     result=backend.prepare(scope(),lambda _:None,lambda:False)
     assert result['status']=='READY',result['issues']
     assert adapter.bars.loc[mask,'close'].iloc[0] == -1  # source stays immutable
+
+
+def test_inspect_reports_per_stock_progress_and_cancels(tmp_path):
+    import pytest
+    backend,_=make_backend(tmp_path)
+    stages=[]
+    result=backend.inspect(scope(),progress=stages.append)
+    assert result['status']=='READY'
+    assert any('逐股检查' in stage for stage in stages)
+    with pytest.raises(InterruptedError):
+        backend.inspect(scope(),cancelled=lambda:True)
+
+
+def test_provider_adjustment_mismatch_becomes_persistent_non_retryable_issue(tmp_path):
+    from etf_strategy.src.market_data_store import normalize_bars
+    backend, adapter=make_backend(tmp_path)
+    adapter.bars.loc[adapter.bars.symbol.eq('600000'),'adjustment']='none'
+    calls=[]
+    class Provider:
+        def fetch_ohlcv(self, request):
+            calls.append(request.symbol)
+            rows=adapter.bars[adapter.bars.symbol.eq(request.symbol)&adapter.bars.date.between(request.start,request.end)].copy()
+            rows['ts']=rows.date;rows['timeframe']='1d'
+            return normalize_bars(rows)
+    backend.provider=Provider()
+    ready=backend.prepare(scope(),lambda _:None,lambda:False)
+    assert any(i['code']=='SOURCE_ADJUSTMENT_UNAVAILABLE' for i in ready['issues'])
+    assert ready['repair_plan']['executable_count']==0
+    backend.prepare(scope(),lambda _:None,lambda:False)
+    assert calls==['600000']
+
+
+def test_phase_aware_wizard_entry_suspension_keeps_cash_and_other_weight(tmp_path):
+    from alphalab.tests.integration.test_wizard_backend import portfolio
+    backend,adapter=make_backend(tmp_path)
+    row=adapter.bars.symbol.eq('000001')&adapter.bars.date.eq('2021-01-04')
+    adapter.bars.loc[row,'tradestatus']='0';adapter.bars.loc[row,['volume','amount']]=float('nan')
+    adapter.bars.loc[row,['open','high','low','close']]=0.
+    adapter.bars['execution_open']=10.
+    ready=backend.inspect(scope())
+    assert ready['status']=='READY',ready['issues']
+    assert next(i for i in ready['issues'] if i['code']=='SUSPENDED')['severity']=='info'
+    config=portfolio();config['min_holdings']=1
+    preview=backend.preview(scope(),config,ready)
+    assert [h['symbol'] for h in preview['holdings']]==['600000']
+    assert preview['holdings'][0]['target_weight']==.2
+    assert preview['cash_residual']>79000
+
+
+def test_explicit_source_reverification_queries_only_symbol_and_preserves_unsupported_evidence(tmp_path):
+    from etf_strategy.src.market_data_store import normalize_bars
+    backend, adapter = make_backend(tmp_path)
+    adapter.bars.loc[adapter.bars.symbol.eq('600000'), 'adjustment'] = 'none'
+    calls = []
+    class Provider:
+        adjustment = 'none'
+        def fetch_ohlcv(self, request):
+            calls.append(request.symbol)
+            if len(calls) > 1:
+                assert list((tmp_path / 'source_capabilities').glob('*.json')), 'keep limitation until validated publish'
+            rows = adapter.bars[adapter.bars.symbol.eq(request.symbol) & adapter.bars.date.between(request.start, request.end)].copy()
+            rows['adjustment'] = self.adjustment
+            rows['ts'] = rows.date; rows['timeframe'] = '1d'
+            return normalize_bars(rows)
+    backend.provider = Provider()
+    ready = backend.prepare(scope(), lambda _: None, lambda: False)
+    original = next(i for i in ready['issues'] if i['code'] == 'SOURCE_ADJUSTMENT_UNAVAILABLE')['evidence']
+    backend.retry_source(scope(), '600000')
+    assert calls == ['600000', '600000']
+    ready = backend.inspect(scope())
+    evidence = next(i for i in ready['issues'] if i['code'] == 'SOURCE_ADJUSTMENT_UNAVAILABLE')['evidence']
+    assert evidence['data_identity'] == original['data_identity']
+    assert ready['repair_plan']['executable_count'] == 0
+    backend.prepare(scope(), lambda _: None, lambda: False)
+    assert calls == ['600000', '600000']
+    backend.provider.adjustment = 'hfq'
+    backend.retry_source(scope(), '600000')
+    assert calls == ['600000', '600000', '600000']
+    assert backend.inspect(scope())['status'] == 'READY'
+    assert not list((tmp_path / 'source_capabilities').glob('*.json'))
+
+
+def test_cancelled_explicit_source_reverification_keeps_original_limitation_and_cache(tmp_path):
+    import pytest
+    from etf_strategy.src.market_data_store import normalize_bars
+    backend, adapter = make_backend(tmp_path)
+    adapter.bars.loc[adapter.bars.symbol.eq('600000'), 'adjustment'] = 'none'
+    calls = []
+    class Provider:
+        def fetch_ohlcv(self, request):
+            calls.append(request.symbol)
+            rows = adapter.bars[adapter.bars.symbol.eq(request.symbol) & adapter.bars.date.between(request.start, request.end)].copy()
+            rows['ts'] = rows.date; rows['timeframe'] = '1d'
+            if len(calls) > 1:
+                rows['adjustment'] = 'hfq'
+            return normalize_bars(rows)
+    backend.provider = Provider()
+    backend.prepare(scope(), lambda _: None, lambda: False)
+    target = next((tmp_path / 'source_capabilities').glob('*.json'))
+    original = target.read_bytes()
+    with pytest.raises(InterruptedError):
+        backend.retry_source(scope(), '600000', cancelled=lambda: len(calls) > 1)
+    assert calls == ['600000', '600000']
+    assert target.read_bytes() == original
+    assert not (tmp_path / 'market_data.duckdb').exists()
