@@ -1,0 +1,344 @@
+{
+  "identity_queries": {
+    "sz.300114:1": {
+      "error": "0",
+      "message": "success",
+      "rows": [
+        {
+          "date": "2022-12-29",
+          "code": "sz.300114",
+          "open": "61.2117700000",
+          "close": "61.6298016000",
+          "volume": "2369536",
+          "amount": "24424610.2100",
+          "adjustflag": "1"
+        },
+        {
+          "date": "2022-12-30",
+          "code": "sz.300114",
+          "open": "61.8089580000",
+          "close": "61.2714888000",
+          "volume": "4212800",
+          "amount": "43396640.0000",
+          "adjustflag": "1"
+        }
+      ]
+    },
+    "sz.300114:2": {
+      "error": "0",
+      "message": "success",
+      "rows": [
+        {
+          "date": "2022-12-29",
+          "code": "sz.300114",
+          "open": "10.2434810000",
+          "close": "10.3134364800",
+          "volume": "2369536",
+          "amount": "24424610.2100",
+          "adjustflag": "2"
+        },
+        {
+          "date": "2022-12-30",
+          "code": "sz.300114",
+          "open": "10.3434174000",
+          "close": "10.2534746400",
+          "volume": "4212800",
+          "amount": "43396640.0000",
+          "adjustflag": "2"
+        }
+      ]
+    },
+    "sz.300114:3": {
+      "error": "0",
+      "message": "success",
+      "rows": [
+        {
+          "date": "2022-12-29",
+          "code": "sz.300114",
+          "open": "10.2500",
+          "close": "10.3200",
+          "volume": "2369536",
+          "amount": "24424610.2100",
+          "adjustflag": "3"
+        },
+        {
+          "date": "2022-12-30",
+          "code": "sz.300114",
+          "open": "10.3500",
+          "close": "10.2600",
+          "volume": "4212800",
+          "amount": "43396640.0000",
+          "adjustflag": "3"
+        }
+      ]
+    },
+    "sz.302132:1": {
+      "error": "0",
+      "message": "success",
+      "rows": [
+        {
+          "date": "2022-12-29",
+          "code": "sz.302132",
+          "open": "10.2500",
+          "close": "10.3200",
+          "volume": "2369536",
+          "amount": "24424610.2100",
+          "adjustflag": "3"
+        },
+        {
+          "date": "2022-12-30",
+          "code": "sz.302132",
+          "open": "10.3500",
+          "close": "10.2600",
+          "volume": "4212800",
+          "amount": "43396640.0000",
+          "adjustflag": "3"
+        }
+      ]
+    },
+    "sz.302132:2": {
+      "error": "0",
+      "message": "success",
+      "rows": [
+        {
+          "date": "2022-12-29",
+          "code": "sz.302132",
+          "open": "10.2500",
+          "close": "10.3200",
+          "volume": "2369536",
+          "amount": "24424610.2100",
+          "adjustflag": "3"
+        },
+        {
+          "date": "2022-12-30",
+          "code": "sz.302132",
+          "open": "10.3500",
+          "close": "10.2600",
+          "volume": "4212800",
+          "amount": "43396640.0000",
+          "adjustflag": "3"
+        }
+      ]
+    },
+    "sz.302132:3": {
+      "error": "0",
+      "message": "success",
+      "rows": [
+        {
+          "date": "2022-12-29",
+          "code": "sz.302132",
+          "open": "10.2500",
+          "close": "10.3200",
+          "volume": "2369536",
+          "amount": "24424610.2100",
+          "adjustflag": "3"
+        },
+        {
+          "date": "2022-12-30",
+          "code": "sz.302132",
+          "open": "10.3500",
+          "close": "10.2600",
+          "volume": "4212800",
+          "amount": "43396640.0000",
+          "adjustflag": "3"
+        }
+      ]
+    }
+  },
+  "selected_comparisons": [
+    {
+      "symbol": "000002",
+      "rows": 827,
+      "source_adjustments": [
+        "qfq"
+      ],
+      "provider_adjustments": [
+        "1"
+      ],
+      "ratio_min": 134.284605,
+      "ratio_max": 135.88659910073372,
+      "ratio_relative_spread": 0.011929841851444634,
+      "return_max_abs_difference": 0.011771910771716243,
+      "warmup_ratio_spread": 5.252722583559688e-07,
+      "max_return_difference_date": "2025-01-09"
+    },
+    {
+      "symbol": "000610",
+      "rows": 827,
+      "source_adjustments": [
+        "qfq"
+      ],
+      "provider_adjustments": [
+        "1"
+      ],
+      "ratio_min": 2.2854059999999996,
+      "ratio_max": 2.2854060000000005,
+      "ratio_relative_spread": 4.440892098500626e-16,
+      "return_max_abs_difference": 4.440892098500626e-16,
+      "warmup_ratio_spread": 4.440892098500626e-16,
+      "max_return_difference_date": "2023-07-07"
+    },
+    {
+      "symbol": "000716",
+      "rows": 827,
+      "source_adjustments": [
+        "qfq"
+      ],
+      "provider_adjustments": [
+        "1"
+      ],
+      "ratio_min": 3.5145299999999997,
+      "ratio_max": 3.514532578482669,
+      "ratio_relative_spread": 7.336635821086901e-07,
+      "return_max_abs_difference": 5.051894311769445e-07,
+      "warmup_ratio_spread": 2.220446049250313e-16,
+      "max_return_difference_date": "2024-08-22"
+    },
+    {
+      "symbol": "000721",
+      "rows": 827,
+      "source_adjustments": [
+        "qfq"
+      ],
+      "provider_adjustments": [
+        "1"
+      ],
+      "ratio_min": 3.2343239999999995,
+      "ratio_max": 3.2343240000000004,
+      "ratio_relative_spread": 2.220446049250313e-16,
+      "return_max_abs_difference": 4.440892098500626e-16,
+      "warmup_ratio_spread": 2.220446049250313e-16,
+      "max_return_difference_date": "2022-12-07"
+    },
+    {
+      "symbol": "000756",
+      "rows": 827,
+      "source_adjustments": [
+        "qfq"
+      ],
+      "provider_adjustments": [
+        "1"
+      ],
+      "ratio_min": 1.585096401222797,
+      "ratio_max": 1.5850982371997142,
+      "ratio_relative_spread": 1.1582746106686415e-06,
+      "return_max_abs_difference": 1.167253066425289e-06,
+      "warmup_ratio_spread": 1.1582746106686415e-06,
+      "max_return_difference_date": "2022-08-05"
+    }
+  ],
+  "sources": {
+    "identity": "https://static.cninfo.com.cn/finalpage/2025-02-07/1222485220.PDF",
+    "industry_contract": "https://tushare.pro/document/2?doc_id=335",
+    "adjustment_method": "https://www.baostock.com/helpdocs/pdf/BaoStock%E5%A4%8D%E6%9D%83%E5%9B%A0%E5%AD%90%E7%AE%80%E4%BB%8B.pdf"
+  },
+  "source_return_rejection": {
+    "symbol": "000002",
+    "date": "2025-01-09",
+    "hfq_implied_return": -0.01320869,
+    "reported_return": -0.001437,
+    "action": "rejected without publishing",
+    "current_research_affected": false
+  },
+  "live_recheck": {
+    "task_id": "85e2391ec6e5467888bc2d1838230ff5",
+    "research_status": "BLOCKED",
+    "stock_count": 4905,
+    "adjustments": {
+      "stock_counts": {
+        "hfq": 4540,
+        "qfq": 365
+      },
+      "mixed_symbols": [],
+      "unknown_symbols": [],
+      "source_stock_counts": {
+        "/Users/zhoulin/.codex/worktrees/1deb/TradePortfolio/alphalab/reports/workbench/cache/market_data.duckdb": 4540,
+        "/Users/zhoulin/Documents/alphaLab/etf_strategy/data/processed/market_data.duckdb": 365
+      },
+      "execution_basis": "建仓数量以未复权开盘价为锚；研究收益使用单股连续复权序列",
+      "limitation": "不同股票使用前/后复权不等于同一股票混用口径。当前规则依赖收益率和均线关系，只有同股序列之间为固定正比例时才具有尺度不变性；标签一致不能证明算法、因子或跨来源收益一致。不可直接比较复权价格高低，也不能把复权价当作实际成交报价。"
+    },
+    "selected_symbols": [
+      "000610",
+      "000716",
+      "000721",
+      "000756",
+      "002095",
+      "002186",
+      "002336",
+      "002528",
+      "002875",
+      "600185"
+    ],
+    "blocking_issues": [
+      {
+        "code": "PIT_UNAVAILABLE",
+        "symbol": null,
+        "phase": "identity",
+        "date_ranges": [],
+        "issue_id": "37856d67c4aa4f21048b5c374affdbd404c0c3313c3cad359bcedee46ab386a3",
+        "message": "正式研究需要历史上市状态及行业生效区间；当前来源无法证明完整 PIT",
+        "action": "提供完整历史元数据，或明确选择探索模式后重新检查",
+        "category": "source_capability",
+        "resolution": "user",
+        "severity": "blocking",
+        "affected_rows": 0,
+        "evidence": {
+          "required_symbols": 4905,
+          "missing_identity_symbols": [],
+          "missing_fields": {
+            "industry_level1": 4905,
+            "industry_level2": 4905,
+            "industry_level3": 4905
+          },
+          "required_history_columns": [
+            "symbol",
+            "effective_from",
+            "effective_to",
+            "status",
+            "source",
+            "snapshot_id",
+            "industry_level1",
+            "industry_level2",
+            "industry_level3"
+          ],
+          "import_contract": "历史行业记录必须有真实生效区间；当前行业快照不能回填为历史事实",
+          "candidate_source_documentation": "https://tushare.pro/document/2?doc_id=335"
+        },
+        "blocking_scope": "research"
+      },
+      {
+        "code": "DELISTED",
+        "symbol": "002336",
+        "phase": "identity",
+        "date_ranges": [],
+        "issue_id": "6e517ad7fefe9df4818a6eef69f46a5d055dac24b07c78f4be731fa2ba2a9383",
+        "message": "002336 在持有区间内退市；V1 不支持退市清算",
+        "action": "当前回测不支持此市场事件；补数无法解决。修改范围会改变实验样本",
+        "category": "market_event",
+        "resolution": "unsupported",
+        "severity": "blocking",
+        "affected_rows": 0,
+        "evidence": {
+          "delisted_date": "2025-07-04",
+          "last_available_bar_date": "2025-07-03",
+          "settlement_verified": false,
+          "missing_evidence": [
+            "持仓承接或转板映射",
+            "可验证的清算或回收事件",
+            "现金入账日期与金额"
+          ],
+          "interpretation": "摘牌不代表股份灭失或现金清算；最后行情不是已成交卖出或清算价格"
+        },
+        "blocking_scope": "research"
+      }
+    ],
+    "issue_counts": {
+      "SYMBOL_ALIAS_RESOLVED": 1,
+      "PIT_UNAVAILABLE": 1,
+      "SUSPENDED": 158,
+      "DELISTED": 1
+    },
+    "executable_actions": 0
+  }
+}

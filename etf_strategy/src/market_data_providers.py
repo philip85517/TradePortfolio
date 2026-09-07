@@ -200,6 +200,8 @@ class BaoStockProvider:
             fields = "date,time,code,open,high,low,close,volume,amount,adjustflag"
             if request.timeframe in {"1d", "1w", "1mo"}:
                 fields = "date,code,open,high,low,close,volume,amount,adjustflag"
+            if request.timeframe == "1d":
+                fields += ",pctChg"
             result = bs.query_history_k_data_plus(
                 _baostock_symbol(request.provider_symbol),
                 fields,
@@ -227,9 +229,13 @@ class BaoStockProvider:
         raw["symbol"] = request.symbol
         raw["timeframe"] = request.timeframe
         raw["source"] = self.name
-        raw["adjusted"] = raw["adjustflag"].eq("2")
+        raw["adjusted"] = raw["adjustflag"].isin(["1", "2"])
         raw["adjustment"] = raw["adjustflag"].map({"1": "hfq", "2": "qfq", "3": "none"}).fillna("unknown")
-        return normalize_bars(raw)
+        normalized = normalize_bars(raw)
+        if 'pctChg' in raw:
+            changes = raw.drop_duplicates('ts', keep='last').set_index('ts')['pctChg']
+            normalized['provider_pct_change'] = pd.to_numeric(normalized.ts.map(changes), errors='coerce')
+        return normalized
 
 
 class CcxtCryptoProvider:

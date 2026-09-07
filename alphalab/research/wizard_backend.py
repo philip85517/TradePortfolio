@@ -219,6 +219,7 @@ class WizardResearchBackend:
         for adapter in adapters:
             frame = adapter.load(start, end, 'a_share', symbols)
             if not frame.empty:
+                frame['price_source'] = str(getattr(adapter, 'db_path', 'injected-adapter'))
                 frames.append(_normalise_dates(frame))
             loader = getattr(adapter, 'load_universe_as_of', None)
             if loader:
@@ -419,7 +420,13 @@ class WizardResearchBackend:
                 issue('PIT_UNAVAILABLE', '规则选股需要信号日历史股票池，不能用当前全市场名单替代', '补齐历史上市信息或改用手选股票', resolution='download')
             else:
                 symbols = sorted(history.symbol.astype(str).unique())
-                data = data[data.symbol.isin(symbols)] if not data.empty else data
+        from .security_identity import resolve_signal_symbols, transition_issue, adjustment_summary, pit_evidence, IDENTITY_VERSION
+        symbols, identity_issues = resolve_signal_symbols(symbols, dates['signal_date'], rule=rule)
+        result['issues'].extend(identity_issues)
+        result['identity_policy'] = IDENTITY_VERSION
+        if rule:
+            data = data[data.symbol.isin(symbols)] if not data.empty else data
+            history = history[history.symbol.astype(str).isin(symbols)] if not history.empty else history
         if strict:
             required_industry = ['industry_level1', 'industry_level2', 'industry_level3']
             complete = not history.empty and all(c in history for c in required_industry)
@@ -428,7 +435,7 @@ class WizardResearchBackend:
             complete = complete and set(symbols).issubset(set(history.symbol.astype(str)))
             if not complete:
                 issue('PIT_UNAVAILABLE', '正式研究需要历史上市状态及行业生效区间；当前来源无法证明完整 PIT',
-                      '提供完整历史元数据，或明确选择探索模式后重新检查')
+                      '提供完整历史元数据，或明确选择探索模式后重新检查', evidence=pit_evidence(history, symbols, required_industry))
         else:
             result['warnings'].append('探索结果仅供描述，不构成严格历史证据；当前行业信息可能含前视偏差')
         if not rule:
@@ -516,6 +523,7 @@ class WizardResearchBackend:
                 issue('INVALID_BARS', f'{symbol} 存在重复、非法或不完整 OHLC', dates=part.loc[invalid, 'date'], phase='prices')
             adjustments = set(part.get('adjustment', pd.Series(['unknown'])).astype(str).str.lower())
             result['coverage'][-1]['adjustment'] = next(iter(adjustments)) if len(adjustments) == 1 else 'mixed'
+            result['coverage'][-1]['price_sources'] = sorted(part.price_source.dropna().astype(str).unique()) if 'price_source' in part else []
             if len(adjustments) != 1 or adjustments & {'unknown', 'none', 'nan', ''}:
                 from .inspection_snapshot import frame_fingerprint
                 from .source_capabilities import load_adjustment_limitation
@@ -537,7 +545,14 @@ class WizardResearchBackend:
             if pd.notna(listed) and listed > pd.Timestamp(dates['signal_date']):
                 issue('NOT_LISTED', f'{symbol} 在信号日尚未上市')
             if selected and not entry_paused and pd.notna(delisted) and delisted <= pd.Timestamp(dates['exit_date']):
-                issue('DELISTED', f'{symbol} 在持有区间内退市；V1 不支持退市清算')
+                issue('DELISTED', f'{symbol} 在持有区间内退市；V1 不支持退市清算', evidence={
+                    'delisted_date': str(delisted.date()), 'last_available_bar_date': str(part.date.max().date()),
+                    'settlement_verified': False, 'missing_evidence': ['持仓承接或转板映射', '可验证的清算或回收事件', '现金入账日期与金额'],
+                    'interpretation': '摘牌不代表股份灭失或现金清算；最后行情不是已成交卖出或清算价格'})
+            if selected and not entry_paused:
+                transition = transition_issue(symbol, dates['signal_date'], dates['exit_date'])
+                if transition:
+                    result['issues'].append(transition)
             price_codes = {'INVALID_BARS', 'ADJUSTMENT_UNAVAILABLE', 'UNTRADABLE', 'MISSING_FACTOR_FIELD', 'SUSPENDED', 'TRADING_STATUS_UNKNOWN', 'SOURCE_ADJUSTMENT_UNAVAILABLE'}
             if any(i['code'] in price_codes and i.get('severity','blocking') == 'blocking' for i in result['issues'][issue_count:]):
                 result['coverage'][-1]['status'] = 'INVALID'
@@ -545,9 +560,10 @@ class WizardResearchBackend:
         if not symbols:
             issue('EMPTY_UNIVERSE', '没有可解析的历史股票范围')
         result['symbols'] = symbols
+        result['adjustment_summary'] = adjustment_summary(result['coverage'])
         checkpoint(f'逐股检查 {len(symbols)}/{len(symbols)} 只')
         from .inspection_snapshot import frame_fingerprint
-        result['data_identity'] = json_hash({'version': 'inspection-v3', 'suspension_policy': POLICY_VERSION,
+        result['data_identity'] = json_hash({'version': 'inspection-v4', 'suspension_policy': POLICY_VERSION, 'identity_policy': IDENTITY_VERSION,
             'data': frame_fingerprint(data, cancelled=cancelled, progress=checkpoint),
             'history': frame_fingerprint(history, cancelled=cancelled), 'dates': dates, 'scope': scope,
             'sources': sources})

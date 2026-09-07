@@ -120,3 +120,9 @@ test('unliquidated wizard result separates realized cash and valuation', () => {
  assert.match(html,/仍有未平仓/);assert.match(html,/已实现盈亏/);assert.match(html,/未实现盈亏/);assert.match(html,/不代表全部卖出/);
  assert.equal(h.liquidationHtml({liquidation_status:'LIQUIDATED'}),'');assert.equal(h.liquidationHtml({}), '');
 });
+
+test('adjustment overview distinguishes per-stock scale from mixed series and preserves source labels', () => {
+ const h=helpers();const html=h.adjustmentHtml({stock_counts:{qfq:365,hfq:4540},mixed_symbols:[],unknown_symbols:[],source_stock_counts:{'source <cache>':4540},execution_basis:'未复权开盘价',limitation:'同股固定比例才尺度不变'});
+ assert.match(html,/前复权.*365/);assert.match(html,/后复权.*4540/);assert.match(html,/单股混用.*0/);assert.match(html,/未复权开盘价/);assert.match(html,/&lt;cache&gt;/);
+ assert.equal(h.adjustmentHtml(null),'');
+});

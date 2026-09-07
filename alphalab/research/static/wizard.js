@@ -25,7 +25,7 @@
     return {ready, running, canConfigure:ready && !pending && !running,
       canPrepare:!ready && !pending && !running && (value.readiness?.repair_plan?.executable_count == null || value.readiness.repair_plan.executable_count > 0), canViewResult:currentTask?.kind === 'run'};
   }
-  function diagnosticLabel(value) { return ({identity:'身份',warmup:'预热',signal:'信号',entry:'建仓',holding:'持有',exit:'退出',data_missing:'数据缺失',data_conflict:'数据冲突',market_event:'已确认市场事件',status_unknown:'状态待核实',source_capability:'来源能力不足'}[value] || value || '未标注'); }
+  function diagnosticLabel(value) { return ({identity:'身份',prices:'价格与复权',coverage:'覆盖',warmup:'预热',signal:'信号',entry:'建仓',holding:'持有',exit:'退出',data_missing:'数据缺失',data_conflict:'数据冲突',market_event:'已确认市场事件',status_unknown:'状态待核实',source_capability:'来源能力不足'}[value] || value || '未标注'); }
   function coverageHtml(rows, page=0, issues=[]) {
     if (!Array.isArray(rows) || !rows.length) return '<p class="muted">尚未得到逐股覆盖检查，请先处理上方数据问题。</p>';
     return '<h3>历史数据覆盖与缺口</h3><div class="coverage-list">'+rows.slice(page*25,page*25+25).map(row=>{
@@ -71,6 +71,11 @@
     const progressAge=seconds(now,t.progress_at || t.updated_at);
     return {elapsed:seconds(running?now:Date.parse(t.updated_at),t.created_at),heartbeatAge,progressAge,stale:running && (heartbeatAge>10 || progressAge>15)};
   }
+  function adjustmentHtml(summary) {
+    if (!summary) return '';
+    const labels={qfq:'前复权',hfq:'后复权',none:'未复权',mixed:'单股混用',unknown:'口径未知'};
+    return '<section class="notice"><h3>复权口径与来源</h3><p>'+Object.entries(summary.stock_counts || {}).map(([key,n])=>`${esc(labels[key] || key)}：${esc(n)} 只`).join(' · ')+`</p><p>单股混用：${esc((summary.mixed_symbols || []).length)} 只 · 未复权／未知：${esc((summary.unknown_symbols || []).length)} 只</p><p>${esc(summary.execution_basis)}</p><p>${esc(summary.limitation)}</p><details><summary>查看数据来源</summary>`+Object.entries(summary.source_stock_counts || {}).map(([key,n])=>`<p>${esc(key)}：${esc(n)} 只</p>`).join('')+'</details></section>';
+  }
   function liquidationHtml(summary) {
     if (summary?.liquidation_status !== 'OPEN_POSITION') return '';
     const values=[['已实现盈亏',summary.realized_profit_loss],['未实现盈亏',summary.unrealized_profit_loss],['未平仓估值',summary.unrealized_holdings_value],['期末现金',summary.realized_cash]];
@@ -79,7 +84,7 @@
   function taskForDraft(currentTask, value) { return currentTask?.id === value.task_id ? currentTask : null; }
   function selectionSymbols(mode, text) { return mode==='manual' ? text.split(/[\s,，;；]+/).filter(Boolean) : []; }
   function unfinishedDrafts(rows) { return rows.filter(row=>!(row.task_kind==='run' && row.task_status==='SUCCEEDED')); }
-  if (typeof module !== 'undefined') module.exports = {validateScope, acceptResponse, coverageHtml, calendarLabel, gates, unfinishedDrafts, selectionSymbols, repairLabel, filterIssues, issuesHtml, attemptSummary, diagnosticLabel, taskForDraft, taskTiming, liquidationHtml};
+  if (typeof module !== 'undefined') module.exports = {validateScope, acceptResponse, coverageHtml, calendarLabel, gates, unfinishedDrafts, selectionSymbols, repairLabel, filterIssues, issuesHtml, attemptSummary, diagnosticLabel, taskForDraft, taskTiming, liquidationHtml, adjustmentHtml};
   if (typeof document === 'undefined') return;
   const $ = id => document.getElementById(id);
   const fmt = v => v == null ? '—' : typeof v === 'number' ? v.toLocaleString('zh-CN',{maximumFractionDigits:2}) : String(v);
@@ -174,6 +179,7 @@
     if (!r) { $('readiness').innerHTML='<div class="notice">尚未检查，或研究范围已修改。请重新检查数据。</div>'; return; }
     const ready=r.status==='READY';
     let html=`<div class="notice ${ready?'success':'danger'}"><strong>${ready?'数据已就绪，可以配置组合':'数据尚未就绪，需先处理以下问题'}</strong></div>`;
+    html+=adjustmentHtml(r.adjustment_summary);
     const dates=r.dates || {};
     html+=metrics([['请求开始',draft.scope.start_date],['请求结束',draft.scope.end_date],['数据质量',draft.scope.quality_mode==='strict'?'正式研究':'探索研究'],...Object.entries(dates).map(([k,v])=>[({entry_date:'实际建仓日',exit_date:'实际结束日',end_date:'实际结束日',signal_date:'规则信号日',warmup_start:'预热起点',warmup_start_date:'预热起点',requested_start_date:'请求开始日',requested_end_date:'请求结束日',warmup_sessions:'所需预热交易日',calendar_source:'交易日历来源',horizon:'持有交易日数'}[k] || k),k==='calendar_source'?calendarLabel(v):v])]);
     html+=metrics([['已就绪股票（只）',(r.coverage || []).filter(x=>x.status==='READY').length],['待核实问题（条）',(r.issues || []).filter(x=>!['info','warning'].includes(x.severity) && x.resolution==='verify').length],['可执行动作（项）',r.repair_plan?.executable_count ?? '待确定'],['需选择／不支持（条）',(r.issues || []).filter(x=>!['info','warning'].includes(x.severity) && ['user','unsupported'].includes(x.resolution)).length]]);

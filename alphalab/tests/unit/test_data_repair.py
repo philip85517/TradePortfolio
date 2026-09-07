@@ -246,3 +246,32 @@ def test_adjustment_mismatch_does_not_retry_even_with_old_transport_context(tmp_
     with pytest.raises(data_repair.AdjustmentUnavailable):
         data_repair.retry_transient(operation, lambda: False, lambda _: None)
     assert len(calls) == 1
+
+
+def test_adjusted_return_must_agree_with_source_reported_return_before_publication(tmp_path):
+    path=tmp_path/'bars.duckdb';publish(bars(),path)
+    inconsistent=pd.concat([bars().assign(close=10.,ts='2026-08-03',provider_pct_change=0.),bars().assign(close=11.,ts='2026-08-04',provider_pct_change=1.)],ignore_index=True)
+    with pytest.raises(ValueError,match='涨跌幅'):
+        publish(inconsistent,path)
+    assert load_bars(path)['close'].tolist()==[11.]
+    consistent=inconsistent.copy();consistent.loc[1,'provider_pct_change']=10.
+    publish(consistent,path)
+    assert len(load_bars(path))==2
+
+
+def test_baostock_daily_response_retains_reported_change_for_validation(monkeypatch):
+    import sys
+    from types import SimpleNamespace
+    from etf_strategy.src.market_data_providers import BaoStockProvider,FetchRequest
+    class Result:
+        error_code='0';error_msg=''
+        def __init__(self,fields):self.fields=fields.split(',');self.remaining=True
+        def next(self):
+            value=self.remaining;self.remaining=False;return value
+        def get_row_data(self):
+            row=dict(date='2025-01-09',code='sz.000002',open='6.93',high='7',low='6.9',close='6.95',volume='10000',amount='69500',adjustflag='1',pctChg='-0.143700')
+            return [row[f] for f in self.fields]
+    fake=SimpleNamespace(login=lambda:SimpleNamespace(error_code='0',error_msg=''),logout=lambda:None,query_history_k_data_plus=lambda symbol,fields,**kwargs:Result(fields))
+    monkeypatch.setitem(sys.modules,'baostock',fake)
+    frame=BaoStockProvider().fetch_ohlcv(FetchRequest('a_share','000002','1d',pd.Timestamp('2025-01-09'),pd.Timestamp('2025-01-09'),options={'adjust':'hfq'}))
+    assert frame.provider_pct_change.iloc[0]==pytest.approx(-.1437)

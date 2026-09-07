@@ -88,6 +88,17 @@ def validate_and_publish(frame, target_path, symbol, start, end, *, cancelled=la
         evidence = [{'date': day.strftime('%Y-%m-%d'), 'returned_adjustment': adjustment}
                     for day, adjustment in zip(days, data['adjustment'])]
         raise AdjustmentUnavailable(symbol, start, end, 'hfq', evidence)
+    if 'provider_pct_change' in data:
+        ordered = data.sort_values('ts')
+        reported = pd.to_numeric(ordered.provider_pct_change, errors='coerce') / 100
+        implied = ordered.close.pct_change(fill_method=None)
+        # BaoStock uses return-based adjustment. Allow five basis points for
+        # provider rounding; larger conflicts need source/factor investigation.
+        conflict = reported.notna() & implied.notna() & (implied - reported).abs().gt(.0005)
+        if conflict.any():
+            row = ordered.loc[conflict].iloc[0]
+            raise ValueError(f'复权价格与来源涨跌幅不一致：{symbol} {row.ts.date()}；'
+                             f'价格收益 {implied.loc[row.name]:.6%}，来源涨跌幅 {reported.loc[row.name]:.6%}；保留现有缓存并核实复权因子')
     if 'volume' not in data:
         data['volume'] = float('nan')
     target = Path(target_path)
