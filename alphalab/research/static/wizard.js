@@ -107,6 +107,7 @@
     return '<div class="notice"><strong>'+ (summary?.target==='hfq' && summary.remaining_symbols?.length ? '正在统一后复权数据' : '正在准备历史数据') + '</strong><p>完成后自动重新校验。以下为本轮开始时的统计，不代表当前已就绪。</p></div>'+adjustmentHtml(summary);
   }
   function liquidationHtml(summary) {
+    if(summary?.liquidation_status==='UNSETTLED_DELISTING') return `<div class="notice warning"><strong>退市股份未结算，完整收益不可确定</strong><p>${(summary.unsettled_symbols || []).map(esc).join('、')}：保留股份，未模拟卖出或清算。</p><p>已知资产：${esc(summary.known_assets_value)} · 其中现金：${esc(summary.realized_cash)}</p><p>已知资产不包含未结算股份价值，不代表完整期末权益。净值与完整收益指标暂不展示。</p></div>`;
     if (summary?.liquidation_status !== 'OPEN_POSITION') return '';
     const values=[['已实现盈亏',summary.realized_profit_loss],['未实现盈亏',summary.unrealized_profit_loss],['未平仓估值',summary.unrealized_holdings_value],['期末现金',summary.realized_cash]];
     return '<div class="notice warning"><strong>结束日停牌，仍有未平仓持仓</strong><p>期末权益及总收益包含未实现估值，不代表全部卖出；停牌持仓未收取卖出费用。</p>'+values.map(([label,value])=>`<p>${label}：${esc(value == null ? '—' : Number(value).toLocaleString('zh-CN',{maximumFractionDigits:2}))}</p>`).join('')+'</div>';

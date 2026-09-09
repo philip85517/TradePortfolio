@@ -68,8 +68,10 @@ def test_pit_issue_identifies_missing_history_fields(tmp_path):
     backend,adapter,history,request=rule_backend(tmp_path)
     history['industry_level2']=None
     ready=backend.inspect(request)
-    issue=next(i for i in ready['issues'] if i['code']=='PIT_UNAVAILABLE')
+    issue=next(i for i in ready['issues'] if i['code']=='INDUSTRY_HISTORY_UNUSED')
     assert issue['evidence']['missing_fields']=={'industry_level2':2}
+    assert issue['severity']=='info'
+    assert ready['status']=='READY'
 
 
 def test_fixed_rule_and_real_entry_lots_are_invariant_under_constant_price_scale(tmp_path):
@@ -138,3 +140,29 @@ def test_qfq_source_refusal_stops_ordinary_uniform_retries(tmp_path):
     assert ready['repair_plan']['executable_count']==0
     backend.prepare(scope(),lambda _:None,lambda:False)
     assert calls==['600000']
+
+
+def test_listing_only_fixed_rule_runs_without_industry_but_rejects_industry_cap(tmp_path):
+    from alphalab.tests.integration.test_wizard_backend import portfolio
+    backend,adapter,history,request=rule_backend(tmp_path)
+    for column in ['industry_level1','industry_level2','industry_level3']:
+        history[column]=None
+    ready=backend.inspect(request)
+    assert ready['status']=='READY',ready['issues']
+    config=portfolio();config.update(weighting='equal',min_holdings=1)
+    assert backend.preview(request,config,ready)['status']=='READY'
+    result=backend.run(request,config,ready,tmp_path/'runs')
+    assert result['summary']['status']=='COMPLETE'
+    assert result['manifest']['spec']['data_quality_mode']=='strict'
+    config['max_industry_weight']=.5
+    with pytest.raises(ValueError,match='INDUSTRY_UNAVAILABLE'):
+        backend.preview(request,config,ready)
+
+
+def test_industry_cap_only_requires_selected_stocks_history(tmp_path):
+    from alphalab.tests.integration.test_wizard_backend import portfolio
+    backend,adapter,history,request=rule_backend(tmp_path)
+    history.loc[history.symbol.eq('600000'),'industry_level1']=None
+    config=portfolio();config.update(weighting='equal',min_holdings=1,max_industry_weight=1.)
+    ready=backend.inspect(request)
+    assert backend.run(request,config,ready,tmp_path/'runs')['summary']['status']=='COMPLETE'

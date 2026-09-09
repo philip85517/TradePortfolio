@@ -9,6 +9,7 @@
       factorTitle: manual ? "持仓与筛选信息" : "因子拆解"};
   }
   function portfolioStatus(results) {
+    if (results.some(item=>item.liquidation_status === "UNSETTLED_DELISTING")) return "研究已保存 · 含未结算股份";
     if (results.some((item) => item.liquidation_status === "OPEN_POSITION")) return "估值完成 · 尚未清算";
     const complete = results.filter((item) => item.status === "COMPLETE");
     if (!complete.length) return "不可评估";
@@ -16,6 +17,7 @@
   }
 
   function performanceCardHtml(result, title, initialCash) {
+    if(result.liquidation_status === "UNSETTLED_DELISTING") return `<div class="performance-card"><span>${escapeHtml(title)}</span><strong>完整收益不可确定</strong><small>退市股份未结算：${(result.unsettled_symbols || []).map(escapeHtml).join('、')}</small><small>已知资产 ${number(result.known_assets_value)} · 其中现金 ${number(result.realized_cash)}</small><small>已知资产不包含未结算股份价值，不代表完整期末权益。</small></div>`;
     const open = result.liquidation_status === "OPEN_POSITION";
     const accounting = result.liquidation_status ? `<small>${open ? "尚未清算" : "已全部清算"} · 已实现盈亏 ${number(result.realized_profit_loss)} · 未实现盈亏 ${number(result.unrealized_profit_loss)}</small><small>现金 ${number(result.realized_cash)} · 未实现持仓估值 ${number(result.unrealized_holdings_value)}</small>${open ? `<small>未退出持仓 ${Object.keys(result.open_positions || {}).map(escapeHtml).join("、") || "--"}</small>` : ""}` : "";
     return `<div class="performance-card"><span>${escapeHtml(title)} · ${open ? "估值收益" : "组合收益"}</span><strong>${percent(result.total_return)}</strong><small>${initialCash == null ? "" : `本金 ${number(initialCash, 0)} · `}${open ? "估值盈亏" : "盈亏"} ${number(result.profit_loss)} · 最大回撤 ${percent(result.max_drawdown)}</small><small>成本前 ${percent(result.gross_return)} · 胜率 ${percent(result.holding_win_rate)}</small>${accounting}</div>`;

@@ -103,6 +103,8 @@ class HorizonPerformance:
     realized_profit_loss: float | None = None
     realized_cash: float | None = None
     open_positions: dict[str, float] | None = None
+    known_assets_value: float | None = None
+    unsettled_symbols: list[str] | None = None
 
 
 @dataclass
@@ -376,7 +378,9 @@ class HistoricalResearchLab:
         context["diagnostics"] = {"universe": universe_diagnostics}
         if data.empty:
             raise ValueError("指定 universe 模式下没有可用股票")
-        _validate_universe_quality(universe_diagnostics, spec.data_quality_mode)
+        _validate_universe_quality(universe_diagnostics, spec.data_quality_mode,
+            require_industry=not (spec.wizard_metadata.get('metadata_policy') == 'required-fields-v1'
+                and spec.rule_version in {'fixed_v0', 'manual_v1'}))
         if spec.suspension_policy == POLICY_VERSION:
             data = prepare_view(data, signal_date)
         data_quality = _quality_summary(data, signal_date)
@@ -1292,6 +1296,9 @@ def _build_portfolio(
     entry_date: date | None,
     spec: ResearchSpec,
 ) -> tuple[pd.DataFrame, str, dict[str, str]]:
+    if spec.wizard_metadata.get('metadata_policy') == 'required-fields-v1' and spec.max_industry_weight is not None and not selected.empty:
+        if 'industry' not in selected or selected.industry.isna().any() or selected.industry.astype(str).str.strip().isin(['', 'UNKNOWN']).any():
+            raise ValueError('INDUSTRY_UNAVAILABLE：行业约束需要所选股票的历史行业资料')
     columns = [
         "symbol",
         "name",
@@ -1552,6 +1559,8 @@ def _evaluate_forward(
         if "valuation_close" not in after:
             after = prepare_view(after, spec.requested_date, entry_date)
         available_dates = sorted(after["date"].drop_duplicates())
+        if spec.wizard_metadata.get('delisting_policy') == 'retain-unsettled-v1':
+            available_dates = sorted(pd.to_datetime(spec.wizard_metadata['research_sessions']))
     else:
         available_dates = sorted(after.loc[after["close"].notna(), "date"].drop_duplicates())
     try:
@@ -1596,6 +1605,11 @@ def _evaluate_forward(
         entry_prices = portfolio.set_index("symbol")["entry_price"]
         shares = portfolio.set_index("symbol")["shares"]
         selected_prices = prices.reindex(columns=entry_prices.index)
+        from .delisting_policy import unsettled_performance
+        unsettled = unsettled_performance(after, selected_prices, shares, entry_prices, window_dates, horizon, spec)
+        if unsettled is not None:
+            performance[horizon] = unsettled
+            continue
         if selected_prices.isna().any().any():
             if not allow_partial:
                 performance[horizon] = HorizonPerformance(
@@ -1820,12 +1834,12 @@ def _validate_quality_mode(summary: dict[str, Any], mode: str) -> None:
         raise ValueError(f"数据质量校验失败（{normalized}）: {'；'.join(reasons)}")
 
 
-def _validate_universe_quality(summary: dict[str, Any], mode: str) -> None:
+def _validate_universe_quality(summary: dict[str, Any], mode: str, *, require_industry: bool = True) -> None:
     """严格模式禁止把仅有上市窗口的 universe 当作正式 PIT 数据。"""
 
     normalized = str(mode).strip().lower() or "exploratory"
     if normalized == "strict" and summary.get("mode") == "point-in-time":
-        if summary.get("point_in_time_quality") != "complete":
+        if summary.get("point_in_time_quality") != "complete" and (require_industry or summary.get("point_in_time_quality") != "listing-only" or summary.get("missing_symbols")):
             raise ValueError(
                 "严格模式要求完整 point-in-time universe；当前缺少历史行业分类生效区间"
             )

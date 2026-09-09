@@ -49,3 +49,10 @@ test('stale NAV valuation evidence names affected dates and symbols safely',()=>
  assert.match(html,/历史价格估值/);assert.match(html,/2023-01-04/);assert.match(html,/3 天/);
  assert.match(html,/&lt;A&gt;,B/);assert.equal(staleValuationHtml([{stale_symbols:'',max_valuation_stale_days:0}]),'');
 });
+
+test('unsettled delisting never displays liquidated or complete portfolio returns',()=>{
+ const context={module:{exports:{}}};vm.runInNewContext(fs.readFileSync('alphalab/research/static/app.js','utf8'),context);
+ const h=context.module.exports;const r={status:'UNSETTLED',liquidation_status:'UNSETTLED_DELISTING',unsettled_symbols:['002336'],realized_cash:50000,known_assets_value:60000};
+ assert.match(h.portfolioStatus([r]),/未结算/);
+ const html=h.performanceCardHtml(r,'组合',100000);assert.match(html,/完整收益不可确定/);assert.match(html,/002336/);assert.doesNotMatch(html,/已全部清算/);
+});

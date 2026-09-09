@@ -429,13 +429,16 @@ class WizardResearchBackend:
             history = history[history.symbol.astype(str).isin(symbols)] if not history.empty else history
         if strict:
             required_industry = ['industry_level1', 'industry_level2', 'industry_level3']
-            complete = not history.empty and all(c in history for c in required_industry)
-            complete = complete and history[required_industry].notna().all().all()
-            complete = complete and history[required_industry].astype(str).apply(lambda col: col.str.strip().ne('')).all().all()
-            complete = complete and set(symbols).issubset(set(history.symbol.astype(str)))
-            if not complete:
-                issue('PIT_UNAVAILABLE', '正式研究需要历史上市状态及行业生效区间；当前来源无法证明完整 PIT',
-                      '提供完整历史元数据，或明确选择探索模式后重新检查', evidence=pit_evidence(history, symbols, required_industry))
+            identity_complete = not history.empty and set(symbols).issubset(set(history.symbol.astype(str)))
+            if not identity_complete:
+                issue('PIT_UNAVAILABLE', '缺少信号日可验证的历史上市身份',
+                      '补充历史上市身份记录', evidence=pit_evidence(history, symbols, []))
+            evidence = pit_evidence(history, symbols, required_industry)
+            if evidence['missing_fields']:
+                result['issues'].append(make_issue('INDUSTRY_HISTORY_UNUSED',
+                    '历史行业资料不完整；当前选股规则不使用行业，不阻挡研究',
+                    '行业显示为未知；若设置行业权重限制，需要先补充信号日历史行业资料',
+                    resolution='none', severity='info', evidence=evidence))
         else:
             result['warnings'].append('探索结果仅供描述，不构成严格历史证据；当前行业信息可能含前视偏差')
         if not rule:
@@ -549,10 +552,11 @@ class WizardResearchBackend:
             if pd.notna(listed) and listed > pd.Timestamp(dates['signal_date']):
                 issue('NOT_LISTED', f'{symbol} 在信号日尚未上市')
             if selected and not entry_paused and pd.notna(delisted) and delisted <= pd.Timestamp(dates['exit_date']):
-                issue('DELISTED', f'{symbol} 在持有区间内退市；V1 不支持退市清算', evidence={
+                result['issues'].append(make_issue('DELISTED_UNSETTLED', f'{symbol} 在持有期间退市；保留未结算股份，完整收益不可确定',
+                    '可以继续研究；展示已知资产与未结算持仓，不假设清算或卖出', symbol=symbol, phase='holding', resolution='none', severity='warning', evidence={
                     'delisted_date': str(delisted.date()), 'last_available_bar_date': str(part.date.max().date()),
                     'settlement_verified': False, 'missing_evidence': ['持仓承接或转板映射', '可验证的清算或回收事件', '现金入账日期与金额'],
-                    'interpretation': '摘牌不代表股份灭失或现金清算；最后行情不是已成交卖出或清算价格'})
+                    'interpretation': '摘牌不代表股份灭失或现金清算；最后行情不是已成交卖出或清算价格'}))
             if selected and not entry_paused:
                 transition = transition_issue(symbol, dates['signal_date'], dates['exit_date'])
                 if transition:
@@ -567,7 +571,7 @@ class WizardResearchBackend:
         result['adjustment_summary'] = adjustment_summary(result['coverage'])
         checkpoint(f'逐股检查 {len(symbols)}/{len(symbols)} 只')
         from .inspection_snapshot import frame_fingerprint
-        result['data_identity'] = json_hash({'version': 'inspection-v5', 'adjustment_policy': 'uniform-hfq-v1', 'suspension_policy': POLICY_VERSION, 'identity_policy': IDENTITY_VERSION,
+        result['data_identity'] = json_hash({'version': 'inspection-v7', 'delisting_policy': 'retain-unsettled-v1', 'metadata_policy': 'required-fields-v1', 'adjustment_policy': 'uniform-hfq-v1', 'suspension_policy': POLICY_VERSION, 'identity_policy': IDENTITY_VERSION,
             'data': frame_fingerprint(data, cancelled=cancelled, progress=checkpoint),
             'history': frame_fingerprint(history, cancelled=cancelled), 'dates': dates, 'scope': scope,
             'sources': sources})
@@ -645,6 +649,9 @@ class WizardResearchBackend:
             portfolios=(PortfolioSpec('strategy', name=name),),
             wizard_metadata={'scope': scope, 'portfolio': portfolio, 'dates': readiness['dates'],
                              'adjustment_policy': 'uniform-hfq-v1', 'adjustment_summary': readiness.get('adjustment_summary'),
+                             'metadata_policy': 'required-fields-v1',
+                             'delisting_policy': 'retain-unsettled-v1',
+                             'research_sessions': [str(d) for d in self._calendar_dates(parse_date(readiness['dates']['entry_date']), parse_date(readiness['dates']['exit_date']))],
                              'data_identity': readiness['data_identity'], 'warnings': readiness['warnings'],
                              'benchmark_disabled_reason': '向导不以缺失未来数据的股票池构造基准，以避免幸存者偏差',
                              'holding_method': 'buy_and_hold', 'price_basis': 'adjusted returns anchored to raw entry open when available'})
@@ -656,7 +663,7 @@ class WizardResearchBackend:
         signal = parse_date(dates['signal_date'])
         data, diagnostic = _apply_universe_mode(data, signal, spec.universe_mode,
             adapter.history if not adapter.history.empty else None)
-        _validate_universe_quality(diagnostic, spec.data_quality_mode)
+        _validate_universe_quality(diagnostic, spec.data_quality_mode, require_industry=False)
         before = data[data.date <= pd.Timestamp(signal)]
         plugin = ManualSelectionPlugin() if spec.rule_version == 'manual_v1' else FrozenRulePlugin(adapter.selection_bars)
         candidates, funnel = plugin.score(before.copy(deep=True))
@@ -667,6 +674,10 @@ class WizardResearchBackend:
         selected = candidates[candidates.eligible].sort_values(['rank', 'symbol']).head(spec.top_n)
         if selected.empty:
             raise ValueError('EMPTY_CANDIDATE_POOL：规则没有候选股票，请修改范围或规则参数')
+        if spec.max_industry_weight is not None:
+            relevant = adapter.history[adapter.history.symbol.isin(selected.symbol)] if 'symbol' in adapter.history else adapter.history
+            if relevant.empty or not set(selected.symbol).issubset(set(relevant.symbol)) or 'industry_level1' not in relevant or relevant.industry_level1.isna().any() or relevant.industry_level1.astype(str).str.strip().eq('').any():
+                raise ValueError('INDUSTRY_UNAVAILABLE：行业约束需要所选股票在信号日的历史行业资料')
         if spec.max_industry_weight is not None and selected.industry.eq('UNKNOWN').any():
             raise ValueError('INDUSTRY_UNAVAILABLE：行业约束需要完整行业元数据')
         holdings, status, reasons = _build_portfolio(selected, data[data.date > pd.Timestamp(signal)], parse_date(dates['entry_date']), spec)
@@ -693,7 +704,7 @@ class WizardResearchBackend:
         lab = HistoricalResearchLab(adapter, runs_dir, plugins={'manual_v1': ManualSelectionPlugin(), 'fixed_v0': FrozenRulePlugin(adapter.selection_bars) if scope.get('selection_mode') == 'rule' else FixedV0Plugin()}, data_binding=FrozenBinding(current, adapter))
         report = lab.run(spec)
         summary = _jsonable(report.performance[spec.horizons[0]])
-        if summary['status'] != 'COMPLETE' or summary['evaluated_date'] != current['dates']['exit_date']:
+        if summary['status'] not in {'COMPLETE', 'UNSETTLED'} or summary['evaluated_date'] != current['dates']['exit_date']:
             raise ValueError('RUN_INCOMPLETE：运行未覆盖请求的退出日期')
         manifest = json.loads((report.artifact_dir / 'manifest.json').read_text())
         return {'run_id': report.run_id, 'artifact_dir': str(report.artifact_dir), 'manifest': manifest,

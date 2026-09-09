@@ -1,0 +1,66 @@
+{
+  "task_id": "0acbdb2ee5514e3c93701723944d77a5",
+  "status": "SUCCEEDED",
+  "readiness_status": "READY",
+  "dates": {
+    "requested_start_date": "2023-01-01",
+    "requested_end_date": "2025-12-03",
+    "signal_date": "2022-12-30",
+    "entry_date": "2023-01-03",
+    "exit_date": "2025-12-03",
+    "warmup_start_date": "2022-07-08",
+    "warmup_sessions": 120,
+    "horizon": 706,
+    "calendar_source": "baostock.query_trade_dates"
+  },
+  "selected_symbols": [
+    "000610",
+    "000716",
+    "000721",
+    "000756",
+    "002095",
+    "002186",
+    "002336",
+    "002528",
+    "002875",
+    "600185"
+  ],
+  "issue_counts": {
+    "SYMBOL_ALIAS_RESOLVED": 1,
+    "INDUSTRY_HISTORY_UNUSED": 1,
+    "SUSPENDED": 158,
+    "DELISTED_UNSETTLED": 1
+  },
+  "blocking_issues": [],
+  "remaining_warning": [
+    {
+      "code": "DELISTED_UNSETTLED",
+      "symbol": "002336",
+      "phase": "holding",
+      "date_ranges": [],
+      "issue_id": "6057956b1b613a8d527dc0232db69b137041b255ddce34243734a34d8ddcb663",
+      "message": "002336 在持有期间退市；保留未结算股份，完整收益不可确定",
+      "action": "可以继续研究；展示已知资产与未结算持仓，不假设清算或卖出",
+      "category": "market_event",
+      "resolution": "none",
+      "severity": "warning",
+      "affected_rows": 0,
+      "evidence": {
+        "delisted_date": "2025-07-04",
+        "last_available_bar_date": "2025-07-03",
+        "settlement_verified": false,
+        "missing_evidence": [
+          "持仓承接或转板映射",
+          "可验证的清算或回收事件",
+          "现金入账日期与金额"
+        ],
+        "interpretation": "摘牌不代表股份灭失或现金清算；最后行情不是已成交卖出或清算价格"
+      },
+      "blocking_scope": "none"
+    }
+  ],
+  "adjustment_counts": {
+    "hfq": 4905
+  },
+  "data_identity": "4f916351d66181b49ea2c1e5d297dcff96bc1a06cdd97ded64009252cd77b3bb"
+}

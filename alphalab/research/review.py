@@ -444,6 +444,8 @@ class ReviewState:
                     "realized_profit_loss": result.get("realized_profit_loss"),
                     "realized_cash": result.get("realized_cash"),
                     "open_positions": result.get("open_positions"),
+                    "known_assets_value": result.get("known_assets_value"),
+                    "unsettled_symbols": result.get("unsettled_symbols"),
                     "evaluated_date": result.get("evaluated_date"),
                 }
             portfolio_payload = _records(portfolio_rows)[0] if not portfolio_rows.empty else None

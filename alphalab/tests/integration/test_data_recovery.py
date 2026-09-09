@@ -36,7 +36,7 @@ def test_delisted_gap_does_not_request_nonexistent_future_bars(tmp_path):
     adapter.bars.loc[adapter.bars.symbol.eq('000001'), 'delisted_date'] = '2023-01-01'
     adapter.bars = adapter.bars[~(adapter.bars.symbol.eq('000001') & adapter.bars.date.ge('2023-01-01'))]
     ready = backend.inspect(scope())
-    assert any(i['code'] == 'DELISTED' for i in ready['issues'])
+    assert any(i['code'] == 'DELISTED_UNSETTLED' and i['severity']=='warning' for i in ready['issues'])
     assert not any(i['code'] == 'MISSING_BARS' for i in ready['issues'])
     assert ready['repair_plan']['executable_count'] == 0
 
