@@ -106,8 +106,16 @@
     const summary=t.configuration?.readiness?.adjustment_summary;
     return '<div class="notice"><strong>'+ (summary?.target==='hfq' && summary.remaining_symbols?.length ? '正在统一后复权数据' : '正在准备历史数据') + '</strong><p>完成后自动重新校验。以下为本轮开始时的统计，不代表当前已就绪。</p></div>'+adjustmentHtml(summary);
   }
+  function restoredStep(value,currentTask) {
+    if(currentTask?.kind==='run') return 5;
+    if(['QUEUED','RUNNING','CANCELLING'].includes(currentTask?.status)) return 2;
+    return value.preview?4:value.readiness?.status==='READY'?3:value.readiness?2:1;
+  }
+  function previewPendingHtml(operation) {
+    return operation==='preview'?'<div class="notice" role="status"><strong>正在计算持仓预览</strong><p>正在核对历史数据、选股结果及整手成交。较大股票池可能需要数分钟，请保持页面打开，无需重复点击。</p></div>':'';
+  }
   function liquidationHtml(summary) {
-    if(summary?.liquidation_status==='UNSETTLED_DELISTING') return `<div class="notice warning"><strong>退市股份未结算，完整收益不可确定</strong><p>${(summary.unsettled_symbols || []).map(esc).join('、')}：保留股份，未模拟卖出或清算。</p><p>已知资产：${esc(summary.known_assets_value)} · 其中现金：${esc(summary.realized_cash)}</p><p>已知资产不包含未结算股份价值，不代表完整期末权益。净值与完整收益指标暂不展示。</p></div>`;
+    if(summary?.liquidation_status==='UNSETTLED_DELISTING') return `<div class="notice warning"><strong>退市股份未结算，完整收益不可确定</strong><p>${(summary.unsettled_symbols || []).map(esc).join('、')}：保留股份，未模拟卖出或清算。</p><p>已知资产：${esc(Number(summary.known_assets_value).toLocaleString('zh-CN',{maximumFractionDigits:2}))} · 其中现金：${esc(Number(summary.realized_cash).toLocaleString('zh-CN',{maximumFractionDigits:2}))}</p><p>已知资产不包含未结算股份价值，不代表完整期末权益。净值与完整收益指标暂不展示。</p></div>`;
     if (summary?.liquidation_status !== 'OPEN_POSITION') return '';
     const values=[['已实现盈亏',summary.realized_profit_loss],['未实现盈亏',summary.unrealized_profit_loss],['未平仓估值',summary.unrealized_holdings_value],['期末现金',summary.realized_cash]];
     return '<div class="notice warning"><strong>结束日停牌，仍有未平仓持仓</strong><p>期末权益及总收益包含未实现估值，不代表全部卖出；停牌持仓未收取卖出费用。</p>'+values.map(([label,value])=>`<p>${label}：${esc(value == null ? '—' : Number(value).toLocaleString('zh-CN',{maximumFractionDigits:2}))}</p>`).join('')+'</div>';
@@ -115,7 +123,7 @@
   function taskForDraft(currentTask, value) { return currentTask?.id === value.task_id ? currentTask : null; }
   function selectionSymbols(mode, text) { return mode==='manual' ? text.split(/[\s,，;；]+/).filter(Boolean) : []; }
   function unfinishedDrafts(rows) { return rows.filter(row=>!(row.task_kind==='run' && row.task_status==='SUCCEEDED')); }
-  if (typeof module !== 'undefined') module.exports = {validateScope, acceptResponse, coverageHtml, calendarLabel, gates, unfinishedDrafts, selectionSymbols, repairLabel, filterIssues, issuesHtml, attemptSummary, diagnosticLabel, taskForDraft, taskTiming, liquidationHtml, adjustmentHtml, pendingReadinessHtml, readinessHeadline, readinessGate, explorationHelp};
+  if (typeof module !== 'undefined') module.exports = {validateScope, acceptResponse, coverageHtml, calendarLabel, gates, unfinishedDrafts, selectionSymbols, repairLabel, filterIssues, issuesHtml, attemptSummary, diagnosticLabel, taskForDraft, taskTiming, liquidationHtml, adjustmentHtml, pendingReadinessHtml, readinessHeadline, readinessGate, explorationHelp, previewPendingHtml, restoredStep};
   if (typeof document === 'undefined') return;
   const $ = id => document.getElementById(id);
   const fmt = v => v == null ? '—' : typeof v === 'number' ? v.toLocaleString('zh-CN',{maximumFractionDigits:2}) : String(v);
@@ -123,7 +131,7 @@
   const names = ['选择范围','准备数据','配置组合','确认运行','查看结果'];
   const defaults = {scope:{market:'a_share',start_date:'2021-03-01',end_date:'2025-06-30',selection_mode:'manual',symbols:[],rule_version:'fixed_v0',top_n:10,quality_mode:'strict'},portfolio:{name:'我的股票组合',initial_cash:100000,weighting:'equal',weights:{},commission_rate:0.0003,slippage_rate:0.001,max_single_weight:1,max_industry_weight:1,min_holdings:1}};
   let statusUnavailable=false, coveragePage=0, issueFilters={}, readinessRendered=undefined;
-  let draft = null, task = null, step = 1, opening = 0, epoch = 0, dirty = false, busy = false, saveTimer, saving = null, pollTimer, requestKey = null;
+  let draft = null, task = null, step = 1, opening = 0, epoch = 0, dirty = false, busy = false, pendingOperation = null, saveTimer, saving = null, pollTimer, requestKey = null;
   async function api(path, method='GET', body) {
     const r = await fetch('/api/wizard'+path,{method,headers:{Accept:'application/json',...(body ? {'Content-Type':'application/json'} : {})},body:body ? JSON.stringify(body) : undefined,cache:'no-store'});
     let p; try { p=await r.json(); } catch { throw new Error('服务未返回有效响应，请稍后重试。'); }
@@ -224,6 +232,7 @@
     $('readiness').innerHTML=html;
   }
   function renderPreview() {
+    if(pendingOperation==='preview') { $('preview').innerHTML=previewPendingHtml(pendingOperation); return; }
     const p=draft.preview; if(!p) { $('preview').innerHTML='<p class="muted">配置修改后需重新计算持仓预览。</p>'; return; }
     const holdings=p.holdings || p.portfolio?.holdings || [];
     let html='<h3>可执行持仓预览</h3>'+metrics([['初始本金',draft.portfolio.initial_cash],['实际持仓数',holdings.length],['剩余现金',p.cash_residual ?? p.cash ?? p.residual_cash ?? p.remaining_cash],['建仓成本',p.total_cost ?? ((p.commission != null || p.slippage != null) ? Number(p.commission || 0)+Number(p.slippage || 0) : p.transaction_cost)]]);
@@ -235,13 +244,16 @@
     if (!t) return '';
     const labels={QUEUED:'等待执行',RUNNING:'正在执行',SUCCEEDED:'已完成',PARTIAL:'部分完成，仍有研究阻断',FAILED:'执行失败',CANCELLED:'已取消',INTERRUPTED:'服务已重启，任务中断',CANCELLING:'正在取消'};
     const {elapsed,heartbeatAge,progressAge,stale}=taskTiming(t);
-    return `<div class="notice ${['FAILED','PARTIAL','INTERRUPTED'].includes(t.status)?'danger':''}"><strong>${esc(t.status==='PARTIAL' && researchRestrictionsOnly(t.result)?readinessHeadline(t.result):(labels[t.status] || t.status))}</strong><p>${esc(t.status==='PARTIAL' && researchRestrictionsOnly(t.result)?'修复记录已保存；剩余研究条件见上方说明。':t.stage === '仍有数据缺口，请处理后继续' ? '仍有研究阻断，请查看对应处理方式' : (t.stage || '等待后台处理'))}</p><small>已用时 ${Number.isFinite(elapsed)?elapsed:0} 秒 · ${active(t)?`最近心跳 ${heartbeatAge} 秒前 · 最近进度 ${progressAge} 秒前`:'状态已保存'}</small>${stale?'<p class="progress-warning">进度暂不可确认；可刷新状态或取消任务。心跳仅表示服务仍在响应。</p>':''}<p>${esc(attemptSummary(t))}</p>${t.error?`<p>${esc(t.error.message || t.error)}</p>`:''}</div>`;
+    return `<div class="notice ${['FAILED','PARTIAL','INTERRUPTED'].includes(t.status)?'danger':''}"><strong>${esc(t.status==='PARTIAL' && researchRestrictionsOnly(t.result)?readinessHeadline(t.result):(labels[t.status] || t.status))}</strong><p>${esc(t.status==='PARTIAL' && researchRestrictionsOnly(t.result)?'修复记录已保存；剩余研究条件见上方说明。':t.stage === '仍有数据缺口，请处理后继续' ? '仍有研究阻断，请查看对应处理方式' : (t.stage || '等待后台处理'))}</p><small>已用时 ${Number.isFinite(elapsed)?elapsed:0} 秒 · ${active(t)?`最近心跳 ${heartbeatAge} 秒前 · 最近进度 ${progressAge} 秒前`:'状态已保存'}</small>${stale?`<p class="progress-warning">${t.kind==='run'?(heartbeatAge<=10?'服务仍在响应，正在等待本阶段计算结果；完成后自动显示。':'暂未收到服务心跳，请检查服务连接。已保存的任务可在刷新后恢复。'):'进度暂不可确认；可刷新状态或取消任务。心跳仅表示服务仍在响应。'}</p>`:''}<p>${esc(attemptSummary(t))}</p>${t.error?`<p>${esc(t.error.message || t.error)}</p>`:''}</div>`;
   }
   function render() {
     if (!draft) return;
     const permissions=gates(draft,task,dirty,busy || statusUnavailable), {ready,running}=permissions, preview=ready && Boolean(draft.preview);
     $('steps').innerHTML=names.map((n,i)=>`<button type="button" data-step="${i+1}" ${i+1===step?'aria-current="step"':''} ${(i===2&&!ready)||(i===3&&!preview)||(i===4&&!permissions.canViewResult)?'disabled':''}>${i+1}. ${n}<small>${i===1?(ready?'可继续':'需检查'):i===2?(!ready?'等待数据就绪':preview?'预览已完成':'待配置'):i===3?(!preview?'等待预览':'可提交'):i===4?(task?.kind==='run'?'已创建任务':'等待运行'): '范围在先'}</small></button>`).join('');
     for(let i=1;i<=5;i++) $('step'+i).hidden=i!==step;
+    const previewButton=$('portfolioForm').querySelector('button[type="submit"]');
+    previewButton.disabled=busy || running || statusUnavailable;
+    previewButton.textContent=pendingOperation==='preview'?'正在计算持仓预览…':'计算可执行持仓预览';
     $('toPortfolio').disabled=!permissions.canConfigure; $('toConfirm').disabled=!preview || busy || running;
     $('dataGate').textContent=readinessGate(draft.readiness);
     $('check').disabled=busy || running;
@@ -254,10 +266,13 @@
     $('explorationHelp').textContent=explorationHelp(draft.readiness);
     $('applyExploratory').disabled=busy || running || statusUnavailable || !$('acceptExploratory').checked;
     $('run').disabled=busy || running || statusUnavailable || !preview;
+    $('run').textContent=pendingOperation==='run'?'正在校验并提交，请稍候…':'启动历史模拟';
     $('cancelPrepare').textContent=task?.kind==='check'?'取消检查':task?.kind==='retry_source'?'取消来源核实':'取消数据准备';
     $('cancelPrepare').hidden=!(['check','prepare','retry_source'].includes(task?.kind) && running);
     $('prepareTask').innerHTML=['check','prepare','retry_source'].includes(task?.kind)?renderTask(task)+(task.result?.repair_attempts?.length?details(task.result.repair_attempts,'本轮处理记录与未解决原因'):''):'';
-    $('runTask').innerHTML=task?.kind==='run'?renderTask(task):'<p>尚未启动运行，请先完成配置与确认。</p>';
+    $('runTask').innerHTML=pendingOperation==='run'?'<div class="notice" role="status"><strong>正在校验并提交运行</strong><p>正在验证保存的数据与配置，较大股票池可能需要数分钟，无需重复点击。</p></div>':task?.kind==='run'?renderTask(task):'<p>尚未启动运行，请先完成配置与确认。</p>';
+    $('retryRun').disabled=busy || running || statusUnavailable;
+    $('retryRun').textContent=pendingOperation==='run'?'正在校验并提交…':'重试运行';
     $('retryRun').hidden=!(task?.kind==='run' && ['FAILED','CANCELLED','INTERRUPTED'].includes(task.status));
     $('recoverTask').hidden=!(task?.kind==='run' && ['FAILED','CANCELLED','INTERRUPTED'].includes(task.status));
     if (readinessRendered!==draft.readiness) { readinessRendered=draft.readiness; coveragePage=0; renderReadiness(); } renderPreview();
@@ -273,7 +288,7 @@
     clearError();
     const validation=validateScope(readScope()); if (validation) { go(1); throw new Error(validation); }
     await save(); if(dirty) return;
-    busy=true; render();
+    busy=true; pendingOperation=kind; render();
     const sentEpoch=epoch, id=draft.id;
     try {
       if(kind==='run' && !requestKey) {
@@ -287,7 +302,7 @@
       if(p.task) {task=p.task; poll();}
       go(kind==='run'?5:kind==='preview'?3:2);
     } catch(e) { if(e.step===2 || e.step==='data' || ['STALE_READINESS','DATA_CHANGED','DATA_NOT_READY'].includes(e.code)) { draft.readiness=null; draft.preview=null; go(2); } throw e; }
-    finally { busy=false; render(); }
+    finally { busy=false; pendingOperation=null; render(); }
   }
   async function poll() {
     clearTimeout(pollTimer); if(!task) return;
@@ -314,7 +329,7 @@
     else {$('saveStatus').textContent='已恢复服务端草稿'; $('retrySave').hidden=true;}
     history.replaceState(null,'','/wizard?draft='+encodeURIComponent(id)); $('home').hidden=true; $('editor').hidden=false;
     step=draft.preview?4:draft.readiness?.status==='READY'?3:draft.readiness?2:1;
-    if(draft.task_id) { task={id:draft.task_id,status:'QUEUED',kind:'prepare'}; statusUnavailable=true; step=2; await poll(); if(request!==opening)return; if(task.kind==='run')step=5; }
+    if(draft.task_id) { task={id:draft.task_id,status:'QUEUED',kind:'prepare'}; statusUnavailable=true; step=2; await poll(); if(request!==opening)return; step=restoredStep(draft,task); }
     go(step);
   }
   async function home() {

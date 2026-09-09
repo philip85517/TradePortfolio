@@ -501,7 +501,7 @@ class ReviewState:
         for column in ["name", "industry_level1", "industry_level2", "industry_level3"]:
             if column not in indexed.columns:
                 continue
-            values = self.candidates_frame["symbol"].astype(str).map(indexed[column])
+            values = self.candidates_frame["symbol"].astype(str).map(indexed[column]).astype("string")
             if column == "name":
                 target = self.candidates_frame.get("name", pd.Series(index=self.candidates_frame.index, dtype=object))
                 self.candidates_frame["name"] = target.where(target.notna() & target.astype(str).str.strip().ne(""), values)

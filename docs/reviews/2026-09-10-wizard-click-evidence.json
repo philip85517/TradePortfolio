@@ -1,0 +1,56 @@
+{
+  "draft_id": "8217878de7a4449c8601af2d4745221c",
+  "task_id": "e5a3d2aed4724163be98c396786182b2",
+  "task_status": "SUCCEEDED",
+  "run_id": "research-20260909T164028431546Z-0f2030d7e2",
+  "review_url": "http://127.0.0.1:8787/research/review/research-20260909T164028431546Z-0f2030d7e2/",
+  "summary": {
+    "horizon": 706,
+    "status": "UNSETTLED",
+    "total_return": null,
+    "max_drawdown": null,
+    "gross_return": null,
+    "evaluated_date": "2025-12-03",
+    "message": "退市股份尚未结算，完整期末权益及收益不可确定；已知资产不包含未结算股份价值。",
+    "holding_win_rate": null,
+    "stock_returns": null,
+    "stock_contributions": null,
+    "initial_cash": 100000.0,
+    "ending_equity": null,
+    "profit_loss": null,
+    "max_drawdown_amount": null,
+    "daily_volatility": null,
+    "annualized_return": null,
+    "annualized_volatility": null,
+    "sharpe": null,
+    "commission_paid": 38.12168841741137,
+    "slippage_paid": 63.526636180438885,
+    "cash_residual": 17384.948417650012,
+    "liquidation_status": "UNSETTLED_DELISTING",
+    "unrealized_holdings_value": null,
+    "unrealized_profit_loss": null,
+    "realized_profit_loss": -28603.74653346283,
+    "realized_cash": 61853.624036287176,
+    "open_positions": {
+      "002336": 500.0
+    },
+    "known_assets_value": 61853.624036287176,
+    "unsettled_symbols": [
+      "002336"
+    ]
+  },
+  "browser_checks": [
+    "data READY: 4905 hfq, 0 blockers",
+    "preview: 9 holdings, 17384.95 cash",
+    "refresh restores confirmation step",
+    "run SUCCEEDED in 333 seconds",
+    "review evaluation shows unsettled shares and 61853.62 cash"
+  ],
+  "tests": {
+    "ui": 27,
+    "identity_and_delisting": 16,
+    "wizard_and_recovery": 38,
+    "review": 15,
+    "research_pipeline": 35
+  }
+}

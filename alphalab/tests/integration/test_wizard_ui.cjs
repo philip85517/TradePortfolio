@@ -151,3 +151,16 @@ test('completed repairs distinguish research restrictions from missing data', ()
  assert.match(h.readinessGate({...r,status:'READY',issues:[]}),/通过/);
  assert.doesNotMatch(h.explorationHelp({...r,issues:[r.issues[0]]}),/退市/);
 });
+
+test('preview request has an explicit waiting state instead of stale instructions',()=>{
+ const h=helpers();assert.match(h.previewPendingHtml('preview'),/正在计算持仓预览/);
+ assert.match(h.previewPendingHtml('preview'),/无需重复点击/);
+ assert.equal(h.previewPendingHtml(null),'');assert.equal(h.previewPendingHtml('run'),'');
+});
+
+test('reopening a finished check restores preview instead of returning to data',()=>{
+ const h=helpers(),d={preview:{status:'READY'},readiness:{status:'READY'}};
+ assert.equal(h.restoredStep(d,{kind:'check',status:'SUCCEEDED'}),4);
+ assert.equal(h.restoredStep(d,{kind:'check',status:'RUNNING'}),2);
+ assert.equal(h.restoredStep(d,{kind:'run',status:'SUCCEEDED'}),5);
+});

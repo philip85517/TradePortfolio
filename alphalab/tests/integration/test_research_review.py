@@ -316,3 +316,13 @@ def test_review_evaluation_preserves_unliquidated_accounting_and_stale_nav(tmp_p
     assert portfolio['nav'][-1]['max_valuation_stale_days'] == 2
     selection = state.stock_detail('300468', mode='selection')
     assert selection['portfolio_performance'] == {}
+
+
+def test_review_accepts_all_null_industry_metadata(tmp_path):
+    state = _state(tmp_path, industry=True)
+    con = duckdb.connect(str(state.db_path))
+    con.execute('CREATE OR REPLACE TABLE market_universe AS SELECT market,symbol,name,NULL::INTEGER AS industry_level1,NULL::INTEGER AS industry_level2,NULL::INTEGER AS industry_level3 FROM market_universe')
+    con.close()
+    state.candidates_frame['industry'] = pd.Series('UNKNOWN', index=state.candidates_frame.index, dtype='string')
+    state._enrich_candidate_metadata()
+    assert state.candidates_frame.industry.eq('UNKNOWN').all()

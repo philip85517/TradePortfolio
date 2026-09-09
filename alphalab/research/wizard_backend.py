@@ -589,6 +589,11 @@ class WizardResearchBackend:
         current, data, history = self._inspect(scope)
         if current['status'] != 'READY' or current['data_identity'] != readiness.get('data_identity') or current['requirement_id'] != readiness.get('requirement_id'):
             raise ValueError('DATA_CHANGED：数据或范围已变化，请重新检查数据')
+        # Inspection may prove delisting from a listing-history interval even when
+        # OHLC rows have no identity columns. Freeze the verified event explicitly.
+        for event in current['issues']:
+            if event['code'] == 'DELISTED_UNSETTLED':
+                data.loc[data.symbol.eq(event['symbol']), 'delisted_date'] = event['evidence']['delisted_date']
         data = prepare_view(data, current['dates']['signal_date'], current['dates']['entry_date'], current['dates']['exit_date'])
         selection_bars = data[data.date <= pd.Timestamp(current['dates']['signal_date'])].copy()
         if scope.get('selection_mode') == 'rule':

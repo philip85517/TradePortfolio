@@ -1996,6 +1996,14 @@ def _performance_payload(performance: HorizonPerformance) -> dict[str, Any]:
         "commission_paid": performance.commission_paid,
         "slippage_paid": performance.slippage_paid,
         "cash_residual": performance.cash_residual,
+        "liquidation_status": performance.liquidation_status,
+        "unrealized_holdings_value": performance.unrealized_holdings_value,
+        "unrealized_profit_loss": performance.unrealized_profit_loss,
+        "realized_profit_loss": performance.realized_profit_loss,
+        "realized_cash": performance.realized_cash,
+        "open_positions": performance.open_positions,
+        "known_assets_value": performance.known_assets_value,
+        "unsettled_symbols": performance.unsettled_symbols,
     }
 
 
