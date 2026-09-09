@@ -139,3 +139,15 @@ test('running uniform migration shows frozen target without claiming readiness',
  const html=h.pendingReadinessHtml(task);assert.match(html,/正在统一/);assert.match(html,/本轮开始时/);assert.match(html,/待统一 1 只/);assert.doesNotMatch(html,/可以配置组合/);
  assert.equal(h.pendingReadinessHtml({...task,status:'SUCCEEDED'}),'');assert.equal(h.pendingReadinessHtml({...task,kind:'run'}),'');
 });
+
+test('completed repairs distinguish research restrictions from missing data', () => {
+ const h=helpers();const r={status:'BLOCKED',repair_plan:{executable_count:0},issues:[{code:'PIT_UNAVAILABLE',resolution:'user'},{code:'DELISTED',symbol:'002336',resolution:'unsupported'}],repair_summary:{attempted:365,resolved:365,failed:0,unsupported:0,unchanged:0}};
+ assert.match(h.readinessHeadline(r),/数据修复完成/);
+ assert.match(h.readinessGate(r),/002336/);
+ assert.match(h.explorationHelp(r),/仍不能开始回测/);
+ const html=h.issuesHtml(r.issues);
+ assert.match(html,/研究模式选择/);assert.match(html,/系统能力限制/);assert.match(html,/重复补数无法解决/);assert.match(html,/<details><summary>技术详情/);
+ assert.doesNotMatch(h.readinessHeadline({...r,issues:[...r.issues,{code:'MISSING_BARS',resolution:'download'}]}),/修复完成/);
+ assert.match(h.readinessGate({...r,status:'READY',issues:[]}),/通过/);
+ assert.doesNotMatch(h.explorationHelp({...r,issues:[r.issues[0]]}),/退市/);
+});

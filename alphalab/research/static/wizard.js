@@ -48,16 +48,41 @@
   function filterIssues(issues, filters={}) {
     return issues.filter(i=>(!filters.symbol || String(i.symbol || '').includes(filters.symbol)) && (!filters.category || i.category===filters.category) && (!filters.phase || i.phase===filters.phase));
   }
+  function blockers(r) { return (r?.issues || []).filter(i=>!['info','warning'].includes(i.severity)); }
+  function researchRestrictionsOnly(r) {
+    const rows=blockers(r);
+    return r?.repair_plan?.executable_count===0 && rows.length>0 && rows.every(i=>i.code==='PIT_UNAVAILABLE' || i.resolution==='unsupported');
+  }
+  function readinessHeadline(r) {
+    if(r?.status==='READY') return '当前研究已通过检查，可以配置组合';
+    if(researchRestrictionsOnly(r)) return r.repair_summary?.resolved>0 && r.repair_summary.resolved===r.repair_summary.attempted ? '数据修复完成，研究条件尚未满足' : '当前没有待补行情，研究条件尚未满足';
+    return '当前研究还不能开始，请处理以下检查项';
+  }
+  function readinessGate(r) {
+    if(r?.status==='READY') return '当前范围已通过所选质量模式的检查。';
+    if(!r) return '请先完成当前研究范围的数据检查。';
+    return '暂不能配置组合：'+blockers(r).map(i=>i.code==='PIT_UNAVAILABLE'?'需选择研究模式或补充历史资料':i.code==='DELISTED'?`${i.symbol} 退市清算暂不支持`:(i.message || i.code)).join('；')+'。';
+  }
+  function explorationHelp(r) {
+    const others=blockers(r).filter(i=>i.code!=='PIT_UNAVAILABLE');
+    return '探索研究接受历史身份或行业资料不完整的限制，结果会明确标记为探索研究。'+(others.length ? '切换后仍不能开始回测：'+others.map(i=>i.code==='DELISTED'?`${i.symbol} 的退市清算暂不支持`:(i.message || i.code)).join('；')+'。' : '切换后将重新检查，检查通过后才能继续配置。');
+  }
   function issuesHtml(issues, filters={}) {
     const filtered=filterIssues(issues,filters);
-    return [['download','可自动处理'],['verify','需核实'],['user','需要你处理'],['warning','提示（不阻断）'],['info','说明（不阻断）']].map(([key,label])=>{
-      const rows=filtered.filter(i=>['info','warning'].includes(key)?i.severity===key:!['info','warning'].includes(i.severity) && (key==='user'?!['download','verify'].includes(i.resolution):i.resolution===key));
+    const group=i=>['info','warning'].includes(i.severity)?i.severity:i.code==='PIT_UNAVAILABLE'?'mode':i.resolution==='unsupported'?'capability':['download','verify'].includes(i.resolution)?i.resolution:'source';
+    return [['mode','研究模式选择'],['capability','系统能力限制'],['download','可自动处理'],['verify','需核实交易状态'],['source','需补充来源证据'],['warning','提示（不阻断）'],['info','说明（不阻断）']].map(([key,label])=>{
+      const rows=filtered.filter(i=>group(i)===key), blocking=!['info','warning'].includes(key);
       if (!rows.length) return '';
-      return `<details class="issue-group ${key==='info'?'info':key==='warning'?'warning':'danger'}"><summary>${label} · ${rows.length} 条问题</summary>${rows.map(i=>`<details><summary>${esc(i.symbol)} · ${esc(i.message || i.code || i)}</summary><p>${esc(i.action || '')}</p>${i.code==='SOURCE_ADJUSTMENT_UNAVAILABLE'?`<button type="button" data-retry-source="${esc(i.symbol)}">重新核实来源</button><p>向当前来源重新请求此股票的数据，验证响应后更新检查结果。</p>`:''}<p>阶段：${esc(diagnosticLabel(i.phase))} · 类型：${esc(diagnosticLabel(i.category || i.code))}</p><p>异常日期：${(i.date_ranges || []).map(d=>esc(d.start)+' → '+esc(d.end)).join('、') || '未提供'}</p><pre>${esc(JSON.stringify(i.evidence || {},null,2))}</pre></details>`).join('')}</details>`;
-    }).join('') || '<p class="muted">没有符合筛选条件的问题。</p>';
+      return `<details class="issue-group ${blocking?'danger':key}" ${blocking?'open':''}><summary>${label} · ${rows.length} ${blocking?'项':'条'}</summary>${rows.map(i=>{
+        const title=i.code==='PIT_UNAVAILABLE'?'缺少完整的历史身份／行业资料':i.code==='DELISTED'?`${i.symbol} 在持有期间退市，系统暂不支持清算`:[i.symbol,i.message || i.code].filter(Boolean).join(' · ');
+        const action=i.code==='PIT_UNAVAILABLE'?'当前资料无法完整还原当时的上市身份或所属行业。可补充带真实生效区间的历史资料，或在下方接受限制并切换探索研究。':i.code==='DELISTED'?'重复补数无法解决，探索模式也不能绕过。需要增加退市处理能力；修改日期或股票范围会改变本次研究。':i.action || '';
+        return `<details ${blocking?'open':''}><summary>${esc(title)}</summary><p>${esc(action)}</p>${i.code==='SOURCE_ADJUSTMENT_UNAVAILABLE'?`<button type="button" data-retry-source="${esc(i.symbol)}">重新核实来源</button><p>向当前来源重新请求此股票的数据，验证响应后更新检查结果。</p>`:''}<details><summary>技术详情</summary><p>阶段：${esc(diagnosticLabel(i.phase))} · 类型：${esc(diagnosticLabel(i.category || i.code))}</p>${i.date_ranges?.length?'<p>相关日期：'+i.date_ranges.map(d=>esc(d.start)+' → '+esc(d.end)).join('、')+'</p>':''}<pre>${esc(JSON.stringify(i.evidence || {},null,2))}</pre></details></details>`;
+      }).join('')}</details>`;
+    }).join('') || '<p class="muted">没有符合筛选条件的检查项。</p>';
   }
   function attemptSummary(t) {
     const summary=t?.result?.repair_summary;
+    if (summary?.resolved>0 && summary.resolved===summary.attempted) return `本轮 ${summary.resolved} 项修复全部完成，没有失败项。数据已保存，无需重复补数。`;
     if (summary) return `来源不支持 ${summary.unsupported ?? (t?.result?.repair_attempts || []).filter(a=>a.status==='unsupported').length} 项 · 本轮已处理 ${summary.resolved || 0} 项 · 未变化 ${summary.unchanged || 0} 项 · 请求失败 ${summary.failed || 0} 项。已验证的缓存与草稿保留。`;
     const attempts=t?.result?.repair_attempts || t?.result?.attempts || t?.progress?.attempts || [];
     if (!Array.isArray(attempts) || !attempts.length) return ['PARTIAL','FAILED','CANCELLED','INTERRUPTED'].includes(t?.status)?'已验证的缓存与草稿保留；重新检查后继续处理剩余问题。':'';
@@ -89,7 +114,7 @@
   function taskForDraft(currentTask, value) { return currentTask?.id === value.task_id ? currentTask : null; }
   function selectionSymbols(mode, text) { return mode==='manual' ? text.split(/[\s,，;；]+/).filter(Boolean) : []; }
   function unfinishedDrafts(rows) { return rows.filter(row=>!(row.task_kind==='run' && row.task_status==='SUCCEEDED')); }
-  if (typeof module !== 'undefined') module.exports = {validateScope, acceptResponse, coverageHtml, calendarLabel, gates, unfinishedDrafts, selectionSymbols, repairLabel, filterIssues, issuesHtml, attemptSummary, diagnosticLabel, taskForDraft, taskTiming, liquidationHtml, adjustmentHtml, pendingReadinessHtml};
+  if (typeof module !== 'undefined') module.exports = {validateScope, acceptResponse, coverageHtml, calendarLabel, gates, unfinishedDrafts, selectionSymbols, repairLabel, filterIssues, issuesHtml, attemptSummary, diagnosticLabel, taskForDraft, taskTiming, liquidationHtml, adjustmentHtml, pendingReadinessHtml, readinessHeadline, readinessGate, explorationHelp};
   if (typeof document === 'undefined') return;
   const $ = id => document.getElementById(id);
   const fmt = v => v == null ? '—' : typeof v === 'number' ? v.toLocaleString('zh-CN',{maximumFractionDigits:2}) : String(v);
@@ -183,18 +208,18 @@
     const r=draft.readiness;
     if (!r) { $('readiness').innerHTML=pendingReadinessHtml(task) || '<div class="notice">尚未检查，或研究范围已修改。请重新检查数据。</div>'; return; }
     const ready=r.status==='READY';
-    let html=`<div class="notice ${ready?'success':'danger'}"><strong>${ready?'数据已就绪，可以配置组合':'数据尚未就绪，需先处理以下问题'}</strong></div>`;
+    let html=`<div class="notice ${ready?'success':'danger'}"><strong>${esc(readinessHeadline(r))}</strong></div>`;
     html+=adjustmentHtml(r.adjustment_summary);
     const dates=r.dates || {};
     html+=metrics([['请求开始',draft.scope.start_date],['请求结束',draft.scope.end_date],['数据质量',draft.scope.quality_mode==='strict'?'正式研究':'探索研究'],...Object.entries(dates).map(([k,v])=>[({entry_date:'实际建仓日',exit_date:'实际结束日',end_date:'实际结束日',signal_date:'规则信号日',warmup_start:'预热起点',warmup_start_date:'预热起点',requested_start_date:'请求开始日',requested_end_date:'请求结束日',warmup_sessions:'所需预热交易日',calendar_source:'交易日历来源',horizon:'持有交易日数'}[k] || k),k==='calendar_source'?calendarLabel(v):v])]);
     html+=metrics([['已就绪股票（只）',(r.coverage || []).filter(x=>x.status==='READY').length],['待核实问题（条）',(r.issues || []).filter(x=>!['info','warning'].includes(x.severity) && x.resolution==='verify').length],['可执行动作（项）',r.repair_plan?.executable_count ?? '待确定'],['需选择／不支持（条）',(r.issues || []).filter(x=>!['info','warning'].includes(x.severity) && ['user','unsupported'].includes(x.resolution)).length]]);
-    if (r.repair_plan?.executable_count===0 && !ready) html+='<div class="notice">当前来源无法自动解决剩余问题。请重新检查或返回修改范围；修改股票或日期会改变实验样本。</div>';
+    if (r.repair_plan?.executable_count===0 && !ready) html+='<div class="notice">当前没有可自动补数的任务。请按下方说明处理研究条件；重复补数不会消除这些限制。</div>';
     const options=(key)=>[...new Set((r.issues || []).map(i=>i[key]).filter(Boolean))].map(v=>`<option value="${esc(v)}" ${issueFilters[key]===v?'selected':''}>${esc(diagnosticLabel(v))}</option>`).join('');
     if (r.issues?.length) html+=`<div class="form-grid"><label>股票筛选<input id="issueSymbol" value="${esc(issueFilters.symbol || '')}" placeholder="六位代码或部分代码"></label><label>问题类型<select id="issueCategory"><option value="">全部类型</option>${options('category')}</select></label><label>研究阶段<select id="issuePhase"><option value="">全部阶段</option>${options('phase')}</select></label></div><div id="issueGroups">${issuesHtml(r.issues,issueFilters)}</div>`;
     if (r.repair_plan?.actions?.length) html+=details(r.repair_plan.actions,'查看本轮自动处理动作');
     if (r.warnings?.length) html+='<div class="notice">'+r.warnings.map(x=>esc(x.message || x)).join('<br>')+'</div>';
     const pages=Math.max(1,Math.ceil((r.coverage || []).length/25)); coveragePage=Math.min(coveragePage,pages-1);
-    html+=coverageHtml(r.coverage,coveragePage,r.issues || [])+`<div class="actions"><button type="button" data-page="${coveragePage-1}" ${coveragePage===0?'disabled':''}>上一页</button><span>第 ${coveragePage+1} / ${pages} 页 · 每页 25 只股票</span><button type="button" data-page="${coveragePage+1}" ${coveragePage+1>=pages?'disabled':''}>下一页</button><button type="button" id="exportDiagnostics">导出原始诊断</button></div>`;
+    html+='<details id="coverageDetails"><summary>查看数据覆盖（'+(r.coverage || []).length+' 只股票）</summary>'+coverageHtml(r.coverage,coveragePage,r.issues || [])+`<div class="actions"><button type="button" data-page="${coveragePage-1}" ${coveragePage===0?'disabled':''}>上一页</button><span>第 ${coveragePage+1} / ${pages} 页 · 每页 25 只股票</span><button type="button" data-page="${coveragePage+1}" ${coveragePage+1>=pages?'disabled':''}>下一页</button><button type="button" id="exportDiagnostics">导出原始诊断</button></div></details>`;
     $('readiness').innerHTML=html;
   }
   function renderPreview() {
@@ -209,7 +234,7 @@
     if (!t) return '';
     const labels={QUEUED:'等待执行',RUNNING:'正在执行',SUCCEEDED:'已完成',PARTIAL:'部分完成，仍有研究阻断',FAILED:'执行失败',CANCELLED:'已取消',INTERRUPTED:'服务已重启，任务中断',CANCELLING:'正在取消'};
     const {elapsed,heartbeatAge,progressAge,stale}=taskTiming(t);
-    return `<div class="notice ${['FAILED','PARTIAL','INTERRUPTED'].includes(t.status)?'danger':''}"><strong>${esc(labels[t.status] || t.status)}</strong><p>${esc(t.stage === '仍有数据缺口，请处理后继续' ? '仍有研究阻断，请查看对应处理方式' : (t.stage || '等待后台处理'))}</p><small>已用时 ${Number.isFinite(elapsed)?elapsed:0} 秒 · ${active(t)?`最近心跳 ${heartbeatAge} 秒前 · 最近进度 ${progressAge} 秒前`:'状态已保存'}</small>${stale?'<p class="progress-warning">进度暂不可确认；可刷新状态或取消任务。心跳仅表示服务仍在响应。</p>':''}<p>${esc(attemptSummary(t))}</p>${t.error?`<p>${esc(t.error.message || t.error)}</p>`:''}</div>`;
+    return `<div class="notice ${['FAILED','PARTIAL','INTERRUPTED'].includes(t.status)?'danger':''}"><strong>${esc(t.status==='PARTIAL' && researchRestrictionsOnly(t.result)?readinessHeadline(t.result):(labels[t.status] || t.status))}</strong><p>${esc(t.status==='PARTIAL' && researchRestrictionsOnly(t.result)?'修复记录已保存；剩余研究条件见上方说明。':t.stage === '仍有数据缺口，请处理后继续' ? '仍有研究阻断，请查看对应处理方式' : (t.stage || '等待后台处理'))}</p><small>已用时 ${Number.isFinite(elapsed)?elapsed:0} 秒 · ${active(t)?`最近心跳 ${heartbeatAge} 秒前 · 最近进度 ${progressAge} 秒前`:'状态已保存'}</small>${stale?'<p class="progress-warning">进度暂不可确认；可刷新状态或取消任务。心跳仅表示服务仍在响应。</p>':''}<p>${esc(attemptSummary(t))}</p>${t.error?`<p>${esc(t.error.message || t.error)}</p>`:''}</div>`;
   }
   function render() {
     if (!draft) return;
@@ -217,13 +242,15 @@
     $('steps').innerHTML=names.map((n,i)=>`<button type="button" data-step="${i+1}" ${i+1===step?'aria-current="step"':''} ${(i===2&&!ready)||(i===3&&!preview)||(i===4&&!permissions.canViewResult)?'disabled':''}>${i+1}. ${n}<small>${i===1?(ready?'可继续':'需检查'):i===2?(!ready?'等待数据就绪':preview?'预览已完成':'待配置'):i===3?(!preview?'等待预览':'可提交'):i===4?(task?.kind==='run'?'已创建任务':'等待运行'): '范围在先'}</small></button>`).join('');
     for(let i=1;i<=5;i++) $('step'+i).hidden=i!==step;
     $('toPortfolio').disabled=!permissions.canConfigure; $('toConfirm').disabled=!preview || busy || running;
-    $('dataGate').textContent=ready?'当前范围已通过所选质量模式的检查。':'历史数据全部通过当前模式检查后才能继续；补数部分成功时仍需处理剩余缺口。';
+    $('dataGate').textContent=readinessGate(draft.readiness);
     $('check').disabled=busy || running;
     $('prepare').disabled=!permissions.canPrepare;
+    $('prepare').hidden=draft.readiness?.repair_plan?.executable_count===0;
     $('prepare').textContent=repairLabel(draft.readiness);
     if (statusUnavailable) { $('prepare').disabled=true; $('check').disabled=true; $('run').disabled=true; }
     $('refreshTask').hidden=!(statusUnavailable || running); $('taskConnection').hidden=!statusUnavailable;
-    $('exploreChoice').hidden=draft.scope.quality_mode==='exploratory' || !(draft.readiness?.issues || []).some(i=>!['info','warning'].includes(i.severity) && (i.resolution==='user' || String(i.code).includes('PIT')));
+    $('exploreChoice').hidden=draft.scope.quality_mode==='exploratory' || !(draft.readiness?.issues || []).some(i=>!['info','warning'].includes(i.severity) && i.code==='PIT_UNAVAILABLE');
+    $('explorationHelp').textContent=explorationHelp(draft.readiness);
     $('applyExploratory').disabled=busy || running || statusUnavailable || !$('acceptExploratory').checked;
     $('run').disabled=busy || running || statusUnavailable || !preview;
     $('cancelPrepare').textContent=task?.kind==='check'?'取消检查':task?.kind==='retry_source'?'取消来源核实':'取消数据准备';
@@ -316,7 +343,7 @@
   $('acceptExploratory').addEventListener('change',render);
   action('applyExploratory',async()=>{if(!$('acceptExploratory').checked)return; document.querySelector('[name=quality][value=exploratory]').checked=true; $('acceptExploratory').checked=false; changed(true); await command('check');});
   $('readiness').addEventListener('change',e=>{const key={issueSymbol:'symbol',issueCategory:'category',issuePhase:'phase'}[e.target.id]; if(key){issueFilters[key]=e.target.value; $('issueGroups').innerHTML=issuesHtml(draft.readiness?.issues || [],issueFilters);}});
-  $('readiness').addEventListener('click',e=>{const retry=e.target.closest('[data-retry-source]'); if(retry){command('retry_source',{symbol:retry.dataset.retrySource}).catch(error); return;} const b=e.target.closest('[data-page]'); if(b && !b.disabled){coveragePage=Number(b.dataset.page); renderReadiness(); $('readiness').querySelector('[data-page]')?.focus();} if(e.target.id==='exportDiagnostics'){const url=URL.createObjectURL(new Blob([JSON.stringify(draft.readiness,null,2)],{type:'application/json'})); const a=document.createElement('a'); a.href=url; a.download='data-diagnostics.json'; a.click(); URL.revokeObjectURL(url);}});
+  $('readiness').addEventListener('click',e=>{const retry=e.target.closest('[data-retry-source]'); if(retry){command('retry_source',{symbol:retry.dataset.retrySource}).catch(error); return;} const b=e.target.closest('[data-page]'); if(b && !b.disabled){coveragePage=Number(b.dataset.page); renderReadiness(); $('coverageDetails').open=true; $('readiness').querySelector('[data-page]')?.focus();} if(e.target.id==='exportDiagnostics'){const url=URL.createObjectURL(new Blob([JSON.stringify(draft.readiness,null,2)],{type:'application/json'})); const a=document.createElement('a'); a.href=url; a.download='data-diagnostics.json'; a.click(); URL.revokeObjectURL(url);}});
   action('check',()=>command('check')); action('prepare',()=>command('prepare')); action('run',()=>command('run'));
   action('retryRun',()=>{requestKey=null;localStorage.removeItem('alphalab.wizard.submit.'+draft.id+'.'+draft.revision);return command('run');});
   action('recoverTask',async()=>{const p=await api('/drafts','POST',{source_task_id:task.id});await openDraft(p.draft.id);});
