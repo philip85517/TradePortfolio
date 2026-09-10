@@ -114,6 +114,12 @@
   function previewPendingHtml(operation) {
     return operation==='preview'?'<div class="notice" role="status"><strong>正在计算持仓预览</strong><p>正在核对历史数据、选股结果及整手成交。较大股票池可能需要数分钟，请保持页面打开，无需重复点击。</p></div>':'';
   }
+  function executionHtml(events) {
+    if (!events?.length) return '';
+    const reasons={listing_metadata_delisting:'已到历史退市边界',termination_decision_delisting:'退市前未能成交，保留未结算股份',termination_decision:'正式退市决定触发退出',terminal:'研究结束日退出',lot_budget:'卖出净回款不足一手，保留现金',no_candidate:'没有合格替补，保留现金',confirmed_suspension:'来源确认停牌',one_price_bar:'一字行情，保守不成交',before_trading_resumes:'尚未到公告明确的复牌日',terminal_or_ineligible:'研究结束或候选已不合格'};
+    const labels={BUY:'买入替补',SELL:'卖出',SELECT:'选择替补',DEFER_SELL:'卖出顺延',DEFER_BUY:'买入顺延',CANCEL_BUY:'取消替补',CASH:'保留现金',UNSETTLED:'未结算',OPEN_POSITION:'未平仓',DEFER:'顺延',NO_CANDIDATE:'无替补，保留现金',TERMINAL_SELL:'期末卖出',INITIAL_BUY:'初始建仓'};
+    return '<details open><summary>退市退出与替补记录</summary><div class="table-wrap"><table><thead><tr><th>日期</th><th>股票</th><th>操作</th><th>股数</th><th>模拟价格</th><th>佣金／滑点</th><th>说明</th></tr></thead><tbody>'+events.map(e=>`<tr><td>${esc(e.date)}</td><td>${esc(e.symbol || '—')}</td><td>${esc(labels[e.action] || e.action)}</td><td>${esc(e.shares ?? '—')}</td><td>${esc(e.price == null?'—':Number(e.price).toLocaleString('zh-CN',{maximumFractionDigits:4}))}</td><td>${esc(e.commission == null?'—':Number(e.commission).toFixed(2))}／${esc(e.slippage == null?'—':Number(e.slippage).toFixed(2))}</td><td>${esc(reasons[e.reason] || e.reason || '')}${e.rank_cutoff?'<br>排名截止：'+esc(e.rank_cutoff):''}${e.source_url?'<br>公告来源：'+esc(e.source_url):''}</td></tr>`).join('')+'</tbody></table></div><p class="muted">卖出金额按建仓原始价锚定的后复权总回报序列计算；这是研究成交模型。替补买入使用当日未复权开盘价，另计费用。</p></details>';
+  }
   function liquidationHtml(summary) {
     if(summary?.liquidation_status==='UNSETTLED_DELISTING') return `<div class="notice warning"><strong>退市股份未结算，完整收益不可确定</strong><p>${(summary.unsettled_symbols || []).map(esc).join('、')}：保留股份，未模拟卖出或清算。</p><p>已知资产：${esc(Number(summary.known_assets_value).toLocaleString('zh-CN',{maximumFractionDigits:2}))} · 其中现金：${esc(Number(summary.realized_cash).toLocaleString('zh-CN',{maximumFractionDigits:2}))}</p><p>已知资产不包含未结算股份价值，不代表完整期末权益。净值与完整收益指标暂不展示。</p></div>`;
     if (summary?.liquidation_status !== 'OPEN_POSITION') return '';
@@ -123,7 +129,19 @@
   function taskForDraft(currentTask, value) { return currentTask?.id === value.task_id ? currentTask : null; }
   function selectionSymbols(mode, text) { return mode==='manual' ? text.split(/[\s,，;；]+/).filter(Boolean) : []; }
   function unfinishedDrafts(rows) { return rows.filter(row=>!(row.task_kind==='run' && row.task_status==='SUCCEEDED')); }
-  if (typeof module !== 'undefined') module.exports = {validateScope, acceptResponse, coverageHtml, calendarLabel, gates, unfinishedDrafts, selectionSymbols, repairLabel, filterIssues, issuesHtml, attemptSummary, diagnosticLabel, taskForDraft, taskTiming, liquidationHtml, adjustmentHtml, pendingReadinessHtml, readinessHeadline, readinessGate, explorationHelp, previewPendingHtml, restoredStep};
+  function submissionStorageKey(value) {
+    return 'alphalab.wizard.submit.v2.'+JSON.stringify([value.id,value.revision,value.readiness?.data_identity ?? null,value.readiness?.requirement_id ?? null]);
+  }
+  function submissionKey(value, storage, createKey) {
+    const key=submissionStorageKey(value);
+    const existing=storage.getItem(key);
+    if (existing) return existing;
+    const request=value.id+':'+value.revision+':'+createKey();
+    storage.setItem(key,request);
+    return request;
+  }
+  function clearSubmissionKey(value, storage) { storage.removeItem(submissionStorageKey(value)); }
+  if (typeof module !== 'undefined') module.exports = {validateScope, acceptResponse, coverageHtml, calendarLabel, gates, unfinishedDrafts, selectionSymbols, repairLabel, filterIssues, issuesHtml, attemptSummary, diagnosticLabel, taskForDraft, taskTiming, liquidationHtml, adjustmentHtml, pendingReadinessHtml, readinessHeadline, readinessGate, explorationHelp, previewPendingHtml, restoredStep, executionHtml, submissionKey, clearSubmissionKey};
   if (typeof document === 'undefined') return;
   const $ = id => document.getElementById(id);
   const fmt = v => v == null ? '—' : typeof v === 'number' ? v.toLocaleString('zh-CN',{maximumFractionDigits:2}) : String(v);
@@ -131,7 +149,7 @@
   const names = ['选择范围','准备数据','配置组合','确认运行','查看结果'];
   const defaults = {scope:{market:'a_share',start_date:'2021-03-01',end_date:'2025-06-30',selection_mode:'manual',symbols:[],rule_version:'fixed_v0',top_n:10,quality_mode:'strict'},portfolio:{name:'我的股票组合',initial_cash:100000,weighting:'equal',weights:{},commission_rate:0.0003,slippage_rate:0.001,max_single_weight:1,max_industry_weight:1,min_holdings:1}};
   let statusUnavailable=false, coveragePage=0, issueFilters={}, readinessRendered=undefined;
-  let draft = null, task = null, step = 1, opening = 0, epoch = 0, dirty = false, busy = false, pendingOperation = null, saveTimer, saving = null, pollTimer, requestKey = null;
+  let draft = null, task = null, step = 1, opening = 0, epoch = 0, dirty = false, busy = false, pendingOperation = null, saveTimer, saving = null, pollTimer;
   async function api(path, method='GET', body) {
     const r = await fetch('/api/wizard'+path,{method,headers:{Accept:'application/json',...(body ? {'Content-Type':'application/json'} : {})},body:body ? JSON.stringify(body) : undefined,cache:'no-store'});
     let p; try { p=await r.json(); } catch { throw new Error('服务未返回有效响应，请稍后重试。'); }
@@ -150,7 +168,7 @@
       if (!m || Object.hasOwn(weights,m[1]) || !Number.isFinite(Number(m[2]))) throw new Error('自定义权重请按“000001: 50%”填写，每只股票只填写一次。');
       weights[m[1]]=Number(m[2])/100;
     }
-    return {name:$('portfolioName').value,initial_cash:Number($('initialCash').value),weighting:$('weighting').value,weights,commission_rate:Number($('commission').value)/100,slippage_rate:Number($('slippage').value)/100,max_single_weight:$('maxSingle').value===''?null:Number($('maxSingle').value)/100,max_industry_weight:$('maxIndustry').value===''?null:Number($('maxIndustry').value)/100,min_holdings:Number($('minHoldings').value)};
+    return {delisting_policy:$('delistingPolicy').value,name:$('portfolioName').value,initial_cash:Number($('initialCash').value),weighting:$('weighting').value,weights,commission_rate:Number($('commission').value)/100,slippage_rate:Number($('slippage').value)/100,max_single_weight:$('maxSingle').value===''?null:Number($('maxSingle').value)/100,max_industry_weight:$('maxIndustry').value===''?null:Number($('maxIndustry').value)/100,min_holdings:Number($('minHoldings').value)};
   }
   function syncChoices() {
     const manual=$('selectionMode').value==='manual';
@@ -164,6 +182,7 @@
     for (const [id,key] of Object.entries({market:'market',startDate:'start_date',endDate:'end_date',selectionMode:'selection_mode',ruleVersion:'rule_version',topN:'top_n'})) $(id).value=s[key];
     $('symbols').value=(s.symbols || []).join(', ');
     document.querySelector(`[name=quality][value=${s.quality_mode==='exploratory' ? 'exploratory' : 'strict'}]`).checked=true;
+    $('delistingPolicy').value=p.delisting_policy || 'retain-unsettled-v1';
     for (const [id,key] of Object.entries({portfolioName:'name',initialCash:'initial_cash',weighting:'weighting',minHoldings:'min_holdings'})) $(id).value=p[key];
     for (const [id,key] of Object.entries({commission:'commission_rate',slippage:'slippage_rate',maxSingle:'max_single_weight',maxIndustry:'max_industry_weight'})) $(id).value=p[key]==null?'':p[key]*100;
     $('weights').value=Object.entries(p.weights || {}).map(([s,w])=>`${s}: ${w*100}%`).join('\n');
@@ -171,7 +190,7 @@
   }
   function changed(scopeChanged) {
     if (!draft) return;
-    epoch++; dirty=true; requestKey=null; clearError();
+    epoch++; dirty=true; clearError();
     if (scopeChanged) {
       draft.scope=readScope(); draft.readiness=null; draft.task_id=null;
       task=taskForDraft(task,draft); clearTimeout(pollTimer); statusUnavailable=false;
@@ -276,9 +295,9 @@
     $('retryRun').hidden=!(task?.kind==='run' && ['FAILED','CANCELLED','INTERRUPTED'].includes(task.status));
     $('recoverTask').hidden=!(task?.kind==='run' && ['FAILED','CANCELLED','INTERRUPTED'].includes(task.status));
     if (readinessRendered!==draft.readiness) { readinessRendered=draft.readiness; coveragePage=0; renderReadiness(); } renderPreview();
-    $('confirmation').innerHTML=metrics([['组合名称',draft.portfolio.name],['初始本金',draft.portfolio.initial_cash],['研究区间',draft.scope.start_date+' → '+draft.scope.end_date],['持有方式','买入并持有至结束日'],['范围',draft.scope.selection_mode==='manual' ? draft.scope.symbols.join(', ') : 'fixed_v0 · '+draft.scope.top_n+' 只'],['数据质量',draft.scope.quality_mode==='strict'?'正式研究':'探索研究'],['佣金',draft.portfolio.commission_rate*100+'%'],['滑点',draft.portfolio.slippage_rate*100+'%'],['权重方式',({equal:'等权',score:'规则评分',custom:'自定义'}[draft.portfolio.weighting])],['最低持仓数',draft.portfolio.min_holdings],['单股权重上限',draft.portfolio.max_single_weight==null?'不限制':draft.portfolio.max_single_weight*100+'%'],['行业权重上限',draft.portfolio.max_industry_weight==null?'不限制':draft.portfolio.max_industry_weight*100+'%']])+(draft.scope.quality_mode==='exploratory'?'<div class="notice danger">本次结果为探索研究，保留数据检查所列历史身份与行业快照限制。</div>':'')+metrics(Object.entries(draft.readiness?.dates || {}).filter(([key])=>['signal_date','entry_date','exit_date','warmup_start_date','horizon','calendar_source'].includes(key)).map(([key,value])=>[({signal_date:'规则信号日',entry_date:'实际建仓日',exit_date:'实际结束日',warmup_start_date:'预热起点',horizon:'持有交易日数',calendar_source:'交易日历来源'}[key]),key==='calendar_source'?calendarLabel(value):value]));
+    $('confirmation').innerHTML=metrics([['组合名称',draft.portfolio.name],['初始本金',draft.portfolio.initial_cash],['研究区间',draft.scope.start_date+' → '+draft.scope.end_date],['持有方式',draft.portfolio.delisting_policy==='announcement-replace-v1'?'退市公告退出与替补':'买入并持有至结束日'],['范围',draft.scope.selection_mode==='manual' ? draft.scope.symbols.join(', ') : 'fixed_v0 · '+draft.scope.top_n+' 只'],['数据质量',draft.scope.quality_mode==='strict'?'正式研究':'探索研究'],['佣金',draft.portfolio.commission_rate*100+'%'],['滑点',draft.portfolio.slippage_rate*100+'%'],['权重方式',({equal:'等权',score:'规则评分',custom:'自定义'}[draft.portfolio.weighting])],['最低持仓数',draft.portfolio.min_holdings],['单股权重上限',draft.portfolio.max_single_weight==null?'不限制':draft.portfolio.max_single_weight*100+'%'],['行业权重上限',draft.portfolio.max_industry_weight==null?'不限制':draft.portfolio.max_industry_weight*100+'%']])+(draft.scope.quality_mode==='exploratory'?'<div class="notice danger">本次结果为探索研究，保留数据检查所列历史身份与行业快照限制。</div>':'')+metrics(Object.entries(draft.readiness?.dates || {}).filter(([key])=>['signal_date','entry_date','exit_date','warmup_start_date','horizon','calendar_source'].includes(key)).map(([key,value])=>[({signal_date:'规则信号日',entry_date:'实际建仓日',exit_date:'实际结束日',warmup_start_date:'预热起点',horizon:'持有交易日数',calendar_source:'交易日历来源'}[key]),key==='calendar_source'?calendarLabel(value):value]));
     const result=task?.kind==='run' && task.status==='SUCCEEDED' ? task.result : null;
-    $('results').innerHTML=result?.run_id?`<div class="notice success"><h3>运行已保存</h3><p>冻结配置及结果可从最近运行重新打开。</p><a href="/research/review/${encodeURIComponent(result.run_id)}/">打开净值、收益、回撤与持仓审阅 →</a></div>`+metrics([['总收益率',result.summary?.total_return == null ? '—' : (result.summary.total_return*100).toFixed(2)+'%'],['绝对盈亏',result.summary?.profit_loss],['期末权益',result.summary?.ending_equity]])+liquidationHtml(result.summary)+details(result.summary || {},'运行摘要'):'';
+    $('results').innerHTML=result?.run_id?`<div class="notice success"><h3>运行已保存</h3><p>冻结配置及结果可从最近运行重新打开。</p><a href="/research/review/${encodeURIComponent(result.run_id)}/">打开净值、收益、回撤与持仓审阅 →</a></div>`+metrics([['总收益率',result.summary?.total_return == null ? '—' : (result.summary.total_return*100).toFixed(2)+'%'],['绝对盈亏',result.summary?.profit_loss],['期末权益',result.summary?.ending_equity]])+liquidationHtml(result.summary)+executionHtml(result.summary?.execution_events)+details(result.summary || {},'运行摘要'):'';
     document.querySelectorAll('#scopeForm input,#scopeForm select,#scopeForm textarea,#portfolioForm input,#portfolioForm select,#portfolioForm textarea').forEach(el=>el.disabled=running || busy || statusUnavailable);
     syncChoices();
   }
@@ -291,11 +310,7 @@
     busy=true; pendingOperation=kind; render();
     const sentEpoch=epoch, id=draft.id;
     try {
-      if(kind==='run' && !requestKey) {
-        const key='alphalab.wizard.submit.'+draft.id+'.'+draft.revision;
-        requestKey=localStorage.getItem(key) || draft.id+':'+draft.revision+':'+(crypto.randomUUID ? crypto.randomUUID() : Date.now());
-        localStorage.setItem(key,requestKey);
-      }
+      const requestKey=kind==='run'?submissionKey(draft,localStorage,()=>crypto.randomUUID ? crypto.randomUUID() : Date.now()):null;
       const p=await api('/drafts/'+encodeURIComponent(id)+'/'+kind,'POST',{revision:draft.revision,...extra,...(kind==='run'?{idempotency_key:requestKey}:{}),...(kind==='prepare' && draft.readiness?.repair_plan?.plan_id?{plan_id:draft.readiness.repair_plan.plan_id}:{})});
       if (!acceptResponse(draft,p.draft,sentEpoch,epoch)) return;
       draft=p.draft; if (p.preview) draft.preview=p.preview;
@@ -322,7 +337,7 @@
   async function openDraft(id) {
     const request=++opening; clearError(); const p=await api('/drafts/'+encodeURIComponent(id));
     if(request!==opening)return;
-    epoch++; draft=p.draft; task=null; statusUnavailable=false; readinessRendered=undefined; dirty=false; requestKey=null;
+    epoch++; draft=p.draft; task=null; statusUnavailable=false; readinessRendered=undefined; dirty=false;
     fill();
     const saved=localStorage.getItem(localKey(id));
     if(saved) { try { const b=JSON.parse(saved); draft.scope=b.scope; draft.portfolio=b.portfolio; draft.readiness=null; draft.preview=null; dirty=true; fill(); if(b.weightsText!=null)$('weights').value=b.weightsText; $('saveStatus').textContent='已恢复本机未保存输入，请重试保存'; $('retrySave').hidden=false; } catch {} }
@@ -361,7 +376,7 @@
   $('readiness').addEventListener('change',e=>{const key={issueSymbol:'symbol',issueCategory:'category',issuePhase:'phase'}[e.target.id]; if(key){issueFilters[key]=e.target.value; $('issueGroups').innerHTML=issuesHtml(draft.readiness?.issues || [],issueFilters);}});
   $('readiness').addEventListener('click',e=>{const retry=e.target.closest('[data-retry-source]'); if(retry){command('retry_source',{symbol:retry.dataset.retrySource}).catch(error); return;} const b=e.target.closest('[data-page]'); if(b && !b.disabled){coveragePage=Number(b.dataset.page); renderReadiness(); $('coverageDetails').open=true; $('readiness').querySelector('[data-page]')?.focus();} if(e.target.id==='exportDiagnostics'){const url=URL.createObjectURL(new Blob([JSON.stringify(draft.readiness,null,2)],{type:'application/json'})); const a=document.createElement('a'); a.href=url; a.download='data-diagnostics.json'; a.click(); URL.revokeObjectURL(url);}});
   action('check',()=>command('check')); action('prepare',()=>command('prepare')); action('run',()=>command('run'));
-  action('retryRun',()=>{requestKey=null;localStorage.removeItem('alphalab.wizard.submit.'+draft.id+'.'+draft.revision);return command('run');});
+  action('retryRun',()=>{clearSubmissionKey(draft,localStorage);return command('run');});
   action('recoverTask',async()=>{const p=await api('/drafts','POST',{source_task_id:task.id});await openDraft(p.draft.id);});
   action('cancelPrepare',async()=>{ const p=await api('/tasks/'+encodeURIComponent(task.id)+'/cancel','POST',{}); task=p.task; render(); poll(); });
   window.addEventListener('beforeunload',e=>{if(dirty){remember();e.preventDefault();e.returnValue='';}});

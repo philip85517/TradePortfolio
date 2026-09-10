@@ -105,6 +105,7 @@ class HorizonPerformance:
     open_positions: dict[str, float] | None = None
     known_assets_value: float | None = None
     unsettled_symbols: list[str] | None = None
+    execution_events: list[dict[str, Any]] | None = None
 
 
 @dataclass
@@ -194,6 +195,8 @@ class DuckDBMarketDataAdapter:
             tables = {row[0] for row in con.execute("SHOW TABLES").fetchall()}
             if "market_ohlcv" not in tables:
                 raise ValueError(f"行情数据库缺少 market_ohlcv 表: {self.db_path}")
+            price_columns = {row[1] for row in con.execute("PRAGMA table_info('market_ohlcv')").fetchall()}
+            price_source = 'source' if 'source' in price_columns else "'unknown' AS source"
             symbol_values = [str(symbol) for symbol in symbols or () if str(symbol).strip()]
             symbol_clause = ""
             symbol_params: list[Any] = []
@@ -203,7 +206,7 @@ class DuckDBMarketDataAdapter:
             data = con.execute(
                 f"""
                 SELECT market, symbol, timeframe, ts, trade_date, open, high, low,
-                       close, volume, amount, adjusted, adjustment
+                       close, volume, amount, adjusted, adjustment, {price_source}
                 FROM market_ohlcv
                 WHERE market = ? AND timeframe = '1d'
                   AND trade_date >= ? AND trade_date <= ?
@@ -434,7 +437,14 @@ class HistoricalResearchLab:
                 effective_spec,
             )
             portfolio = _annotate_portfolio(portfolio, portfolio_spec)
-            performance, nav = _evaluate_forward(portfolio, after, entry_date, horizons, effective_spec)
+            if effective_spec.wizard_metadata.get('delisting_policy') == 'announcement-replace-v1':
+                from .replacement_policy import evaluate_replacement
+                performance, nav = evaluate_replacement(
+                    portfolio, self.adapter.replacement_data,
+                    pd.to_datetime(effective_spec.wizard_metadata['research_sessions']), effective_spec,
+                    self.adapter.replacement_rank, self.adapter.replacement_raw_open)
+            else:
+                performance, nav = _evaluate_forward(portfolio, after, entry_date, horizons, effective_spec)
             benchmark = _build_benchmark(candidates, after, entry_date, effective_spec)
             benchmark_performance, benchmark_nav = _evaluate_forward(
                 benchmark,
@@ -1336,9 +1346,11 @@ def _build_portfolio(
     for _, row in selected.iterrows():
         part = after[(after["symbol"] == row["symbol"]) & (after["date"] == pd.Timestamp(entry_date))]
         paused = spec.suspension_policy == POLICY_VERSION and not part.empty and suspended_rows(part).iloc[0]
+        locked = spec.wizard_metadata.get('delisting_policy') == 'announcement-replace-v1' and not part.empty and part.iloc[0]['high'] == part.iloc[0]['low']
+        paused = paused or locked
         if paused:
             suspended_entries.add(str(row["symbol"]))
-            reasons[str(row["symbol"])] = "建仓日停牌，买入未成交，预定权重保留现金"
+            reasons[str(row["symbol"])] = "建仓日一字行情，保守不成交，预定权重保留现金" if locked else "建仓日停牌，买入未成交，预定权重保留现金"
         if not paused and (part.empty or pd.isna(part.iloc[0]["open"])):
             reasons[str(row["symbol"])] = "缺少建仓日开盘价"
             continue
@@ -2004,6 +2016,7 @@ def _performance_payload(performance: HorizonPerformance) -> dict[str, Any]:
         "open_positions": performance.open_positions,
         "known_assets_value": performance.known_assets_value,
         "unsettled_symbols": performance.unsettled_symbols,
+        "execution_events": performance.execution_events,
     }
 
 

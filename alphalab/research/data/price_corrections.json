@@ -1,0 +1,56 @@
+{
+  "schema_version": 1,
+  "purpose": "Auditable corrections to known provider errors. Preserve original databases; recompute affected research inputs. These are not historical trading signals.",
+  "corrections": [
+    {
+      "source_correction_id": "baostock-600321-hfq-20221024-factor-v1",
+      "symbol": "600321",
+      "source": "baostock",
+      "adjustment": "hfq",
+      "effective_from": "2022-10-24",
+      "effective_to": null,
+      "factor_numerator": "6.042542",
+      "factor_denominator": "7.855290",
+      "price_fields": ["open", "high", "low", "close"],
+      "method": "Remove the unsupported BaoStock back-adjustment factor step while preserving the preceding HFQ price scale; apply numerator / denominator to OHLC only.",
+      "verified_on": "2026-09-11",
+      "evidence": {
+        "annual_report": {
+          "source_url": "https://money.finance.sina.com.cn/corp/view/vCB_AllBulletinDetail.php?id=8875015&stockid=600321",
+          "title": "正源控股股份有限公司2022年年度报告",
+          "published_on": "2023-03-10",
+          "section": "财务报表附注53 股本；母公司所有者权益变动表",
+          "finding": "2022年期初期末股本均为1,510,550,000股，无发行、送股、公积金转股增减；母公司权益表利润分配栏目无金额。报告未支持2022-10-24的30%送转因子变化。"
+        },
+        "provider_query": {
+          "provider": "baostock",
+          "symbol": "sh.600321",
+          "history_method": "query_history_k_data_plus",
+          "history_start": "2022-10-19",
+          "history_end": "2022-10-26",
+          "frequency": "d",
+          "adjustflags_compared": ["1", "2", "3"],
+          "factor_method": "query_adjust_factor",
+          "factor_start": "2020-01-01",
+          "factor_end": "2025-12-03",
+          "factor_rows": [
+            {"dividOperateDate": "2020-07-06", "foreAdjustFactor": "1.000000", "backAdjustFactor": "6.042542"},
+            {"dividOperateDate": "2022-10-24", "foreAdjustFactor": "1.000000", "backAdjustFactor": "7.855290"}
+          ],
+          "previous_date": "2022-10-21",
+          "previous_hfq_close": "10.9370010200",
+          "current_date": "2022-10-24",
+          "current_hfq_close": "13.7467575000",
+          "current_hfq_preclose": "14.2180749000",
+          "previous_raw_and_qfq_close": "1.8100000000",
+          "current_raw_and_qfq_close": "1.7500000000",
+          "reported_pctChg": "-3.314900",
+          "original_hfq_return": 0.2569037412414905,
+          "verified_raw_and_qfq_return": -0.03314917127071826,
+          "original_initial_cache_reproduces_fresh_hfq": true,
+          "conclusion": "An approximately 30% HFQ factor step creates an unsupported positive return. Raw and QFQ agree with reported pctChg. Correcting the factor step restores that return without loosening the return-consistency tolerance."
+        }
+      }
+    }
+  ]
+}

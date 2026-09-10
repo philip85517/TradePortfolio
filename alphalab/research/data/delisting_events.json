@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "coverage": "fixed_source_bundle_not_complete",
+  "description": "Manually verified formal termination decisions only. Absence is not evidence that a stock has no delisting decision.",
+  "events": [
+    {
+      "symbol": "002336",
+      "event_type": "termination_decision",
+      "event_id": "cninfo:002336:2025-039",
+      "published_at": "2025-06-06",
+      "source_url": "https://static.cninfo.com.cn/finalpage/2025-06-06/1223789415.PDF",
+      "source_title": "人人乐连锁商业集团股份有限公司关于收到股票终止上市决定的公告",
+      "announcement_number": "2025-039",
+      "exchange_decision_number": "深证上〔2025〕546号",
+      "trading_resumes_on": "2025-06-13",
+      "delisted_date": "2025-07-04",
+      "evidence_note": "The PDF reports receipt of the formal decision on 2025-06-05; the dated public disclosure URL is 2025-06-06. Use 2025-06-06 with date-only precision conservatively, not the private receipt date or earlier risk-warning date. Page 1 states resumption and termination dates; the exact publication clock time has not been verified.",
+      "verified_on": "2026-09-11"
+    }
+  ]
+}

@@ -143,7 +143,7 @@ class ResearchWorkflow:
             portfolio = source['portfolio'] if source else {
                 'name': '我的股票组合', 'initial_cash': 100000, 'weighting': 'equal', 'weights': {},
                 'commission_rate': .0003, 'slippage_rate': .0005, 'max_single_weight': None,
-                'max_industry_weight': None, 'min_holdings': 1}
+                'max_industry_weight': None, 'min_holdings': 1, 'delisting_policy': 'retain-unsettled-v1'}
             draft = {'id': uuid4().hex, 'revision': 0, 'scope': deepcopy(scope),
                      'portfolio': deepcopy(portfolio), 'readiness': None, 'preview': None,
                      'task_id': None, 'created_at': _now(), 'updated_at': _now()}
@@ -164,7 +164,7 @@ class ResearchWorkflow:
                     raise WorkflowError('录入内容必须是对象')
             next_scope = {**draft['scope'], **(scope or {})}
             next_portfolio = {**draft['portfolio'], **(portfolio or {})}
-            if set(next_scope) - set(draft['scope']) or set(next_portfolio) - set(draft['portfolio']):
+            if set(next_scope) - set(draft['scope']) or set(next_portfolio) - (set(draft['portfolio']) | {'delisting_policy'}):
                 raise WorkflowError('存在不支持的配置字段')
             if next_scope != draft['scope']:
                 draft.update(readiness=None, preview=None, task_id=None)
@@ -399,8 +399,9 @@ class ResearchWorkflow:
                     if summary.get('failed') and not summary.get('resolved'):
                         status = 'FAILED'
                 else:
+                    run_options = {'progress': progress} if getattr(self.backend, 'supports_run_progress', False) else {}
                     result = self.backend.run(deepcopy(draft['scope']), deepcopy(draft['portfolio']),
-                                              deepcopy(draft['readiness']), self.runs_dir)
+                                              deepcopy(draft['readiness']), self.runs_dir, **run_options)
                     status = 'SUCCEEDED'
                 with self._lock:
                     if cancelled():

@@ -125,6 +125,13 @@ class FrozenBinding:
                 con.execute('CREATE TABLE frozen_trading_status AS SELECT * FROM frozen_states')
             con.register('frozen_selection', self.adapter.selection_bars)
             con.execute('CREATE TABLE frozen_selection_bars AS SELECT * FROM frozen_selection')
+            if hasattr(self.adapter, 'replacement_scoring_data'):
+                con.register('replacement_scoring', self.adapter.replacement_scoring_data)
+                con.execute('CREATE TABLE frozen_replacement_scoring AS SELECT * FROM replacement_scoring')
+                for name, values in [('replacement_rankings', self.adapter.replacement_rankings), ('replacement_anchors', self.adapter.replacement_anchors), ('replacement_normalization', self.adapter.replacement_normalization)]:
+                    if values:
+                        con.register(name, pd.DataFrame(values))
+                        con.execute(f'CREATE TABLE frozen_{name} AS SELECT * FROM {name}')
             if not self.adapter.history.empty:
                 con.register('frozen_history', self.adapter.history)
                 con.execute('CREATE TABLE frozen_universe_history AS SELECT * FROM frozen_history')
@@ -133,6 +140,7 @@ class FrozenBinding:
 
 class WizardResearchBackend:
     supports_inspection_progress = True
+    supports_run_progress = True
     def __init__(self, db_path='auto', cache_dir=None, *, calendar=None, provider=None, adapter=None):
         self.db_path = db_path
         self.cache_dir = Path(cache_dir or Path(__file__).resolve().parents[2] / '.alphalab/wizard-data')
@@ -295,6 +303,9 @@ class WizardResearchBackend:
             execution = json.loads(execution_file.read_text())
             values = data.symbol.map(lambda symbol: execution.get(f"{symbol}:{dates['entry_date']}"))
             data['execution_open'] = data['execution_open'].fillna(values) if 'execution_open' in data else values
+        if not data.empty:
+            from .price_corrections import apply_verified_price_corrections
+            data = apply_verified_price_corrections(data)
         return data, history, sources
 
     def _repair_source_identity(self):
@@ -411,6 +422,13 @@ class WizardResearchBackend:
         except Exception as exc:
             issue('SOURCE_UNAVAILABLE', f'读取历史数据失败：{exc}')
             return result, pd.DataFrame(), pd.DataFrame()
+        from .price_corrections import active_price_corrections
+        corrected = set(data.loc[data.get('source_correction_id', pd.Series(index=data.index, dtype=object)).notna(), 'symbol'])
+        result['price_corrections'] = active_price_corrections(corrected, dates['warmup_start_date'], dates['exit_date'])
+        for correction in result['price_corrections']:
+            result['issues'].append(make_issue('SOURCE_PRICE_CORRECTION', f"{correction['symbol']} 已应用有来源记录的复权修正",
+                  '原始来源数据与旧运行保留；本次使用修正后的行情重新评分',
+                  symbol=correction['symbol'], phase='prices', severity='warning', resolution='none', evidence=correction))
         checkpoint('校验历史身份和研究范围')
         strict = scope.get('quality_mode', 'strict') == 'strict'
         rule = scope.get('selection_mode') == 'rule'
@@ -583,10 +601,10 @@ class WizardResearchBackend:
     def inspect(self, scope, progress=None, cancelled=None):
         return self._inspect(scope, progress=progress, cancelled=cancelled)[0]
 
-    def _freeze(self, scope, readiness):
+    def _freeze(self, scope, readiness, portfolio=None, progress=None):
         if not readiness or readiness.get('status') != 'READY':
             raise ValueError('DATA_NOT_READY：请先检查并补齐数据')
-        current, data, history = self._inspect(scope)
+        current, data, history = self._inspect(scope, progress=progress)
         if current['status'] != 'READY' or current['data_identity'] != readiness.get('data_identity') or current['requirement_id'] != readiness.get('requirement_id'):
             raise ValueError('DATA_CHANGED：数据或范围已变化，请重新检查数据')
         # Inspection may prove delisting from a listing-history interval even when
@@ -594,11 +612,26 @@ class WizardResearchBackend:
         for event in current['issues']:
             if event['code'] == 'DELISTED_UNSETTLED':
                 data.loc[data.symbol.eq(event['symbol']), 'delisted_date'] = event['evidence']['delisted_date']
+        replacement = (portfolio or {}).get('delisting_policy') == 'announcement-replace-v1'
+        normalization = []
+        if replacement:
+            from .replacement_inputs import prepare_replacement_data
+            # The declared research universe is frozen at the original signal.
+            data = data[data.symbol.isin(current['symbols'])].copy()
+            data, normalization = prepare_replacement_data(data, current, cache_dir=self.cache_dir, progress=progress,
+                history=history, sessions=self._calendar_dates(parse_date(current['dates']['warmup_start_date']), parse_date(current['dates']['exit_date'])))
+            # Supplemental holding-period prices can introduce corrections that
+            # were absent from the initial signal-window readiness evidence.
+            from .price_corrections import active_price_corrections
+            corrected = set(data.loc[data.source_correction_id.notna(), 'symbol']) if 'source_correction_id' in data else set()
+            current['price_corrections'] = active_price_corrections(corrected, current['dates']['warmup_start_date'], current['dates']['exit_date'])
         data = prepare_view(data, current['dates']['signal_date'], current['dates']['entry_date'], current['dates']['exit_date'])
+        ranking_data = data.copy() if replacement else None
         selection_bars = data[data.date <= pd.Timestamp(current['dates']['signal_date'])].copy()
         if scope.get('selection_mode') == 'rule':
             selection_bars, _ = _apply_universe_mode(selection_bars, parse_date(current['dates']['signal_date']), 'point-in-time', history if not history.empty else None)
-            data = data[(data.date <= pd.Timestamp(current['dates']['signal_date'])) | data.symbol.isin(current['selected_symbols'])].copy()
+            if not replacement:
+                data = data[(data.date <= pd.Timestamp(current['dates']['signal_date'])) | data.symbol.isin(current['selected_symbols'])].copy()
         # Preserve adjusted returns while expressing shares in actual entry-day
         # cash-market units. Raw entry anchors are part of the data identity.
         if 'execution_open' in data:
@@ -613,11 +646,28 @@ class WizardResearchBackend:
                         raise ValueError('EXECUTION_PRICE_UNAVAILABLE：未复权开盘价无效')
                     scale = anchor / float(entry.iloc[0]['open'])
                     data.loc[part.index, ['open', 'high', 'low', 'close']] *= scale
-        return current, FrozenAdapter(data, history, selection_bars)
+        if replacement:
+            data = prepare_view(data, current['dates']['signal_date'])
+        frozen = FrozenAdapter(data, history, selection_bars)
+        frozen.replacement_normalization = normalization
+        if replacement:
+            from .replacement_inputs import attach_replacement_inputs
+            attach_replacement_inputs(frozen, ranking_data, history, self, scope)
+        return current, frozen
 
     def _spec(self, scope, portfolio, readiness):
         weighting = portfolio.get('weighting', 'equal')
         manual = scope.get('selection_mode') != 'rule'
+        delisting_policy = portfolio.get('delisting_policy', 'retain-unsettled-v1')
+        if delisting_policy not in {'retain-unsettled-v1', 'announcement-replace-v1'}:
+            raise ValueError('未知退市处理策略')
+        replacement = delisting_policy == 'announcement-replace-v1'
+        if replacement and manual:
+            raise ValueError('退市自动替补需要固定规则选股')
+        if replacement and portfolio.get('max_industry_weight') is not None:
+            raise ValueError('退市替补的行业权重约束需要完整换仓日历史行业证据，当前尚不支持')
+        from .delisting_events import load_events
+        events = load_events(self.cache_dir / 'delisting_events.json') if replacement else []
         if weighting not in ({'equal', 'custom'} if manual else {'equal', 'score'}):
             raise ValueError('当前选股方式不支持该权重方式')
         def number(key, default):
@@ -654,12 +704,13 @@ class WizardResearchBackend:
             portfolios=(PortfolioSpec('strategy', name=name),),
             wizard_metadata={'scope': scope, 'portfolio': portfolio, 'dates': readiness['dates'],
                              'adjustment_policy': 'uniform-hfq-v1', 'adjustment_summary': readiness.get('adjustment_summary'),
+                             'price_corrections': readiness.get('price_corrections', []),
                              'metadata_policy': 'required-fields-v1',
-                             'delisting_policy': 'retain-unsettled-v1',
+                             'delisting_policy': delisting_policy, 'delisting_events': events,
                              'research_sessions': [str(d) for d in self._calendar_dates(parse_date(readiness['dates']['entry_date']), parse_date(readiness['dates']['exit_date']))],
                              'data_identity': readiness['data_identity'], 'warnings': readiness['warnings'],
                              'benchmark_disabled_reason': '向导不以缺失未来数据的股票池构造基准，以避免幸存者偏差',
-                             'holding_method': 'buy_and_hold', 'price_basis': 'adjusted returns anchored to raw entry open when available'})
+                             'holding_method': 'announcement_exit_and_replace' if replacement else 'buy_and_hold', 'price_basis': 'adjusted returns anchored to raw entry open when available'})
 
     def _preview(self, scope, portfolio, current, adapter):
         spec = self._spec(scope, portfolio, current)
@@ -698,11 +749,13 @@ class WizardResearchBackend:
             'data_identity': current['data_identity'], 'portfolio': portfolio}), spec
 
     def preview(self, scope, portfolio, readiness):
-        current, adapter = self._freeze(scope, readiness)
+        current, adapter = self._freeze(scope, readiness, portfolio)
         return self._preview(scope, portfolio, current, adapter)[0]
 
-    def run(self, scope, portfolio, readiness, runs_dir):
-        current, adapter = self._freeze(scope, readiness)
+    def run(self, scope, portfolio, readiness, runs_dir, *, progress=None):
+        current, adapter = self._freeze(scope, readiness, portfolio, progress=progress)
+        if progress:
+            progress('行情已冻结，计算退市退出、替补与净值')
         preview, spec = self._preview(scope, portfolio, current, adapter)
         # All execution reads use this copied frame and copied metadata. Provider writes
         # after this point cannot change the run's validated snapshot.
@@ -955,7 +1008,11 @@ frame.to_json(sys.argv[4],orient='table',date_format='iso')
 from pathlib import Path
 from etf_strategy.src.market_data_providers import BaoStockProvider,FetchRequest
 frame=BaoStockProvider().fetch_ohlcv(FetchRequest('a_share',sys.argv[1],'1d',pd.Timestamp(sys.argv[2]),pd.Timestamp(sys.argv[2]),options={'adjust':'none'}))
-assert not frame.empty,'No raw entry price'
+assert len(frame)==1,'Expected exactly one raw entry bar'
+assert str(frame.iloc[0]['symbol'])==sys.argv[1],'Raw symbol mismatch'
+col='date' if 'date' in frame else 'ts'
+assert pd.Timestamp(frame.iloc[0][col]).date()==pd.Timestamp(sys.argv[2]).date(),'Raw date mismatch'
+assert frame.iloc[0]['adjustment']=='none','Raw basis mismatch'
 Path(sys.argv[3]).write_text(json.dumps(float(frame.iloc[0]['open'])))
 """
         temporary = self.cache_dir / 'raw-entry.pending'

@@ -16,11 +16,18 @@
     return complete.every((item) => item.liquidation_status === "LIQUIDATED") ? "已全部清算" : "已完成";
   }
 
+  function executionAuditHtml(events) {
+    if (!events?.length) return '';
+    const labels={SELL:'卖出',BUY:'买入替补',SELECT:'选择替补',DEFER_SELL:'卖出顺延',DEFER_BUY:'买入顺延',CASH:'保留现金',CANCEL_BUY:'取消替补',UNSETTLED:'未结算',OPEN_POSITION:'未平仓'};
+    const reasons={listing_metadata_delisting:'已到历史退市边界',termination_decision_delisting:'退市前未能成交，保留未结算股份',termination_decision:'正式退市决定触发退出',terminal:'研究结束日退出',lot_budget:'卖出净回款不足一手，保留现金',no_candidate:'没有合格替补，保留现金',confirmed_suspension:'来源确认停牌',one_price_bar:'一字行情，保守不成交',before_trading_resumes:'尚未到公告明确的复牌日',terminal_or_ineligible:'研究结束或候选已不合格'};
+    const esc=value=>String(value ?? '').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+    return '<details><summary>退出与替补交易明细</summary>'+events.map(e=>`<p>${esc(e.date)} · ${esc(e.symbol)} · ${esc(labels[e.action] || e.action)} · ${esc(e.shares ?? '—')} 股 · 模拟价格 ${esc(e.price == null ? '—' : Number(e.price).toLocaleString('zh-CN',{maximumFractionDigits:4}))}<br>佣金 ${esc(e.commission == null ? '—' : Number(e.commission).toFixed(2))} · 滑点 ${esc(e.slippage == null ? '—' : Number(e.slippage).toFixed(2))}<br>排名截止：${esc(e.rank_cutoff || '—')} · ${esc(reasons[e.reason] || e.reason || '')}<br>公告来源：${esc(e.source_url || '—')}</p>`).join('')+'</details>';
+  }
   function performanceCardHtml(result, title, initialCash) {
-    if(result.liquidation_status === "UNSETTLED_DELISTING") return `<div class="performance-card"><span>${escapeHtml(title)}</span><strong>完整收益不可确定</strong><small>退市股份未结算：${(result.unsettled_symbols || []).map(escapeHtml).join('、')}</small><small>已知资产 ${number(result.known_assets_value)} · 其中现金 ${number(result.realized_cash)}</small><small>已知资产不包含未结算股份价值，不代表完整期末权益。</small></div>`;
+    if(result.liquidation_status === "UNSETTLED_DELISTING") return `<div class="performance-card"><span>${escapeHtml(title)}</span><strong>完整收益不可确定</strong><small>退市股份未结算：${(result.unsettled_symbols || []).map(escapeHtml).join('、')}</small><small>已知资产 ${number(result.known_assets_value)} · 其中现金 ${number(result.realized_cash)}</small><small>已知资产不包含未结算股份价值，不代表完整期末权益。</small>${executionAuditHtml(result.execution_events)}</div>`;
     const open = result.liquidation_status === "OPEN_POSITION";
     const accounting = result.liquidation_status ? `<small>${open ? "尚未清算" : "已全部清算"} · 已实现盈亏 ${number(result.realized_profit_loss)} · 未实现盈亏 ${number(result.unrealized_profit_loss)}</small><small>现金 ${number(result.realized_cash)} · 未实现持仓估值 ${number(result.unrealized_holdings_value)}</small>${open ? `<small>未退出持仓 ${Object.keys(result.open_positions || {}).map(escapeHtml).join("、") || "--"}</small>` : ""}` : "";
-    return `<div class="performance-card"><span>${escapeHtml(title)} · ${open ? "估值收益" : "组合收益"}</span><strong>${percent(result.total_return)}</strong><small>${initialCash == null ? "" : `本金 ${number(initialCash, 0)} · `}${open ? "估值盈亏" : "盈亏"} ${number(result.profit_loss)} · 最大回撤 ${percent(result.max_drawdown)}</small><small>成本前 ${percent(result.gross_return)} · 胜率 ${percent(result.holding_win_rate)}</small>${accounting}</div>`;
+    return `<div class="performance-card"><span>${escapeHtml(title)} · ${open ? "估值收益" : "组合收益"}</span><strong>${percent(result.total_return)}</strong><small>${initialCash == null ? "" : `本金 ${number(initialCash, 0)} · `}${open ? "估值盈亏" : "盈亏"} ${number(result.profit_loss)} · 最大回撤 ${percent(result.max_drawdown)}</small><small>成本前 ${percent(result.gross_return)} · 胜率 ${percent(result.holding_win_rate)}</small>${accounting}${executionAuditHtml(result.execution_events)}</div>`;
   }
 
   function staleValuationHtml(rows) {
@@ -29,7 +36,7 @@
     return `<details class="muted"><summary>历史价格估值：${stale.length} 条记录（不代表当日可成交）</summary>${stale.map((row) => `<div>${escapeHtml(row.date)} · ${escapeHtml(row.horizon)} 日周期 · ${escapeHtml(row.stale_symbols || "--")} · 估值已陈旧 ${number(row.max_valuation_stale_days, 0)} 天</div>`).join("")}</details>`;
   }
 
-  if (typeof module !== "undefined") module.exports = {reviewLabels, portfolioStatus, performanceCardHtml, staleValuationHtml};
+  if (typeof module !== "undefined") module.exports = {reviewLabels, portfolioStatus, performanceCardHtml, staleValuationHtml, executionAuditHtml};
   if (typeof document === "undefined") return;
 
   const state = {
@@ -211,6 +218,9 @@
     if (state.portfolioIds.includes(state.portfolioId)) $("portfolioSelect").value = state.portfolioId;
     panel.hidden = false;
     const holdings = payload.holdings || [];
+    const hasEvents = Object.values(payload.performance || {}).some(r=>r.execution_events?.length);
+    const holdingsTitle = document.querySelector('.portfolio-holdings-title');
+    if (holdingsTitle) holdingsTitle.textContent = hasEvents ? '初始建仓持仓（后续变更见退出与替补交易明细）' : '当前运行持仓';
     const performance = payload.performance || {};
     const complete = Object.values(performance).filter((item) => item.status === "COMPLETE");
     const horizonText = (payload.horizons || []).join(" / ");
@@ -248,6 +258,7 @@
     const groups = new Map();
     const addRows = (source, sourceRows) => sourceRows.forEach((row) => {
       const horizon = Number(row.horizon);
+      if (row[field] == null) return;
       const value = Number(row[field]);
       if (!Number.isFinite(horizon) || !Number.isFinite(value)) return;
       const key = `${source}:${horizon}`;

@@ -1,0 +1,154 @@
+{
+  "symbol": "000936",
+  "generated_at": "2026-09-10T16:53:25.771710+00:00",
+  "operation": "Read-only local DuckDB queries and BaoStock network fetches; no cache or production writes",
+  "local_sources": {
+    "hfq": "/Users/zhoulin/.codex/worktrees/1deb/TradePortfolio/alphalab/reports/workbench/cache/market_data.duckdb",
+    "qfq": "/Users/zhoulin/Documents/alphaLab/etf_strategy/data/processed/stock_market_data_2021.duckdb",
+    "table": "market_ohlcv",
+    "filter": "symbol=000936, timeframe=1d, trade_date 2022-07-08 through 2022-12-30",
+    "hfq_fetched_at": "2026-09-08T00:26:39.018832",
+    "qfq_fetched_at": "2026-06-25T16:30:02.245213"
+  },
+  "overlap": {
+    "rows": 120,
+    "ratio_min": 4.582552308385164,
+    "ratio_max": 4.582555646716713,
+    "ratio_relative_range": 7.284873853041773e-07,
+    "segments": [
+      {
+        "start": "2022-07-08",
+        "end": "2022-07-12",
+        "close_hfq_over_qfq": 4.582555646716712
+      },
+      {
+        "start": "2022-07-13",
+        "end": "2022-12-30",
+        "close_hfq_over_qfq": 4.582552308385165
+      }
+    ],
+    "ohlc_within_day_ratio_spread_at_segment_starts": 8.881784197001252e-16,
+    "volume_equal": true,
+    "amount_equal": true,
+    "zero_volume_days": 0,
+    "strict_price_rounding_interval": {
+      "lower": 4.58255563279955,
+      "upper": 4.58255231842856,
+      "empty": true
+    }
+  },
+  "fresh_hfq_verification": {
+    "call": "baostock.query_history_k_data_plus('sz.000936','date,open,high,low,close,adjustflag',start_date='2022-07-08',end_date='2022-12-30',frequency='d',adjustflag='1')",
+    "error_code": "0",
+    "rows": 120,
+    "max_absolute_difference_from_cached_hfq": {
+      "open": 3.552713678800501e-15,
+      "high": 0.0,
+      "low": 3.552713678800501e-15,
+      "close": 3.552713678800501e-15
+    }
+  },
+  "factor_query": {
+    "call": "baostock.query_adjust_factor('sz.000936',start_date='2021-01-01',end_date='2026-09-11')",
+    "error_code": "0",
+    "fields": [
+      "code",
+      "dividOperateDate",
+      "foreAdjustFactor",
+      "backAdjustFactor",
+      "adjustFactor"
+    ],
+    "rows": [
+      [
+        "sz.000936",
+        "2021-07-09",
+        "0.972567",
+        "4.473917",
+        "4.473917"
+      ],
+      [
+        "sz.000936",
+        "2022-07-13",
+        "0.982121",
+        "4.517865",
+        "4.517865"
+      ],
+      [
+        "sz.000936",
+        "2023-07-05",
+        "0.983724",
+        "4.525241",
+        "4.525241"
+      ],
+      [
+        "sz.000936",
+        "2024-07-04",
+        "0.987194",
+        "4.541203",
+        "4.541203"
+      ],
+      [
+        "sz.000936",
+        "2024-09-26",
+        "0.990682",
+        "4.557250",
+        "4.557250"
+      ],
+      [
+        "sz.000936",
+        "2025-06-26",
+        "0.993609",
+        "4.570713",
+        "4.570713"
+      ],
+      [
+        "sz.000936",
+        "2025-09-25",
+        "0.996183",
+        "4.582554",
+        "4.582554"
+      ],
+      [
+        "sz.000936",
+        "2026-07-07",
+        "1.000000",
+        "4.600112",
+        "4.600112"
+      ]
+    ],
+    "observed_factor_decimal_places": 6,
+    "inferred_old_qfq_factors_from_cached_ratios": [
+      0.9762930000000002,
+      0.9858839999999999
+    ],
+    "inference_note": "backAdjustFactor divided by observed cached hfq/qfq ratio implies old qfq factors exactly 0.976293 and 0.985884 within floating-point precision. Current foreAdjustFactor differs because qfq snapshot dates differ."
+  },
+  "fresh_target_window": {
+    "call": "baostock.query_history_k_data_plus('sz.000936','date,open,high,low,close,volume,amount,adjustflag,tradestatus',start_date='2025-01-01',end_date='2025-06-13',frequency='d',adjustflag='1')",
+    "error_code": "0",
+    "rows": 106,
+    "first_date": "2025-01-02",
+    "last_date": "2025-06-13",
+    "adjustflag": "1",
+    "tradestatus_1_rows": 106,
+    "hfq_qfq_ratio_min": 4.58255486798099,
+    "hfq_qfq_ratio_max": 4.582554867980992,
+    "first_ohlc": [
+      36.1389925,
+      36.458,
+      33.4957875,
+      33.90594
+    ],
+    "last_ohlc": [
+      32.4020475,
+      33.4957875,
+      31.991895,
+      32.3109025
+    ]
+  },
+  "conclusion": "Cached hfq reproduces the provider response. Cross-date ratio changes coincide with dividend factor regimes; price tick rounding alone omits source factor precision. No evidence here of additive-price transform or halted/zero-price contamination.",
+  "tolerance_assessment": {
+    "proposed_relative_tolerance": 1e-05,
+    "interpretation": "Empirical provider-factor rounding allowance, not mathematical proof of an exact constant conversion. For 000936 this exceeds observed 7.3e-7 segment variation and causes at most the declared approximation error. Retain source identity, max residual and policy version; do not imply this establishes future ratios for unobserved corporate action regimes. Direct hfq retrieval is available and removes approximation for the observed target window."
+  }
+}

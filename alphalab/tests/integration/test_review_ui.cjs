@@ -56,3 +56,15 @@ test('unsettled delisting never displays liquidated or complete portfolio return
  assert.match(h.portfolioStatus([r]),/未结算/);
  const html=h.performanceCardHtml(r,'组合',100000);assert.match(html,/完整收益不可确定/);assert.match(html,/002336/);assert.doesNotMatch(html,/已全部清算/);
 });
+test('review shows event trades with source and rank cutoff', () => {
+ const context={module:{exports:{}}};vm.runInNewContext(fs.readFileSync('alphalab/research/static/app.js','utf8'),context);
+ const html=context.module.exports.executionAuditHtml([{action:'BUY',date:'2025-06-16',symbol:'000001',shares:100,rank_cutoff:'2025-06-13',source_url:'https://example.com/a'}]);
+ assert.match(html,/2025-06-13/);assert.match(html,/000001/);assert.match(html,/买入/);
+});
+test('execution details explain cash and suspension in Chinese with readable amounts',()=>{
+ const {executionAuditHtml}=reviewExports();
+ const html=executionAuditHtml([{action:'SELL',reason:'termination_decision',price:0.6096950000000001,commission:0.09145425000000001,slippage:0.15250000000000002},{action:'DEFER_SELL',reason:'before_trading_resumes'},{action:'CASH',reason:'lot_budget'}]);
+ assert.match(html,/正式退市决定触发退出/);assert.match(html,/尚未到公告明确的复牌日/);assert.match(html,/卖出净回款不足一手，保留现金/);
+ assert.match(html,/模拟价格 0.6097/);assert.match(html,/佣金 0.09 · 滑点 0.15/);
+ assert.doesNotMatch(html,/termination_decision|lot_budget|0000000001/);
+});

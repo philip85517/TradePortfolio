@@ -3,6 +3,41 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const vm = require('node:vm');
 function helpers() { const context = { module: { exports: {} } }; vm.runInNewContext(fs.existsSync('alphalab/research/static/wizard.js') ? fs.readFileSync('alphalab/research/static/wizard.js', 'utf8') : '', context); return context.module.exports; }
+function submissionStorage() {
+ const values=new Map();
+ return {getItem:key=>values.get(key) ?? null,setItem:(key,value)=>values.set(key,value),removeItem:key=>values.delete(key)};
+}
+test('run submission follows frozen data after recheck without reusing failed legacy request',()=>{
+ const h=helpers(),storage=submissionStorage();let sequence=0;
+ const createKey=()=>`request-${++sequence}`;
+ const draft={id:'draft',revision:7,readiness:{data_identity:'before-repair',requirement_id:'scope-a'}};
+ storage.setItem('alphalab.wizard.submit.draft.7','failed-old-request');
+ const old=h.submissionKey(draft,storage,createKey);
+ assert.notEqual(old,'failed-old-request');
+ assert.equal(h.submissionKey(draft,storage,createKey),old);
+ draft.readiness={data_identity:'after-repair',requirement_id:'scope-a'};
+ const repaired=h.submissionKey(draft,storage,createKey);
+ assert.notEqual(repaired,old);
+ assert.equal(h.submissionKey(draft,storage,createKey),repaired);
+ // Reloading the script preserves idempotency for this exact frozen data.
+ assert.equal(helpers().submissionKey(JSON.parse(JSON.stringify(draft)),storage,createKey),repaired);
+ draft.readiness={data_identity:'after-repair',requirement_id:'scope-b'};
+ assert.notEqual(h.submissionKey(draft,storage,createKey),repaired);
+});
+test('retry replaces only current readiness submission and leaves other frozen identities idempotent',()=>{
+ const h=helpers(),storage=submissionStorage();let sequence=0;
+ const createKey=()=>`request-${++sequence}`;
+ const previous={id:'draft',revision:7,readiness:{data_identity:'old',requirement_id:'scope'}};
+ const current={...previous,readiness:{data_identity:'new',requirement_id:'scope'}};
+ const old=h.submissionKey(previous,storage,createKey),first=h.submissionKey(current,storage,createKey);
+ h.clearSubmissionKey(current,storage);
+ const retried=h.submissionKey(current,storage,createKey);
+ assert.notEqual(retried,first);
+ assert.equal(h.submissionKey(current,storage,createKey),retried);
+ assert.equal(h.submissionKey(previous,storage,createKey),old);
+ assert.notEqual(h.submissionKey({...current,revision:8},storage,createKey),retried);
+ assert.notEqual(h.submissionKey({...current,id:'another'},storage,createKey),retried);
+});
 test('scope validates reversed dates and duplicate selections before checking data', () => {
  const h=helpers(); assert.equal(typeof h.validateScope,'function');
  assert.match(h.validateScope({start_date:'2025-01-01',end_date:'2021-01-01'}), /结束/);
@@ -163,4 +198,10 @@ test('reopening a finished check restores preview instead of returning to data',
  assert.equal(h.restoredStep(d,{kind:'check',status:'SUCCEEDED'}),4);
  assert.equal(h.restoredStep(d,{kind:'check',status:'RUNNING'}),2);
  assert.equal(h.restoredStep(d,{kind:'run',status:'SUCCEEDED'}),5);
+});
+test('replacement policy exposes opt-in and an auditable transaction table', () => {
+ const html=fs.readFileSync('alphalab/research/static/wizard.html','utf8');
+ assert.match(html,/announcement-replace-v1/);
+ const h=helpers();const rendered=h.executionHtml([{date:'2025-06-13',symbol:'002336',action:'SELL',shares:500,price:0.4,net_proceeds:199,source_url:'https://example.com/a'}]);
+ assert.match(rendered,/002336/);assert.match(rendered,/2025-06-13/);assert.match(rendered,/卖出/);
 });

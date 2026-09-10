@@ -1,0 +1,98 @@
+{
+  "run_id": "research-20260910T182300883182Z-f5a894775d",
+  "draft_id": "bbb045486b4e4d9cbe353b95454355db",
+  "status": "COMPLETE",
+  "initial_cash": 100000.0,
+  "ending_equity": 62158.38008203717,
+  "profit_loss": -37841.61991796283,
+  "total_return": -0.3784161991796283,
+  "max_drawdown": -0.5242825712289458,
+  "nav_rows": 707,
+  "unsettled_symbols": [],
+  "execution_events": [
+    {
+      "action": "DEFER_SELL",
+      "symbol": "002336",
+      "date": "2025-06-09",
+      "reason": "before_trading_resumes",
+      "event_id": "cninfo:002336:2025-039"
+    },
+    {
+      "action": "DEFER_SELL",
+      "symbol": "002336",
+      "date": "2025-06-10",
+      "reason": "before_trading_resumes",
+      "event_id": "cninfo:002336:2025-039"
+    },
+    {
+      "action": "DEFER_SELL",
+      "symbol": "002336",
+      "date": "2025-06-11",
+      "reason": "before_trading_resumes",
+      "event_id": "cninfo:002336:2025-039"
+    },
+    {
+      "action": "DEFER_SELL",
+      "symbol": "002336",
+      "date": "2025-06-12",
+      "reason": "before_trading_resumes",
+      "event_id": "cninfo:002336:2025-039"
+    },
+    {
+      "action": "SELL",
+      "symbol": "002336",
+      "date": "2025-06-13",
+      "reason": "termination_decision",
+      "shares": 500.0,
+      "price": 0.6096950000000001,
+      "net_proceeds": 304.75604575000006,
+      "commission": 0.09145425000000001,
+      "slippage": 0.15250000000000002,
+      "price_basis": "adjusted_total_return_anchored_at_raw_entry",
+      "raw_entry_open": 19.07,
+      "adjusted_entry_open": 19.07,
+      "event_id": "cninfo:002336:2025-039",
+      "source_url": "https://static.cninfo.com.cn/finalpage/2025-06-06/1223789415.PDF"
+    },
+    {
+      "action": "SELECT",
+      "symbol": "300204",
+      "date": "2025-06-13",
+      "rank_cutoff": "2025-06-13",
+      "budget": 304.75604575000006,
+      "event_id": "cninfo:002336:2025-039"
+    },
+    {
+      "action": "CASH",
+      "symbol": "300204",
+      "date": "2025-06-16",
+      "reason": "lot_budget",
+      "rank_cutoff": "2025-06-13"
+    }
+  ],
+  "ranking": [
+    [
+      "2025-06-13",
+      2647
+    ]
+  ],
+  "normalization": [
+    [
+      "verified-overlap-qfq-to-hfq-v1",
+      3724
+    ],
+    [
+      "direct-provider-hfq-v1",
+      1171
+    ]
+  ],
+  "sha256": {
+    "manifest.json": "9fd9eb9f8f4b2fe43df053100aef0ef2d449bbbad4f3263a22eb55199d7d14e5",
+    "nav.csv": "3e036ae7d90cba6aa6097b1ff1515127a352a7729e421a523ce830a426fadef0"
+  },
+  "tests": {
+    "python": 236,
+    "javascript": 32
+  },
+  "note": "Research-model cash flows; sales use adjusted total-return prices anchored at raw initial entry. Source corrections and announcement evidence are frozen in manifest."
+}
