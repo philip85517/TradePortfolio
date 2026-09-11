@@ -172,6 +172,44 @@ python scripts/update_stock_data.py \
   --all
 ```
 
+### 2018—当前批量回追与覆盖审计
+
+`update_stock_data.py` 支持按已存行情的前置/尾部日期缺口回追，不需要手动导入 CSV。默认优先选取数据库中已有日线的目标标的；首次空库时才回退到发现的 active universe。
+
+先审计当前研究目标池的覆盖范围：
+
+```bash
+python scripts/update_stock_data.py \
+  --db data/processed/market_data.duckdb \
+  --markets a_share \
+  --timeframes 1d \
+  --start-date 2018-01-01 \
+  --end-date 2026-08-29 \
+  --coverage-mode edges \
+  --coverage-only \
+  --coverage-report data/processed/a_share_coverage.csv
+```
+
+执行可恢复的批量回追；`--max-symbols` 与 `--offset` 可将目标池拆成多批，重复执行不会产生重复主键：
+
+```bash
+python scripts/update_stock_data.py \
+  --db data/processed/market_data.duckdb \
+  --markets a_share \
+  --timeframes 1d \
+  --start-date 2018-01-01 \
+  --end-date 2026-08-29 \
+  --coverage-mode edges \
+  --target existing-price \
+  --provider baostock \
+  --chunk-days 0 \
+  --retries 2 \
+  --all \
+  --coverage-report data/processed/a_share_coverage.csv
+```
+
+日常更新使用 `--incremental --coverage-mode none`；provider 请求失败会自动重试，所有请求和写入区间会追加记录到 `market_update_log`。
+
 Run a deterministic local example without network:
 
 ```bash

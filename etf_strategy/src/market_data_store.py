@@ -90,6 +90,8 @@ def initialize_market_database(con) -> None:
         )
         """
     )
+    con.execute("ALTER TABLE market_update_log ADD COLUMN IF NOT EXISTS status VARCHAR DEFAULT 'success'")
+    con.execute("ALTER TABLE market_update_log ADD COLUMN IF NOT EXISTS attempts INTEGER DEFAULT 1")
     con.execute(
         """
         CREATE TABLE IF NOT EXISTS market_universe (
@@ -315,6 +317,74 @@ def upsert_bars(
         "end_ts": data["ts"].max(),
         "db_path": str(Path(db_path)),
     }
+
+
+def record_update_attempt(
+    db_path: str | Path,
+    market: str,
+    symbol: str,
+    timeframe: str,
+    source: str,
+    start_ts: pd.Timestamp,
+    end_ts: pd.Timestamp,
+    *,
+    rows_written: int = 0,
+    note: str | None = None,
+    status: str = "success",
+    attempts: int = 1,
+) -> None:
+    """Persist an update attempt, including empty or failed provider responses."""
+
+    with connect_market_db(db_path) as con:
+        _record_update_attempt(
+            con,
+            market,
+            symbol,
+            timeframe,
+            source,
+            start_ts,
+            end_ts,
+            rows_written=rows_written,
+            note=note,
+            status=status,
+            attempts=attempts,
+        )
+
+
+def _record_update_attempt(
+    con,
+    market: str,
+    symbol: str,
+    timeframe: str,
+    source: str,
+    start_ts: pd.Timestamp,
+    end_ts: pd.Timestamp,
+    *,
+    rows_written: int,
+    note: str | None,
+    status: str,
+    attempts: int,
+) -> None:
+    con.execute(
+        """
+        INSERT INTO market_update_log (
+            market, symbol, timeframe, source, start_ts, end_ts, rows_written, note, status, attempts
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        [
+            market,
+            symbol,
+            timeframe,
+            source,
+            pd.Timestamp(start_ts).to_pydatetime(),
+            pd.Timestamp(end_ts).to_pydatetime(),
+            rows_written,
+            note,
+            status,
+            attempts,
+        ],
+    )
 
 
 def load_bars(

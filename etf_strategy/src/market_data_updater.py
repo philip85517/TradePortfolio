@@ -9,7 +9,7 @@ import pandas as pd
 import yaml
 
 from .market_data_providers import FetchRequest, MarketDataError, provider_for
-from .market_data_store import TIMEFRAMES, latest_bar_ts, market_database_summary, upsert_bars
+from .market_data_store import TIMEFRAMES, latest_bar_ts, market_database_summary, record_update_attempt, upsert_bars
 
 
 @dataclass(frozen=True)
@@ -81,8 +81,15 @@ def update_market_data(
     provider_name: str = "auto",
     chunk_days: int | None = None,
     sleep_seconds: float = 0.0,
+    retries: int = 2,
+    retry_delay_seconds: float = 1.0,
 ) -> dict:
     import time
+
+    if retries < 0:
+        raise ValueError("retries must be non-negative")
+    if retry_delay_seconds < 0:
+        raise ValueError("retry_delay_seconds must be non-negative")
 
     total_rows = 0
     completed = 0
@@ -92,8 +99,25 @@ def update_market_data(
         try:
             chunks = _request_chunks(request, chunk_days)
             for chunk in chunks:
-                data = provider.fetch_ohlcv(chunk)
+                data = _fetch_with_retries(
+                    provider,
+                    chunk,
+                    retries=retries,
+                    retry_delay_seconds=retry_delay_seconds,
+                )
                 if data.empty:
+                    record_update_attempt(
+                        db_path,
+                        request.market,
+                        request.symbol,
+                        request.timeframe,
+                        provider.name,
+                        chunk.start,
+                        chunk.end,
+                        note="empty provider response after successful query",
+                        status="empty",
+                        attempts=1,
+                    )
                     continue
                 result = upsert_bars(
                     data,
@@ -106,6 +130,18 @@ def update_market_data(
                     time.sleep(sleep_seconds)
             completed += 1
         except Exception as exc:  # noqa: BLE001 - batch updates should continue across symbols.
+            record_update_attempt(
+                db_path,
+                request.market,
+                request.symbol,
+                request.timeframe,
+                provider.name,
+                request.start,
+                request.end,
+                note=str(exc),
+                status="failed",
+                attempts=retries + 1,
+            )
             failures.append(
                 {
                     "market": request.market,
@@ -122,6 +158,23 @@ def update_market_data(
         "rows_written": total_rows,
         "db_summary": summary,
     }
+
+
+def _fetch_with_retries(provider, request: FetchRequest, retries: int, retry_delay_seconds: float) -> pd.DataFrame:
+    import time
+
+    last_error: Exception | None = None
+    for attempt in range(retries + 1):
+        try:
+            return provider.fetch_ohlcv(request)
+        except Exception as exc:  # noqa: BLE001 - provider errors are retried at the batch boundary.
+            last_error = exc
+            if attempt == retries:
+                break
+            if retry_delay_seconds:
+                time.sleep(retry_delay_seconds * (2**attempt))
+    assert last_error is not None
+    raise last_error
 
 
 def _request_chunks(request: FetchRequest, chunk_days: int | None) -> list[FetchRequest]:
