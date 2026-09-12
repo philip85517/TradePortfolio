@@ -345,6 +345,30 @@ test('controller uses a guarded shared time range, callbacks, bounded event grou
   assert.equal(library.charts.every((chart) => chart.removed), true);
 });
 
+test('grouped marker click returns the full period context for an accessible chooser', () => {
+  const h = charts();
+  const document = fakeDocument();
+  const container = fakeElement();
+  container.ownerDocument = document;
+  const library = fakeChartApi([]);
+  const selected = [];
+  const controller = h.create(container, {
+    data: navData(),
+    initialCash: 1000,
+    library,
+    onSelectEvent: (event) => selected.push(event),
+  });
+  const group = controller.getEventGroups()[0];
+  assert.equal(group.events.length, 2);
+  library.charts[0].emitClick({marker: {id: group.id}, time: group.time});
+  assert.equal(selected.length, 1);
+  assert.equal(selected[0].type, 'group');
+  assert.equal(selected[0].groupId, group.id);
+  assert.deepEqual(selected[0].events.map((event) => event.id), group.eventIds);
+  assert.deepEqual(selected[0].events.map((event) => event.date), ['2025-01-02', '2025-01-02']);
+  controller.destroy();
+});
+
 test('weekly main candles and daily drawdown synchronize by factual dates and apply all/bounded ranges', () => {
   const h = charts();
   const document = fakeDocument();

@@ -29,7 +29,7 @@ function sampleReview(overrides = {}) {
       { id: 'initial-1', date: '2023-01-03', action: 'BUY', filled: true, symbol: '000001', name: '平安银行', shares: 100, price: 10, reason_code: 'initial_entry', source_kind: 'derived_frozen_entry' },
       { id: 'defer-1', date: '2025-06-09', action: 'DEFER_SELL', filled: false, symbol: '002336', reason_code: 'before_trading_resumes' },
       { id: 'defer-2', date: '2025-06-10', action: 'DEFER_SELL', filled: false, symbol: '002336', reason_code: 'before_trading_resumes' },
-      { id: 'sell-1', date: '2025-06-13', action: 'SELL', filled: true, symbol: '002336', name: '人乐退', shares: 500, price: 0.609695, commission: 0.09145425, slippage: 0.1525, net_cash: 304.75604575, chain_id: 'chain-1', reason_code: 'termination_decision', source_url: 'https://example.com/event.pdf', price_basis_label: '研究总回报价格' },
+      { id: 'sell-1', event_id: 'cninfo:002336:2025-039', date: '2025-06-13', action: 'SELL', filled: true, symbol: '002336', name: '人乐退', shares: 500, price: 0.609695, commission: 0.09145425, slippage: 0.1525, net_cash: 304.75604575, chain_id: 'chain-1', reason_code: 'termination_decision', source_url: 'https://example.com/event.pdf', price_basis_label: '研究总回报价格' },
       { id: 'select-1', date: '2025-06-13', action: 'SELECT', filled: false, symbol: '300204', chain_id: 'chain-1', reason_code: 'replacement_selection', rank_cutoff: '2025-06-13', budget: 304.75604575 },
       { id: 'cash-1', date: '2025-06-16', action: 'CASH', filled: false, symbol: '300204', chain_id: 'chain-1', reason_code: 'lot_budget', budget: 304.75604575 },
       { id: 'terminal-1', date: '2025-12-03', action: 'SELL', filled: true, symbol: '000001', shares: 100, price: 8.2, reason_code: 'terminal' },
@@ -56,6 +56,52 @@ function sampleReview(overrides = {}) {
     quality_mode: 'strict',
     horizons: [706],
     by_horizon: { '706': { ...horizon, ...overrides } },
+  };
+}
+
+function observableContainer() {
+  const regions = new Map();
+  const listeners = new Map();
+  const container = {
+    ownerDocument: null,
+    _html: '',
+    get innerHTML() { return this._html; },
+    set innerHTML(value) { this._html = String(value ?? ''); },
+    addEventListener(type, handler) { listeners.set(type, handler); },
+    dispatch(type, target) { listeners.get(type)?.({type, target, preventDefault() {}}); },
+    querySelector(selector) {
+      const region = selector.match(/^\[data-review-region="([^"]+)"\]$/)?.[1];
+      if (region) {
+        if (!regions.has(region)) regions.set(region, {innerHTML: '', textContent: ''});
+        return regions.get(region);
+      }
+      if (selector === '[data-review-chart-note]') {
+        if (!regions.has('chart-note')) regions.set('chart-note', {innerHTML: '', textContent: ''});
+        return regions.get('chart-note');
+      }
+      if (selector === '[data-review-group-event]') return {focus() {}};
+      return null;
+    },
+    querySelectorAll() { return []; },
+    region(name) { return regions.get(name)?.innerHTML || ''; },
+  };
+  return container;
+}
+
+function targetFor(attributes = {}) {
+  return {
+    closest(selector) {
+      if (selector === '[data-review-group-event]' && attributes.groupEvent) return this;
+      if (selector === '[data-review-action]' && attributes.action) return this;
+      if (selector === '[data-review-event]' && attributes.event) return this;
+      return null;
+    },
+    getAttribute(name) {
+      if (name === 'data-review-group-event') return attributes.groupEvent || null;
+      if (name === 'data-review-action') return attributes.action || null;
+      if (name === 'data-review-event') return attributes.event || null;
+      return null;
+    },
   };
 }
 
@@ -157,5 +203,54 @@ test('detail payload replaces summary fallback chart when identity is unchanged'
   assert.equal(controller.getModel().data.nav.length, 3);
   assert.equal(creates, 2);
   assert.equal(destroys, 1);
+  controller.destroy();
+});
+
+test('DOM review lifecycle exposes evidence chronology, selected side detail, grouped chooser, and money units', () => {
+  const container = observableContainer();
+  let chartOptions;
+  const charts = {
+    create(_host, options) {
+      chartOptions = options;
+      return {update() {}, destroy() {}, getState() { return {range: 'all'}; }};
+    },
+  };
+  const controller = ui.create(container, {data: sampleReview(), charts});
+  assert.match(container.region('metrics'), /盈亏金额（元）/);
+  controller.setEvidence({spec: {wizard_metadata: {delisting_events: [{
+    event_id: 'cninfo:002336:2025-039', published_at: '2025-06-06', trading_resumes_on: '2025-06-13',
+    delisted_date: '2025-07-04', source_title: '正式退市决定公告', evidence_note: '首个可成交日来自冻结公告。',
+  }]}}});
+  controller.selectEvent('sell-1');
+  assert.match(container.region('details'), /data-review-selected-detail/);
+  assert.match(container.region('details'), /公告日期/);
+  assert.match(container.region('details'), /2025-06-06/);
+  assert.match(container.region('details'), /公告复牌日/);
+  assert.doesNotMatch(container.region('details'), /portfolio-review-event-body/);
+
+  const firstGroup = chartOptions.onSelectEvent;
+  firstGroup({type: 'group', groupId: 'event-group-test', period: '1D', date: '2025-06-13', events: [
+    sampleReview().by_horizon['706'].events.find((event) => event.id === 'sell-1'),
+    sampleReview().by_horizon['706'].events.find((event) => event.id === 'select-1'),
+  ]});
+  assert.equal(controller.getState().eventGroup.events.length, 2);
+  assert.match(container.region('details'), /选择要查看的单个事件/);
+  container.dispatch('click', targetFor({groupEvent: 'select-1'}));
+  assert.equal(controller.getState().selectedEventId, 'select-1');
+  assert.equal(controller.getState().eventGroup, null);
+  controller.destroy();
+});
+
+test('no-model failure is observable and retry invokes the owner callback', () => {
+  const container = observableContainer();
+  const retries = [];
+  const controller = ui.create(container, {charts: null, onRetry: (identity) => retries.push(identity)});
+  assert.match(container.innerHTML, /正在读取冻结组合结果/);
+  controller.setError(new Error('冻结结果接口不可用'));
+  assert.match(container.innerHTML, /role="alert"/);
+  assert.match(container.innerHTML, /冻结结果接口不可用/);
+  container.dispatch('click', targetFor({action: 'retry-results'}));
+  assert.equal(retries.length, 1);
+  assert.match(container.innerHTML, /正在读取冻结组合结果/);
   controller.destroy();
 });

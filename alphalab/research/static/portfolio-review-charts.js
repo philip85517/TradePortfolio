@@ -542,6 +542,7 @@
         time: group.time || group.date,
         sourceDate: group.date,
         id: group.id,
+        groupId: group.id,
         eventId: group.events?.length === 1 ? group.events[0].id : null,
         eventIds: [...(group.eventIds || [])],
         position: group.hasFill ? (group.fills && !group.decisions ? "belowBar" : "aboveBar") : "aboveBar",
@@ -1223,14 +1224,34 @@
     }
 
     function handleClick(parameter) {
-      const direct = eventIdFromParameter(parameter);
-      if (direct && eventById(direct)) {
-        selectEvent(direct, true);
+      const groups = currentGroups();
+      const groupCandidates = [
+        parameter?.groupId,
+        parameter?.marker?.groupId,
+        parameter?.marker?.id,
+        parameter?.hoveredObjectId,
+      ].filter(Boolean).map(String);
+      let group = groups.find((item) => groupCandidates.includes(String(item.id))) || null;
+      if (!group) {
+        const date = asDate(parameter?.time || parameter?.date || parameter?.marker?.time);
+        if (date) {
+          group = groups.find((item) => item.time === date || item.date === date || (state.period !== "1D" && item.periodKey === periodKeyForDate(date, state.period))) || null;
+        }
+      }
+      if (group) {
+        if (group.events.length > 1) {
+          safeCallback(config.onSelectEvent, {
+            type: "group",
+            groupId: group.id,
+            date: group.date,
+            period: group.period,
+            events: group.events.map((event) => ({...event})),
+          });
+        } else if (group.events[0]) selectEvent(group.events[0].id, true);
         return;
       }
-      const groupId = direct || parameter?.groupId;
-      const group = currentGroups().find((item) => item.id === groupId);
-      if (group?.events?.[0]) selectEvent(group.events[0].id, true);
+      const direct = eventIdFromParameter(parameter);
+      if (direct && eventById(direct)) selectEvent(direct, true);
     }
 
     function handleHover(parameter) {

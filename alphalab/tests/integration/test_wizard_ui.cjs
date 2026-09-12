@@ -2,10 +2,64 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const vm = require('node:vm');
+const portfolioReviewUI = require('../../research/static/portfolio-review.js');
 function helpers() { const context = { module: { exports: {} } }; vm.runInNewContext(fs.existsSync('alphalab/research/static/wizard.js') ? fs.readFileSync('alphalab/research/static/wizard.js', 'utf8') : '', context); return context.module.exports; }
 function submissionStorage() {
  const values=new Map();
  return {getItem:key=>values.get(key) ?? null,setItem:(key,value)=>values.set(key,value),removeItem:key=>values.delete(key)};
+}
+
+class WizardNode {
+ constructor(id='') { this.id=id; this.value=''; this.textContent=''; this.innerHTML=''; this.hidden=false; this.disabled=false; this.checked=false; this.dataset={}; this.open=false; this.listeners={}; this.classList={toggle(){},add(){},remove(){}}; }
+ addEventListener(type, handler) { (this.listeners[type] ||= []).push(handler); }
+ querySelector() { return new WizardNode(); }
+ querySelectorAll() { return []; }
+ focus() {}
+}
+
+class ReviewNode extends WizardNode {
+ constructor(documentObject) { super('results'); this.ownerDocument=documentObject; this.regions=new Map(); }
+ querySelector(selector) {
+   const region=selector.match(/^\[data-review-region="([^"]+)"\]$/)?.[1];
+   if (region) { if (!this.regions.has(region)) this.regions.set(region,new WizardNode()); return this.regions.get(region); }
+   if (selector==='[data-review-chart-note]') { if (!this.regions.has('chart-note')) this.regions.set('chart-note',new WizardNode()); return this.regions.get('chart-note'); }
+   return null;
+ }
+ querySelectorAll() { return []; }
+}
+
+function wizardDocument() {
+ const documentObject={};
+ const ids=['error','saveStatus','retrySave','loadServer','home','editor','steps','step1','step2','step3','step4','step5','scopeForm','market','startDate','endDate','selectionMode','ruleVersion','topN','manualScope','ruleScope','symbols','delistingPolicy','portfolioName','initialCash','weighting','minHoldings','commission','slippage','maxSingle','maxIndustry','weights','customWeights','preview','backData','toConfirm','taskConnection','refreshTask','readiness','exploreChoice','explorationHelp','acceptExploratory','applyExploratory','prepareTask','editScope','check','prepare','cancelPrepare','toPortfolio','dataGate','confirmation','backPortfolio','run','runTask','retryRun','recoverTask','copyDraft','returnConfig'];
+ const nodes=new Map(ids.map((id)=>[id,new WizardNode(id)]));
+ const results=new ReviewNode(documentObject); nodes.set('results',results);
+ documentObject.getElementById=(id)=>{ if(!nodes.has(id)) nodes.set(id,new WizardNode(id)); return nodes.get(id); };
+ documentObject.querySelector=()=>new WizardNode();
+ documentObject.querySelectorAll=()=>[];
+ documentObject.createElement=()=>new WizardNode();
+ documentObject.body=new WizardNode('body');
+ documentObject._nodes=nodes;
+ return documentObject;
+}
+
+function reviewResult(runId='run-1', portfolioId='strategy') {
+ return {run_id:runId,portfolio_id:portfolioId,name:'测试组合',initial_cash:1000,horizons:[706],summary:{horizon:706,status:'COMPLETE',total_return:0.1,profit_loss:100,ending_equity:1100,initial_cash:1000},nav:[{date:'2025-01-02',equity:1000,unit_nav:1},{date:'2025-01-03',equity:1100,unit_nav:1.1}],events:[],scope:{requested_start_date:'2025-01-01',requested_end_date:'2025-01-03',actual_date_range:['2025-01-02','2025-01-03']},capabilities:{daily_nav:true}};
+}
+
+function lifecycleContext(fetchImpl) {
+ const documentObject=wizardDocument();
+ const storage=submissionStorage();
+ const draft={id:'draft-1',revision:1,scope:{market:'a_share',start_date:'2025-01-01',end_date:'2025-12-03',selection_mode:'manual',symbols:['000001'],rule_version:'fixed_v0',top_n:10,quality_mode:'strict'},portfolio:{name:'测试组合',initial_cash:100000,weighting:'equal',weights:{},commission_rate:0.0003,slippage_rate:0.001,max_single_weight:1,max_industry_weight:1,min_holdings:1},readiness:{status:'READY',dates:{signal_date:'2025-01-01',entry_date:'2025-01-02',exit_date:'2025-12-03',horizon:706},coverage:[],issues:[],repair_plan:{executable_count:0}},preview:{holdings:[]},task_id:'task-1'};
+ const runResult=reviewResult();
+ const reviewOptions=[];
+ const controllers=[];
+ const windowObject={addEventListener(){},PortfolioReviewUI:{create(container,options){
+   const controller=portfolioReviewUI.create(container,{...options,charts:null});
+   reviewOptions.push(options); controllers.push(controller); return controller;
+ }}};
+ const context={document:documentObject,window:windowObject,location:{search:'?draft=draft-1'},history:{replaceState(){}},localStorage:storage,fetch:fetchImpl,URLSearchParams,URL,Blob,AbortController,crypto:{randomUUID(){return 'request-id'}},setInterval(){return 1},setTimeout(){return 1},clearTimeout(){},console,Promise,Date,Math,JSON,Number,String,Object,Array,Set,Map,encodeURIComponent,decodeURIComponent};
+ context.globalThis=context;
+ return {context,documentObject,draft,runResult,reviewOptions,controllers};
 }
 test('run submission follows frozen data after recheck without reusing failed legacy request',()=>{
  const h=helpers(),storage=submissionStorage();let sequence=0;
@@ -199,6 +253,58 @@ test('reopening a finished check restores preview instead of returning to data',
  assert.equal(h.restoredStep(d,{kind:'check',status:'RUNNING'}),2);
  assert.equal(h.restoredStep(d,{kind:'run',status:'SUCCEEDED'}),5);
 });
+
+test('original wizard renders observable review states, drops stale fetches, and retries the same frozen identity', async () => {
+ const pending=[]; const calls=[]; let portfolioCount=0;
+ const draft={id:'draft-1',revision:1,scope:{market:'a_share',start_date:'2025-01-01',end_date:'2025-12-03',selection_mode:'manual',symbols:['000001'],rule_version:'fixed_v0',top_n:10,quality_mode:'strict'},portfolio:{name:'测试组合',initial_cash:100000,weighting:'equal',weights:{},commission_rate:0.0003,slippage_rate:0.001,max_single_weight:1,max_industry_weight:1,min_holdings:1},readiness:{status:'READY',dates:{signal_date:'2025-01-01',entry_date:'2025-01-02',exit_date:'2025-12-03',horizon:706},coverage:[],issues:[],repair_plan:{executable_count:0}},preview:{holdings:[]},task_id:'task-1'};
+ const result={run_id:'run-1',portfolio_id:'strategy',name:'测试组合',initial_cash:100000,horizons:[706],summary:{horizon:706,status:'COMPLETE'}};
+ const detail=(portfolioId)=>({run_id:'run-1',portfolio_id:portfolioId,name:'测试组合',initial_cash:1000,horizons:[706],summary:{horizon:706,status:'COMPLETE',total_return:0.1,profit_loss:100,ending_equity:1100,initial_cash:1000},nav:[{date:'2025-01-02',equity:1000,unit_nav:1},{date:'2025-01-03',equity:1100,unit_nav:1.1}],events:[],scope:{requested_start_date:'2025-01-01',requested_end_date:'2025-01-03',actual_date_range:['2025-01-02','2025-01-03']},capabilities:{daily_nav:true}});
+ const response=(value,status=200)=>({ok:status>=200 && status<300,status,json:async()=>value});
+ const fetchImpl=async (url)=>{
+   calls.push(url);
+   if(url==='/api/wizard/drafts/draft-1') return response({draft:JSON.parse(JSON.stringify(draft))});
+   if(url==='/api/wizard/tasks/task-1') return response({task:{id:'task-1',kind:'run',status:'SUCCEEDED',result}});
+   if(url.startsWith('/research/review/run-1/api/portfolio')) { portfolioCount+=1; return new Promise((resolve,reject)=>pending.push({resolve,reject,index:portfolioCount})); }
+   if(url==='/research/review/run-1/api/summary') return response({spec:{wizard_metadata:{delisting_events:[]}}});
+   throw new Error(`unexpected fetch ${url}`);
+ };
+ const harness=lifecycleContext(fetchImpl);
+ harness.draft=draft; harness.runResult=result;
+ vm.runInNewContext(fs.readFileSync('alphalab/research/static/wizard.js','utf8'),harness.context);
+ const flush=async()=>{for(let i=0;i<4;i++) await new Promise((resolve)=>setImmediate(resolve));};
+ await flush();
+ assert.equal(portfolioCount,1);
+ assert.equal(harness.reviewOptions[0].portfolioId,'strategy');
+ assert.match(harness.documentObject._nodes.get('results').regions.get('state').innerHTML,/正在重新读取冻结结果/);
+
+ harness.reviewOptions[0].onSelectionChange({runId:'run-1',portfolioId:'alternate',horizon:'706'});
+ await flush();
+ assert.equal(portfolioCount,2);
+ assert.equal(harness.reviewOptions[1].portfolioId,'alternate');
+ pending[0].resolve(response(detail('strategy')));
+ pending[1].resolve(response(detail('alternate')));
+ await flush();
+ assert.equal(harness.controllers[0].getModel().data.nav.length,0,'stale owner must not receive late detail');
+ assert.equal(harness.controllers[1].getModel().data.nav.length,2);
+ assert.match(harness.documentObject._nodes.get('results').regions.get('chart').innerHTML,/组合日终净值回退图/);
+
+ harness.reviewOptions[1].onRetry({runId:'run-1',portfolioId:'alternate',horizon:'706'});
+ await flush();
+ assert.equal(portfolioCount,3,'same identity retry must issue a new request');
+ pending[2].resolve(response({error:'temporary failure'},503));
+ await flush();
+ assert.equal(harness.controllers[2].getState().status,'fallback');
+ assert.match(harness.documentObject._nodes.get('results').regions.get('state').innerHTML,/详细投影暂不可用/);
+ harness.reviewOptions[2].onRetry({runId:'run-1',portfolioId:'alternate',horizon:'706'});
+ await flush();
+ assert.equal(portfolioCount,4);
+ pending[3].resolve(response(detail('alternate')));
+ await flush();
+ assert.equal(harness.controllers[3].getState().status,'ready');
+ assert.equal(harness.controllers[3].getModel().portfolioId,'alternate');
+ assert.equal(calls.filter((url)=>url.includes('/api/summary')).length,2);
+});
+
 test('replacement policy exposes opt-in and an auditable transaction table', () => {
  const html=fs.readFileSync('alphalab/research/static/wizard.html','utf8');
  assert.match(html,/announcement-replace-v1/);

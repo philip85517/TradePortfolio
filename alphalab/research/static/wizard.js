@@ -185,15 +185,15 @@
     if(reviewAbort) { try { reviewAbort.abort(); } catch {} reviewAbort=null; }
     if(reviewController) { try { reviewController.destroy(); } catch {} reviewController=null; }
   }
-  function loadPortfolioReview(result, requestedIdentity) {
+  function loadPortfolioReview(result, requestedIdentity, forceReload = false) {
     if(!result?.run_id || typeof window.PortfolioReviewUI==='undefined') { $('results').innerHTML=legacyResultHtml(result); return; }
     const base=reviewIdentity(result,requestedIdentity?.portfolioId,requestedIdentity?.horizon);
     const ownerKey=JSON.stringify(base);
-    if(reviewController && reviewOwnerKey===ownerKey && reviewSourceResult?.run_id===result.run_id) return;
+    if(!forceReload && reviewController && reviewOwnerKey===ownerKey && reviewSourceResult?.run_id===result.run_id) return;
     clearPortfolioReview();
     reviewOwnerKey=ownerKey; reviewSourceResult=result;
     reviewController=window.PortfolioReviewUI.create($('results'),{data:result,fallback:true,portfolioId:base.portfolioId,horizon:base.horizon,
-      onRetry:(identity)=>loadPortfolioReview(result,identity),
+      onRetry:(identity)=>loadPortfolioReview(result,identity,true),
       onSelectionChange:(identity)=>loadPortfolioReview(result,identity)});
     const requestToken=++reviewEpoch, ownerDraft=draft?.id, ownerTask=task?.id, controller=reviewController;
     reviewAbort=typeof AbortController==='function'?new AbortController():null;

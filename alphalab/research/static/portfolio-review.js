@@ -383,7 +383,8 @@
     let display = present ? (type === "percent" ? formatPercent(value) : type === "money" ? formatMoney(value) : formatNumber(value, type === "shares" ? 0 : 2)) : formatMissing(value, reason);
     if (type === "percent" && present && finite(value) !== null && finite(value) > 0) display = `+${display}`;
     const signClass = present && finite(value) !== null ? (finite(value) > 0 ? "positive" : finite(value) < 0 ? "negative" : "neutral") : "unknown";
-    return `<div class="portfolio-review-metric ${escapeHtml(extraClass)}"><span>${escapeHtml(label)}</span><strong class="${signClass}">${escapeHtml(display)}</strong></div>`;
+    const visibleLabel = type === "money" && !String(label).includes("元") ? `${label}（元）` : label;
+    return `<div class="portfolio-review-metric ${escapeHtml(extraClass)}"><span>${escapeHtml(visibleLabel)}</span><strong class="${signClass}">${escapeHtml(display)}</strong></div>`;
   }
 
   function compactMetricGrid(data) {
@@ -410,15 +411,48 @@
 
   function summaryFactsHtml(data) {
     const facts = factualSummary(data);
-    const rows = facts.lines.length ? facts.lines.map((line) => `<li>${escapeHtml(line)}</li>`).join("") : `<li>冻结事件未提供可生成事实摘要的记录。</li>`;
-    return `<section class="portfolio-review-facts" aria-labelledby="portfolioReviewFactsTitle"><div class="portfolio-review-section-title"><div><span class="portfolio-review-kicker">FACTS FROM FROZEN EVENTS</span><h3 id="portfolioReviewFactsTitle">结果摘要</h3></div><span class="portfolio-review-count">${escapeHtml(facts.headline)}</span></div><ul>${rows}</ul></section>`;
+    const lines = facts.lines.length ? facts.lines : ["冻结事件未提供可生成事实摘要的记录。"];
+    const preview = lines.slice(0, 2).map((line) => `<li>${escapeHtml(line)}</li>`).join("");
+    const extra = lines.length > 2 ? `<details class="portfolio-review-facts-more"><summary>展开其余 ${lines.length - 2} 条事实</summary><ul>${lines.slice(2).map((line) => `<li>${escapeHtml(line)}</li>`).join("")}</ul></details>` : "";
+    return `<section class="portfolio-review-facts" aria-labelledby="portfolioReviewFactsTitle"><div class="portfolio-review-section-title"><div><span class="portfolio-review-kicker">FACTS FROM FROZEN EVENTS</span><h3 id="portfolioReviewFactsTitle">结果摘要</h3></div><span class="portfolio-review-count">${escapeHtml(facts.headline)}</span></div><ul class="portfolio-review-facts-preview">${preview}</ul>${extra}</section>`;
+  }
+
+  function buildEvidenceIndex(payload) {
+    const index = Object.create(null);
+    const sources = [
+      payload,
+      payload?.spec,
+      payload?.wizard_metadata,
+      payload?.spec?.wizard_metadata,
+      payload?.spec?.wizard_metadata?.delisting,
+    ];
+    for (const source of sources) {
+      const records = Array.isArray(source?.delisting_events) ? source.delisting_events : [];
+      for (const record of records) {
+        if (!record || typeof record !== "object") continue;
+        const keys = [
+          record.event_id,
+          record.trigger_event_id,
+          record.chain_trigger_event_id,
+          record.id,
+          record.announcement_number,
+          record.symbol && record.announcement_number ? `${record.symbol}:${record.announcement_number}` : null,
+        ].filter((key) => key !== null && key !== undefined && String(key).trim());
+        for (const key of keys) if (!index[String(key)]) index[String(key)] = {...record};
+      }
+    }
+    return index;
   }
 
   function eventDetailParts(event, evidence) {
     const parts = [];
     const notFilled = !eventIsFill(event);
-    const sourceDate = dateText(event.source_date || event.announcement_date || evidence?.published_at);
-    if (sourceDate && sourceDate !== dateText(event.date)) parts.push(["来源 / 公告日期", sourceDate]);
+    const publishedDate = dateText(evidence?.published_at || evidence?.announcement_date || event.source_date || event.announcement_date);
+    if (publishedDate) parts.push(["公告日期", publishedDate]);
+    const executableDate = dateText(evidence?.trading_resumes_on || evidence?.first_executable_date || evidence?.resumption_date);
+    if (executableDate) parts.push(["公告复牌日", executableDate]);
+    const delistedDate = dateText(evidence?.delisted_date || evidence?.termination_date);
+    if (delistedDate) parts.push(["终止上市日", delistedDate]);
     parts.push(["实际日期", dateText(event.date) || "未知（事件日期未保存）"]);
     if (event.shares !== null && event.shares !== undefined) parts.push(["股数", formatNumber(event.shares, 0)]);
     else parts.push(["股数", notFilled ? "不适用（未形成成交）" : "未知（冻结成交证据未提供）"]);
@@ -443,8 +477,9 @@
   }
 
   function eventEvidence(event, evidenceById) {
-    const key = event?.event_id || event?.chain_id || event?.id;
-    if (key && evidenceById && typeof evidenceById === "object") return evidenceById[key] || null;
+    if (!event || !evidenceById || typeof evidenceById !== "object") return null;
+    const keys = [event.event_id, event.trigger_event_id, event.chain_trigger_event_id, event.chain_id, event.id].filter(Boolean);
+    for (const key of keys) if (evidenceById[String(key)]) return evidenceById[String(key)];
     return null;
   }
 
@@ -454,8 +489,7 @@
     const terminal = fill && action === "SELL" && ["terminal", "terminal_sell"].includes(eventReason(event));
     const classNames = ["portfolio-review-event-row", fill ? "is-fill" : "is-decision", terminal ? "is-terminal" : ""];
     const status = fill ? "真实成交" : action === "INITIAL_NOT_FILLED" ? "未成交" : "决策 / 过程";
-    const detail = eventDetailParts(event, eventEvidence(event, evidenceById)).map(([key, value]) => `<div><dt>${escapeHtml(key)}</dt><dd>${escapeHtml(value)}</dd></div>`).join("");
-    return `<article class="${classNames.join(" ")} ${selectedId === String(event.id) ? "is-selected" : ""}" data-event-row="${escapeHtml(event.id)}"><button class="portfolio-review-event-select" type="button" data-review-event="${escapeHtml(event.id)}" aria-pressed="${selectedId === String(event.id) ? "true" : "false"}"><span class="event-symbol"><b>${escapeHtml(event.symbol || "未标明标的")}</b><small>${escapeHtml(event.name || "")}</small></span><span class="event-action"><i aria-hidden="true"></i>${escapeHtml(actionLabel(event))}<small>${escapeHtml(status)}</small></span><time datetime="${escapeHtml(dateText(event.date) || "")}">${escapeHtml(dateText(event.date) || "未知日期")}</time></button><div class="portfolio-review-event-body"><p>${escapeHtml(reasonLabel(event))}</p><dl>${detail}</dl><p>${sourceLinkHtml(event, eventEvidence(event, evidenceById))}</p></div></article>`;
+    return `<article class="${classNames.join(" ")} ${selectedId === String(event.id) ? "is-selected" : ""}" data-event-row="${escapeHtml(event.id)}"><button class="portfolio-review-event-select" type="button" data-review-event="${escapeHtml(event.id)}" aria-pressed="${selectedId === String(event.id) ? "true" : "false"}"><span class="event-symbol"><b>${escapeHtml(event.symbol || "未标明标的")}</b><small>${escapeHtml(event.name || "")}</small></span><span class="event-action"><i aria-hidden="true"></i>${escapeHtml(actionLabel(event))}<small>${escapeHtml(status)}</small></span><span class="event-reason">${escapeHtml(reasonLabel(event))}</span><time datetime="${escapeHtml(dateText(event.date) || "")}">${escapeHtml(dateText(event.date) || "未知日期")}</time></button></article>`;
   }
 
   function groupedEventHtml(events, selectedId, evidenceById) {
@@ -509,6 +543,24 @@
     return `<div class="portfolio-review-event-filters" role="search" aria-label="交易事件筛选"><label>股票<input data-review-filter="symbol" type="search" value="${escapeHtml(filters.symbol || "")}" placeholder="代码或名称"></label><label>操作<select data-review-filter="action"><option value="">全部操作</option>${actions.map((value) => `<option value="${escapeHtml(value)}" ${String(filters.action || "").toUpperCase() === value ? "selected" : ""}>${escapeHtml(ACTION_LABELS[value] || value)}</option>`).join("")}</select></label><label>原因<select data-review-filter="reason"><option value="">全部原因</option>${reasons.map((value) => `<option value="${escapeHtml(value)}" ${String(filters.reason || "") === value ? "selected" : ""}>${escapeHtml(REASON_LABELS[value] || value)}</option>`).join("")}</select></label><label>起始日期<input data-review-filter="dateStart" type="date" value="${escapeHtml(filters.dateStart || "")}"></label><label>结束日期<input data-review-filter="dateEnd" type="date" value="${escapeHtml(filters.dateEnd || "")}"></label><button type="button" data-review-action="clear-filters">清除筛选</button></div>`;
   }
 
+  function selectedEventDetailHtml(model, state) {
+    const event = model?.data?.events?.find((candidate) => String(candidate.id) === String(state.selectedEventId)) || null;
+    if (!event) return `<div class="portfolio-review-selected-detail-empty"><span class="portfolio-review-kicker">SELECTED EVENT</span><h4>选择一个事件查看冻结明细</h4><p>从左侧事件列表或图表标记选择事件；日期、成交与来源始终按冻结记录显示。</p></div>`;
+    const evidence = eventEvidence(event, state.evidenceById);
+    const detail = eventDetailParts(event, evidence).map(([key, value]) => `<div><dt>${escapeHtml(key)}</dt><dd>${escapeHtml(value)}</dd></div>`).join("");
+    const note = evidence?.evidence_note ? `<p class="portfolio-review-evidence-note"><strong>证据说明</strong>${escapeHtml(evidence.evidence_note)}</p>` : "";
+    const sourceTitle = evidence?.source_title ? `<p class="portfolio-review-source-title">${escapeHtml(evidence.source_title)}</p>` : "";
+    return `<div class="portfolio-review-selected-detail-content"><span class="portfolio-review-kicker">SELECTED EVENT</span><h4 id="portfolioReviewSelectedEventTitle">${escapeHtml(event.symbol || "未标明标的")} · ${escapeHtml(actionLabel(event))}</h4><p class="portfolio-review-selected-event-meta">${escapeHtml(dateText(event.date) || "未知日期")} · ${escapeHtml(reasonLabel(event))}</p><dl>${detail}</dl><p class="portfolio-review-source-link">${sourceLinkHtml(event, evidence)}</p>${sourceTitle}${note}</div>`;
+  }
+
+  function eventGroupChooserHtml(state) {
+    const group = state.eventGroup;
+    const events = Array.isArray(group?.events) ? group.events : [];
+    if (!events.length) return selectedEventDetailHtml(null, state);
+    const buttons = events.map((event) => `<button type="button" class="portfolio-review-group-event" data-review-group-event="${escapeHtml(event.id)}"><span><b>${escapeHtml(event.symbol || "未标明标的")}</b><small>${escapeHtml(event.name || "")}</small></span><span>${escapeHtml(actionLabel(event))} · ${escapeHtml(reasonLabel(event))}</span><time datetime="${escapeHtml(dateText(event.date) || "")}">${escapeHtml(dateText(event.date) || "未知日期")}</time></button>`).join("");
+    return `<div class="portfolio-review-event-group-chooser" role="region" aria-labelledby="portfolioReviewEventGroupTitle"><span class="portfolio-review-kicker">EVENT GROUP</span><h4 id="portfolioReviewEventGroupTitle">${escapeHtml(group.period === "1D" ? (group.date || "同一日期") : `${group.period || "周期"} · ${group.date || "同一周期"}`)} 有 ${events.length} 个冻结事件</h4><p>请选择要查看的单个事件；每个事件的实际日期会保留。</p><div class="portfolio-review-group-options" role="list">${buttons}</div><button type="button" class="portfolio-review-group-cancel" data-review-action="clear-event-group">返回事件列表</button></div>`;
+  }
+
   function eventTabHtml(model, state) {
     const data = model.data;
     const view = filteredEventsView(data, state.filters, state.eventLimit);
@@ -518,7 +570,8 @@
     const rows = view.visible.length ? groupedEventHtml(view.visible, selectedId, state.evidenceById) : `<p class="portfolio-review-empty">没有符合当前筛选条件的事件。请清除筛选后查看冻结记录。</p>`;
     const more = view.omitted > 0 ? `<button class="portfolio-review-more" type="button" data-review-action="more-events">显示更多事件（还剩 ${view.omitted} 条，控制器仍保留全部记录）</button>` : "";
     const chainRows = (data.chains || []).map((chain) => `<details class="portfolio-review-chain"><summary><span>${escapeHtml(chain.start_date || "未知")} → ${escapeHtml(chain.end_date || "未知")}</span><strong>${escapeHtml(chain.summary || "冻结事件链")}</strong></summary><p>触发 → 约束 → 执行 → 替补选择 → 结果</p><p>${escapeHtml(chain.summary || "冻结证据未提供链摘要")}</p><div class="chain-events">${(chain.event_ids || []).map((id) => data.events.find((event) => String(event.id) === String(id))).filter(Boolean).map((event) => eventRowHtml(event, selectedId, state.evidenceById)).join("")}</div></details>`).join("");
-    return `<section class="portfolio-review-tab-panel" data-review-tab-panel="events"><div class="portfolio-review-section-title"><div><span class="portfolio-review-kicker">EVENT TRACE</span><h3>交易与调仓</h3></div><div class="portfolio-review-tab-actions"><span>${escapeHtml(scopeLabel)}</span><button type="button" data-review-export="events-all">下载全部事件 CSV</button><button type="button" data-review-export="events-filtered">下载当前筛选 CSV</button></div></div>${notice}${eventFiltersHtml(data, state.filters)}<div class="portfolio-review-legend" aria-label="事件类型图例"><span class="legend-fill">● 真实成交</span><span class="legend-decision">■ 决策 / 顺延</span><span class="legend-terminal">◆ 期末清算</span></div><div class="portfolio-review-event-list">${rows}</div>${more}${chainRows ? `<div class="portfolio-review-chain-list"><h4>调仓链</h4>${chainRows}</div>` : ""}</section>`;
+    const selectedDetail = state.eventGroup ? eventGroupChooserHtml(state) : selectedEventDetailHtml(model, state);
+    return `<section class="portfolio-review-tab-panel" data-review-tab-panel="events"><div class="portfolio-review-section-title"><div><span class="portfolio-review-kicker">EVENT TRACE</span><h3>交易与调仓</h3></div><div class="portfolio-review-tab-actions"><span>${escapeHtml(scopeLabel)}</span><button type="button" data-review-export="events-all">下载全部事件 CSV</button><button type="button" data-review-export="events-filtered">下载当前筛选 CSV</button></div></div>${notice}${eventFiltersHtml(data, state.filters)}<div class="portfolio-review-legend" aria-label="事件类型图例"><span class="legend-fill">● 真实成交</span><span class="legend-decision">■ 决策 / 顺延</span><span class="legend-terminal">◆ 期末清算</span></div><div class="portfolio-review-event-layout"><div class="portfolio-review-event-list-column"><div class="portfolio-review-event-list">${rows}</div>${more}${chainRows ? `<div class="portfolio-review-chain-list"><h4>调仓链</h4>${chainRows}</div>` : ""}</div><aside class="portfolio-review-selected-detail" data-review-selected-detail aria-label="选中事件详情">${selectedDetail}</aside></div></section>`;
   }
 
   function holdingsTable(title, rows, emptyText) {
@@ -627,8 +680,8 @@
     const state = {
       status: config.data ? (config.fallback ? "fallback" : "ready") : "loading",
       metric: "unit_nav", period: "1D", range: "all", tab: "events", benchmark: false,
-      selectedEventId: null, filters: {symbol: "", action: "", reason: "", dateStart: "", dateEnd: ""},
-      eventLimit: 160, filterNotice: "", errorMessage: "", evidence: null, evidenceError: "", hover: null,
+      selectedEventId: null, eventGroup: null, filters: {symbol: "", action: "", reason: "", dateStart: "", dateEnd: ""},
+      eventLimit: 160, filterNotice: "", errorMessage: "", evidence: null, evidenceById: Object.create(null), evidenceError: "", hover: null,
       renderCount: 0,
     };
     let model = config.data ? normalizeReviewPayload(config.data, {portfolioId: config.portfolioId, horizon: config.horizon, fallback: config.fallback}) : null;
@@ -673,7 +726,13 @@
             data,
             initialCash: model.data.initial_cash ?? model.data.summary?.initial_cash,
             benchmark: state.benchmark && model.data.benchmark_nav ? model.data.benchmark_nav : null,
-            onSelectEvent: (event) => selectEvent(event?.id || event?.event_id, {fromChart: true}),
+            onSelectEvent: (event) => {
+              if (event?.type === "group" || (event?.groupId && Array.isArray(event.events) && event.events.length > 1)) {
+                openEventGroup(event);
+                return;
+              }
+              selectEvent(event?.id || event?.event_id, {fromChart: true});
+            },
             onHover: handleHover,
             onError: (error) => { state.chartError = error?.message || "图表标记暂不可用"; renderChartNote(); },
           });
@@ -701,7 +760,9 @@
 
     function renderLoading() {
       if (!model) {
-        if (container) container.innerHTML = `<div class="portfolio-review-state portfolio-review-loading" role="status" aria-live="polite"><span class="portfolio-review-spinner" aria-hidden="true"></span><h2>正在读取冻结组合结果</h2><p>只读取本次运行保存的净值与执行证据，不会重新运行策略。</p></div>`;
+        if (container) container.innerHTML = state.status === "error"
+          ? `<div class="portfolio-review-state portfolio-review-error-state" role="alert"><h2>结果读取失败</h2><p>${escapeHtml(state.errorMessage || "冻结结果暂不可用")}</p><button type="button" data-review-action="retry-results">重试读取结果</button></div>`
+          : `<div class="portfolio-review-state portfolio-review-loading" role="status" aria-live="polite"><span class="portfolio-review-spinner" aria-hidden="true"></span><h2>正在读取冻结组合结果</h2><p>只读取本次运行保存的净值与执行证据，不会重新运行策略。</p></div>`;
         shellReady = false;
         return;
       }
@@ -763,6 +824,7 @@
         state.filterNotice = "已清除事件筛选，显示图表所选冻结事件。";
       }
       state.selectedEventId = String(event.id);
+      state.eventGroup = null;
       if (chartController && !options.fromChart && typeof chartController.locateEvent === "function") {
         try { chartController.locateEvent(event.id); } catch (_) { /* fallback list remains usable */ }
       }
@@ -783,9 +845,24 @@
 
     function clearSelection() {
       state.selectedEventId = null;
+      state.eventGroup = null;
       chartController?.update?.({selectedEventId: null});
       renderEventsRegion();
       return controller;
+    }
+
+    function openEventGroup(group) {
+      if (destroyed || !group || !Array.isArray(group.events) || group.events.length < 2) return null;
+      state.selectedEventId = null;
+      state.eventGroup = {
+        groupId: String(group.groupId || group.id || ""),
+        date: dateText(group.date || group.time) || null,
+        period: String(group.period || state.period || "1D"),
+        events: group.events.map((event) => ({...event})),
+      };
+      renderEventsRegion();
+      query(container, "[data-review-group-event]")?.focus?.();
+      return state.eventGroup;
     }
 
     function setData(payload, options = {}) {
@@ -795,7 +872,7 @@
       const oldIdentity = identity();
       const changedIdentity = JSON.stringify(nextIdentity) !== JSON.stringify(oldIdentity);
       const dataExpanded = Boolean(model && !model.data.nav.length && next.data.nav.length);
-      if (changedIdentity || dataExpanded) { destroyChart(); shellReady = false; state.selectedEventId = null; state.filters = {symbol: "", action: "", reason: "", dateStart: "", dateEnd: ""}; }
+      if (changedIdentity || dataExpanded) { destroyChart(); shellReady = false; state.selectedEventId = null; state.eventGroup = null; state.filters = {symbol: "", action: "", reason: "", dateStart: "", dateEnd: ""}; }
       model = next;
       state.portfolioId = next.portfolioId; state.horizon = next.horizon;
       state.status = options.fallback ? "fallback" : "ready";
@@ -819,7 +896,7 @@
       return controller;
     }
 
-    function setEvidence(payload) { state.evidence = payload && typeof payload === "object" ? payload : null; state.evidenceError = ""; if (shellReady && state.tab === "evidence") setRegion("details", evidenceText(model, state)); return controller; }
+    function setEvidence(payload) { state.evidence = payload && typeof payload === "object" ? payload : null; state.evidenceById = buildEvidenceIndex(state.evidence); state.evidenceError = ""; if (shellReady && state.tab === "evidence") setRegion("details", evidenceText(model, state)); else if (shellReady && state.tab === "events") setRegion("details", eventTabHtml(model, state)); return controller; }
     function setEvidenceError(error) { state.evidenceError = String(error?.message || error || "摘要证据读取失败"); if (shellReady && state.tab === "evidence") setRegion("details", evidenceText(model, state)); return controller; }
 
     function update(next = {}) {
@@ -849,6 +926,8 @@
       listenersBound = true;
       container.addEventListener("click", (event) => {
         const target = event.target;
+        const groupEvent = target?.closest?.("[data-review-group-event]");
+        if (groupEvent) { event.preventDefault(); state.eventGroup = null; selectEvent(groupEvent.getAttribute("data-review-group-event"), {fromChart: true}); return; }
         const eventButton = target?.closest?.("[data-review-event]");
         if (eventButton) { event.preventDefault(); selectEvent(eventButton.getAttribute("data-review-event"), {fromChart: false}); return; }
         const metric = target?.closest?.("[data-review-metric]"); if (metric) { update({metric: metric.getAttribute("data-review-metric")}); return; }
@@ -857,10 +936,11 @@
         const tab = target?.closest?.("[data-review-tab]"); if (tab) { update({tab: tab.getAttribute("data-review-tab")}); return; }
         const action = target?.closest?.("[data-review-action]")?.getAttribute("data-review-action");
         if (action === "clear-filters") { state.filters = {symbol: "", action: "", reason: "", dateStart: "", dateEnd: ""}; state.filterNotice = ""; renderEventsRegion(); return; }
+        if (action === "clear-event-group") { state.eventGroup = null; renderEventsRegion(); return; }
         if (action === "more-events") { state.eventLimit += 240; renderEventsRegion(); return; }
         if (action === "reset-range") { update({range: "all"}); return; }
         if (action === "apply-range") { const start = query(container, '[data-review-range-input="start"]')?.value || ""; const end = query(container, '[data-review-range-input="end"]')?.value || ""; if (start && end) update({range: {start, end}}); return; }
-        if (action === "retry-results") { config.onRetry?.(identity()); return; }
+        if (action === "retry-results") { state.status = "loading"; state.errorMessage = ""; renderLoading(); config.onRetry?.(identity()); return; }
         const exportType = target?.closest?.("[data-review-export]")?.getAttribute("data-review-export");
         if (exportType) {
           const events = exportType === "events-filtered" ? filteredEventsView(model.data, state.filters, state.eventLimit).filtered : model.data.events;
@@ -897,7 +977,7 @@
         const toggle = event.target?.getAttribute?.("data-review-toggle"); if (toggle === "benchmark") update({benchmark: event.target.checked});
       });
       container.addEventListener("keydown", (event) => {
-        if (event.key === "Escape" && state.selectedEventId) { event.preventDefault(); clearSelection(); return; }
+        if (event.key === "Escape" && (state.selectedEventId || state.eventGroup)) { event.preventDefault(); clearSelection(); return; }
         const tab = event.target?.closest?.("[data-review-tab]");
         if (!tab) return;
         const tabs = queryAll(container, "[data-review-tab]"); const index = tabs.indexOf(tab); let next = null;
@@ -936,6 +1016,7 @@
       getChart: () => chartController,
     };
 
+    bindListeners();
     if (model) renderShell(); else renderLoading();
     return controller;
   }
@@ -950,6 +1031,7 @@
     formatMoney,
     formatPrice,
     formatMissing,
+    buildEvidenceIndex,
     eventIsFill,
     actionLabel,
     reasonLabel,
