@@ -345,3 +345,31 @@ def test_review_accepts_all_null_industry_metadata(tmp_path):
     state.candidates_frame['industry'] = pd.Series('UNKNOWN', index=state.candidates_frame.index, dtype='string')
     state._enrich_candidate_metadata()
     assert state.candidates_frame.industry.eq('UNKNOWN').all()
+
+
+def test_index_comparison_endpoint_scopes_dates_and_keeps_run_immutable(tmp_path, monkeypatch):
+    from alphalab.research import index_comparison
+    import hashlib
+
+    state = _state(tmp_path, multiple=True)
+    before = {str(p): hashlib.sha256(p.read_bytes()).hexdigest() for p in state.run.run_dir.rglob('*') if p.is_file()}
+    calls = []
+    def fake_load(cache_dir, portfolio_dates):
+        calls.append((cache_dir, portfolio_dates))
+        return {'series': [{'id': 'sp500', 'status': 'unavailable', 'rows': []}]}
+    monkeypatch.setattr(index_comparison, 'load_index_comparisons', fake_load)
+    server = create_review_server(state)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        payload = _get_json(server, '/api/index-comparisons?portfolio_id=large&horizon=3')
+    finally:
+        server.shutdown(); thread.join(timeout=2); server.server_close()
+    assert payload['portfolio_id'] == 'large'
+    assert payload['horizon'] == '3'
+    assert payload['series'][0]['id'] == 'sp500'
+    expected = state.portfolio_detail('large')['review']['by_horizon']['3']['nav']
+    assert calls[0][1] == [row['date'] for row in expected]
+    assert not calls[0][0].is_relative_to(state.run.run_dir)
+    after = {str(p): hashlib.sha256(p.read_bytes()).hexdigest() for p in state.run.run_dir.rglob('*') if p.is_file()}
+    assert before == after

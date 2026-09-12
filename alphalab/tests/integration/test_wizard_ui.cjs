@@ -255,7 +255,7 @@ test('reopening a finished check restores preview instead of returning to data',
 });
 
 test('original wizard renders observable review states, drops stale fetches, and retries the same frozen identity', async () => {
- const pending=[]; const calls=[]; let portfolioCount=0;
+ const pending=[]; const comparisonPending=[]; const calls=[]; let portfolioCount=0;
  const draft={id:'draft-1',revision:1,scope:{market:'a_share',start_date:'2025-01-01',end_date:'2025-12-03',selection_mode:'manual',symbols:['000001'],rule_version:'fixed_v0',top_n:10,quality_mode:'strict'},portfolio:{name:'测试组合',initial_cash:100000,weighting:'equal',weights:{},commission_rate:0.0003,slippage_rate:0.001,max_single_weight:1,max_industry_weight:1,min_holdings:1},readiness:{status:'READY',dates:{signal_date:'2025-01-01',entry_date:'2025-01-02',exit_date:'2025-12-03',horizon:706},coverage:[],issues:[],repair_plan:{executable_count:0}},preview:{holdings:[]},task_id:'task-1'};
  const result={run_id:'run-1',portfolio_id:'strategy',name:'测试组合',initial_cash:100000,horizons:[706],summary:{horizon:706,status:'COMPLETE'}};
  const detail=(portfolioId)=>({run_id:'run-1',portfolio_id:portfolioId,name:'测试组合',initial_cash:1000,horizons:[706],summary:{horizon:706,status:'COMPLETE',total_return:0.1,profit_loss:100,ending_equity:1100,initial_cash:1000},nav:[{date:'2025-01-02',equity:1000,unit_nav:1},{date:'2025-01-03',equity:1100,unit_nav:1.1}],events:[],scope:{requested_start_date:'2025-01-01',requested_end_date:'2025-01-03',actual_date_range:['2025-01-02','2025-01-03']},capabilities:{daily_nav:true}});
@@ -265,6 +265,7 @@ test('original wizard renders observable review states, drops stale fetches, and
    if(url==='/api/wizard/drafts/draft-1') return response({draft:JSON.parse(JSON.stringify(draft))});
    if(url==='/api/wizard/tasks/task-1') return response({task:{id:'task-1',kind:'run',status:'SUCCEEDED',result}});
    if(url.startsWith('/research/review/run-1/api/portfolio')) { portfolioCount+=1; return new Promise((resolve,reject)=>pending.push({resolve,reject,index:portfolioCount})); }
+   if(url.startsWith('/research/review/run-1/api/index-comparisons')) return new Promise(resolve=>comparisonPending.push({resolve,url}));
    if(url==='/research/review/run-1/api/summary') return response({spec:{wizard_metadata:{delisting_events:[]}}});
    throw new Error(`unexpected fetch ${url}`);
  };
@@ -303,6 +304,21 @@ test('original wizard renders observable review states, drops stale fetches, and
  assert.equal(harness.controllers[3].getState().status,'ready');
  assert.equal(harness.controllers[3].getModel().portfolioId,'alternate');
  assert.equal(calls.filter((url)=>url.includes('/api/summary')).length,2);
+ assert.equal(comparisonPending.length,2);
+ assert.match(comparisonPending[1].url,/portfolio_id=alternate&horizon=706/);
+ comparisonPending[0].resolve(response({series:[{id:'stale',status:'ready',rows:[]}]}));
+ comparisonPending[1].resolve(response({series:[{id:'hsi',name:'恒生指数',status:'ready',rows:[{date:'2025-01-02',unit_nav:1},{date:'2025-01-03',unit_nav:1.1}]}]}));
+ await flush();
+ assert.equal(harness.controllers[1].getState().comparisons,null,'late comparison must not reach destroyed owner');
+ assert.equal(harness.controllers[3].getState().comparisons.series[0].id,'hsi');
+ assert.equal(harness.controllers[3].getState().status,'ready');
+ harness.reviewOptions[3].onReloadComparisons();
+ await flush();
+ assert.equal(portfolioCount,4,'retry indices must not reload portfolio or rerun research');
+ comparisonPending[2].resolve(response({error:'index provider unavailable'},503));
+ await flush();
+ assert.equal(harness.controllers[3].getState().comparisonStatus,'error');
+ assert.equal(harness.controllers[3].getState().status,'ready');
 });
 
 test('replacement policy exposes opt-in and an auditable transaction table', () => {

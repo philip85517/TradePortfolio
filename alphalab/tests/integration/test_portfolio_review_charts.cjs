@@ -183,6 +183,7 @@ function fakeChartApi(log, options = {}) {
       emitCrosshair(value) { crosshairHandlers.forEach((fn) => fn(value)); },
       emitClick(value) { clickHandlers.forEach((fn) => fn(value)); },
       emitTimeRange(value) { timeRangeHandlers.forEach((fn) => fn(value)); },
+      emitLogicalRange(value) { visibleHandlers.forEach(fn => fn(value)); },
     };
     return object;
   }
@@ -381,8 +382,8 @@ test('dense adjacent event markers stay glyph-sized while retaining event groups
   const markers = h.markersForEvents(groups, events.map((event) => event.date));
 
   assert.equal(markers.length, events.length);
-  assert.ok(markers.every((marker) => marker.text === ''), 'native markers must not carry collision-prone prose');
-  assert.deepEqual(markers.map((marker) => marker.title), ['延后卖出', '卖出', '入选', '保留现金']);
+  assert.deepEqual(markers.map((marker) => marker.text), ['', '卖▼1', '', '']);
+  assert.deepEqual(markers.map((marker) => marker.title), ['延后卖出', '实际卖出 1 笔', '入选', '保留现金']);
   assert.deepEqual(markers.map((marker) => [marker.id, marker.shape, marker.position, marker.color]), [
     [groups[0].id, 'square', 'aboveBar', '#6b7280'],
     [groups[1].id, 'arrowDown', 'aboveBar', '#b42318'],
@@ -390,6 +391,127 @@ test('dense adjacent event markers stay glyph-sized while retaining event groups
     [groups[3].id, 'square', 'aboveBar', '#b45309'],
   ]);
   assert.deepEqual(markers.map((marker) => marker.eventIds), events.map((event) => [event.id]));
+});
+
+function periodMarkerData() {
+  return {
+    run_id: 'run-period-markers',
+    portfolio_id: 'strategy',
+    initial_cash: 1000,
+    scope: {valid_date_range: ['2025-01-06', '2025-01-31']},
+    nav: [
+      {date: '2025-01-06', equity: 1000, daily_return: 0, drawdown: 0},
+      {date: '2025-01-07', equity: 1010, daily_return: 0.01, drawdown: 0},
+      {date: '2025-01-10', equity: 1020, daily_return: 0.01, drawdown: 0},
+      {date: '2025-01-13', equity: 1030, daily_return: 0.01, drawdown: 0},
+      {date: '2025-01-31', equity: 1040, daily_return: 0.01, drawdown: 0},
+    ],
+    events: [
+      {id: 'buy-period', date: '2025-01-06', action: 'BUY', action_label: '买入', filled: true, symbol: '000001'},
+      {id: 'decision-period', date: '2025-01-07', action: 'SELECT', action_text: '入选', filled: false, symbol: '000002'},
+      {id: 'sell-period', date: '2025-01-10', action: 'SELL', action_label: '卖出', filled: true, symbol: '000001'},
+      {id: 'buy-month', date: '2025-01-13', action: 'BUY', action_label: '买入', filled: true, symbol: '000003'},
+    ],
+    capabilities: {
+      session_list: ['2025-01-06', '2025-01-07', '2025-01-10', '2025-01-13', '2025-01-31'],
+      valid_date_range: ['2025-01-06', '2025-01-31'],
+      missing_session_dates: [],
+    },
+  };
+}
+
+test('period markers split buys and sells, preserve actual dates, and hide decisions unless requested', () => {
+  const h = charts();
+  const data = periodMarkerData();
+  const groups = h.groupEvents(data.events.slice(0, 3), '1W');
+  const hidden = h.markersForEvents(groups, ['2025-01-10'], {showDecisions: false});
+  assert.equal(hidden.length, 2);
+  assert.deepEqual(hidden.map((marker) => marker.text), ['买▲1', '卖▼1']);
+  assert.deepEqual(hidden.map((marker) => marker.eventIds), [['buy-period'], ['sell-period']]);
+  assert.deepEqual(hidden.map((marker) => marker.sourceDates), [['2025-01-06'], ['2025-01-10']]);
+  assert.deepEqual(hidden.map((marker) => marker.groupId), [groups[0].id, groups[0].id]);
+  const shown = h.markersForEvents(groups, ['2025-01-10'], {showDecisions: true});
+  assert.equal(shown.length, 3);
+  assert.equal(shown.filter((marker) => marker.decision).length, 1);
+  assert.equal(shown.find((marker) => marker.decision).color, '#6b7280');
+});
+
+test('weekly hover covers every event in the period and mapped marker clicks target the clicked fill', () => {
+  const h = charts();
+  const document = fakeDocument();
+  const container = fakeElement();
+  container.ownerDocument = document;
+  const log = [];
+  const library = fakeChartApi(log);
+  const hovered = [];
+  const selected = [];
+  const controller = h.create(container, {
+    data: periodMarkerData(),
+    initialCash: 1000,
+    library,
+    onHover: (value) => hovered.push(value),
+    onSelectEvent: (value) => selected.push(value),
+  });
+  controller.update({period: '1W'});
+  const candle = library.charts[0].series.find((series) => series.kind === 'candlestick');
+  assert.ok(candle);
+  const buyMarker = candle.markers.find((marker) => marker.eventIds.includes('buy-period'));
+  const sellMarker = candle.markers.find((marker) => marker.eventIds.includes('sell-period'));
+  assert.ok(buyMarker);
+  assert.ok(sellMarker);
+  assert.equal(buyMarker.time, '2025-01-10');
+  assert.equal(sellMarker.time, '2025-01-10');
+  assert.deepEqual(buyMarker.sourceDates, ['2025-01-06']);
+  assert.deepEqual(sellMarker.sourceDates, ['2025-01-10']);
+  library.charts[0].emitCrosshair({time: '2025-01-07'});
+  assert.deepEqual(hovered.at(-1).events.map((event) => event.id), ['buy-period', 'decision-period', 'sell-period']);
+  assert.deepEqual(hovered.at(-1).events.map((event) => event.date), ['2025-01-06', '2025-01-07', '2025-01-10']);
+  assert.equal(hovered.at(-1).eventCount, 3);
+  assert.equal(hovered.at(-1).bar.time, '2025-01-10');
+  const beforeClickRanges = library.charts[0].dateRanges.length;
+  library.charts[0].emitClick({marker: {id: buyMarker.id, eventId: buyMarker.eventId, eventIds: buyMarker.eventIds, groupId: buyMarker.groupId}, time: buyMarker.time});
+  assert.equal(selected.length, 1);
+  assert.equal(selected[0].id, 'buy-period');
+  assert.equal(library.charts[0].dateRanges.length, beforeClickRanges, 'clicking chart marker must pin details without changing zoom');
+  controller.destroy();
+});
+
+test('multiple benchmark lines rebase to the first portfolio NAV and sample weekly bars by last observed date', () => {
+  const h = charts();
+  const document = fakeDocument();
+  const container = fakeElement();
+  container.ownerDocument = document;
+  const log = [];
+  const library = fakeChartApi(log);
+  const data = periodMarkerData();
+  const controller = h.create(container, {
+    data,
+    initialCash: 1000,
+    library,
+    benchmarks: [
+      {id: 'index-a', name: '指数 A', color: '#7c3aed', rows: [
+        {date: '2025-01-06', unit_nav: 1},
+        {date: '2025-01-07', unit_nav: 1.01},
+        {date: '2025-01-10', unit_nav: 1.02},
+        {date: '2025-01-13', unit_nav: 1.03},
+        {date: '2025-01-31', unit_nav: 1.04},
+      ]},
+      {id: 'index-b', name: '指数 B', color: '#d97706', rows: [
+        {date: '2025-01-06', unit_nav: 1},
+        {date: '2025-01-10', unit_nav: 0.98},
+        {date: '2025-01-31', unit_nav: 1.05},
+      ]},
+    ],
+  });
+  controller.update({period: '1W'});
+  const lines = library.charts[0].series.filter((series) => series.kind === 'line' && series.options.visible !== false);
+  assert.equal(lines.length, 2);
+  assert.deepEqual(lines.map((series) => series.options.color), ['#7c3aed', '#d97706']);
+  assert.deepEqual(lines[0].data.map((point) => point.time), ['2025-01-10', '2025-01-13', '2025-01-31']);
+  assert.deepEqual(lines[0].data.map((point) => point.value), [1.02, 1.03, 1.04]);
+  assert.deepEqual(lines[1].data.map((point) => point.time), ['2025-01-10', '2025-01-13', '2025-01-31']);
+  assert.deepEqual(lines[1].data.map((point) => point.value), [0.98, 0.98, 1.05]);
+  controller.destroy();
 });
 
 test('weekly main candles and daily drawdown synchronize by factual dates and apply all/bounded ranges', () => {
@@ -401,18 +523,18 @@ test('weekly main candles and daily drawdown synchronize by factual dates and ap
   const errors = [];
   const library = fakeChartApi(log);
   const controller = h.create(container, { data: navData(), initialCash: 1000, library, onError: (error) => errors.push(error) });
-  const initialFits = log.filter((item) => item[0] === 'fit');
-  assert.equal(initialFits.length, 2);
-  assert.deepEqual(library.charts[0].dateRanges[0], {from: '2025-01-02', to: '2025-01-10'});
-  assert.deepEqual(library.charts[1].dateRanges[0], {from: '2025-01-02', to: '2025-01-10'});
+  assert.deepEqual(library.charts[0].ranges[0], library.charts[1].ranges[0]);
+  assert.ok(library.charts[0].ranges[0].from < 0);
   controller.update({ period: '1W' });
+  const grids = library.charts.map(chart => chart.series.find(series => series.options.visible === false));
+  assert.deepEqual(grids[0].data, grids[1].data);
   library.charts[1].emitCrosshair({ time: '2025-01-06' });
   assert.equal(library.charts[0].crosshairPositions.at(-1).time, '2025-01-06');
-  library.charts[0].emitTimeRange({ from: '2025-01-02', to: '2025-01-08' });
-  assert.deepEqual(library.charts[1].dateRanges.at(-1), { from: '2025-01-02', to: '2025-01-08' });
+  library.charts[0].emitLogicalRange({from:-1,to:8});
+  assert.deepEqual(library.charts[1].ranges.at(-1), {from:-1,to:8});
   controller.update({ range: { start: '2025-01-03', end: '2025-01-07' } });
-  assert.deepEqual(library.charts[0].dateRanges.at(-1), { from: '2025-01-03', to: '2025-01-07' });
-  assert.deepEqual(library.charts[1].dateRanges.at(-1), { from: '2025-01-03', to: '2025-01-07' });
+  assert.deepEqual(library.charts[0].ranges.at(-1), library.charts[1].ranges.at(-1));
+  assert.deepEqual(controller.getState().range, {start:'2025-01-03',end:'2025-01-07'});
   assert.equal(errors.length, 0);
   controller.destroy();
 });
@@ -506,12 +628,13 @@ test('native marker sets are sorted, series-time compatible, and period markers 
   data.nav[1].stale_symbols = '000001';
   data.nav[1].max_valuation_stale_days = 2;
   const library = fakeChartApi(log);
-  const controller = h.create(container, { data, initialCash: 1000, library, onError: (error) => errors.push(error) });
+  const selected = [];
+  const controller = h.create(container, { data, initialCash: 1000, library, onError: (error) => errors.push(error), onSelectEvent: (event) => selected.push(event) });
   controller.update({ period: '1W' });
   const candle = library.charts[0].series.find((series) => series.kind === 'candlestick');
   assert.ok(candle);
   assert.deepEqual(candle.data.filter((point) => point.open !== undefined).map((point) => point.time), ['2025-01-03']);
-  assert.ok(candle.data.some((point) => point.time === '2025-01-08' && point.open === undefined));
+  assert.equal(candle.data.some((point) => point.time === '2025-01-08' && point.open === undefined), false);
   assert.equal(candle.markers.every((marker, index) => index === 0 || marker.time >= candle.markers[index - 1].time), true);
   assert.equal(candle.markers.every((marker) => candle.data.some((point) => point.time === marker.time)), true);
   const warning = candle.markers.find((marker) => marker.id.startsWith('warning-') && marker.sourceDate === '2025-01-08');
@@ -522,6 +645,8 @@ test('native marker sets are sorted, series-time compatible, and period markers 
   assert.ok(stale);
   assert.equal(stale.text, '');
   assert.equal(stale.title, '估值陈旧');
+  library.charts[0].emitClick({hoveredObjectId: stale.id, time: stale.time});
+  assert.equal(selected.length, 0);
   const marker = candle.markers.find((item) => item.eventIds.includes('buy-1'));
   assert.equal(marker.sourceDate, '2025-01-02');
   assert.equal(candle.markers.some((item) => item.eventIds.includes('sell-1')), false);
@@ -602,4 +727,37 @@ test('local named chart assets are present and vendor bundle is the locked 4.2.3
   assert.match(vendor, /Lightweight Charts.*v4\.2\.3/);
   assert.ok(fs.statSync(path.resolve('alphalab/research/static/vendor/LICENSE')).size > 0);
   assert.ok(fs.statSync(path.resolve('alphalab/research/static/vendor/NOTICE')).size > 0);
+});
+
+test('full-history daily view permits all rows and adds visible logical margins', () => {
+  const library = fakeChartApi([]);
+  const create = library.createChart;
+  library.createChart = function(container, options) {
+    const chart = create.call(this, container, options);
+    const scale = chart.timeScale();
+    scale.getVisibleLogicalRange = () => ({from:0, to:706});
+    chart.timeScale = () => scale;
+    return chart;
+  };
+  const container = fakeElement(); container.ownerDocument = fakeDocument();
+  const nav=Array.from({length:707},(_,i)=>({date:new Date(Date.UTC(2023,0,3+i)).toISOString().slice(0,10),equity:1000+i,drawdown:0}));
+  const controller = charts().create(container,{data:{nav,initial_cash:1000,events:[]},library});
+  assert.ok(library.charts[0].options.timeScale.minBarSpacing <= 0.5);
+  for (const chart of library.charts) {
+    const range=chart.ranges.at(-1);
+    assert.ok(range.from < -10);
+    assert.ok(range.to > 716);
+  }
+  controller.destroy();
+});
+
+test('weekly return view uses the same period endpoints as its benchmark and marker', () => {
+  const library=fakeChartApi([]);
+  const container=fakeElement();container.ownerDocument=fakeDocument();
+  const controller=charts().create(container,{data:periodMarkerData(),library,period:'1W',metric:'cumulative_return'});
+  const main=library.charts[0].series[0];
+  const times=main.data.filter(p=>p.value!==undefined).map(p=>p.time);
+  assert.equal(times.includes('2025-01-07'),false);
+  assert.ok(main.markers.some(m=>m.eventIds.includes('buy-period') && m.time==='2025-01-10'));
+  controller.destroy();
 });

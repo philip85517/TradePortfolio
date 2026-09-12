@@ -73,6 +73,13 @@
     return Number.isFinite(valueDate.getTime()) ? valueDate : null;
   }
 
+  function shiftDate(value, days) {
+    const date = dateValue(value);
+    if (!date || !Number.isFinite(Number(days))) return asDate(value);
+    date.setUTCDate(date.getUTCDate() + Number(days));
+    return date.toISOString().slice(0, 10);
+  }
+
   function compareDates(left, right) {
     return String(left).localeCompare(String(right));
   }
@@ -156,6 +163,45 @@
     defineMeta(rows, "runId", object.run_id || null);
     defineMeta(rows, "portfolioId", object.portfolio_id || null);
     return rows;
+  }
+
+  function firstValidUnitNav(rows) {
+    return (Array.isArray(rows) ? rows : [])
+      .map((row) => asFiniteNumber(row?.unit_nav))
+      .find((value) => value !== null && value !== 0) ?? null;
+  }
+
+  function rebaseNavRows(rows, anchor) {
+    const base = asFiniteNumber(anchor);
+    if (base === null || base === 0) return Array.isArray(rows) ? rows : [];
+    const source = Array.isArray(rows) ? rows : [];
+    const rebased = source.map((row) => {
+      const result = {...row};
+      const unit = asFiniteNumber(row?.unit_nav);
+      result.unit_nav = unit === null ? null : unit / base;
+      result.cumulative_return = result.unit_nav === null ? null : result.unit_nav - 1;
+      return result;
+    });
+    for (const name of ["initialCash", "validDateRange", "sessionList", "missingSessionDates", "aggregation", "runId", "portfolioId"]) {
+      if (Object.prototype.hasOwnProperty.call(rows || [], name)) defineMeta(rebased, name, rows[name]);
+    }
+    return rebased;
+  }
+
+  function benchmarkConfigs(config) {
+    const source = config && typeof config === "object" ? config : {};
+    const plural = Array.isArray(source.benchmarks) ? source.benchmarks : [];
+    if (plural.length) return plural.filter((item) => item && typeof item === "object");
+    if (source.benchmark && (Array.isArray(source.benchmark) || typeof source.benchmark === "object")) {
+      return [{
+        id: source.benchmark?.id || "benchmark",
+        name: source.benchmark?.name || "基准",
+        color: source.benchmark?.color || "#2563eb",
+        rows: Array.isArray(source.benchmark) ? source.benchmark : source.benchmark.rows || source.benchmark.nav || source.benchmark,
+        legacy: true,
+      }];
+    }
+    return [];
   }
 
   function dateRangeBounds(rows, range, options) {
@@ -543,26 +589,67 @@
     return {position: "aboveBar", shape: "square"};
   }
 
-  function markersForEvents(groups, availableDates) {
+  function markerEventsForGroup(group, showDecisions) {
+    const events = Array.isArray(group?.events) ? group.events : [];
+    const buys = events.filter((event) => eventIsFill(event) && String(event.action || "").toUpperCase() === "BUY");
+    const sells = events.filter((event) => eventIsFill(event) && String(event.action || "").toUpperCase() === "SELL");
+    const decisions = events.filter((event) => !eventIsFill(event));
+    const result = [];
+    if (buys.length) result.push({kind: "BUY", events: buys});
+    if (sells.length) result.push({kind: "SELL", events: sells});
+    if (showDecisions && decisions.length) result.push({kind: "DECISION", events: decisions});
+    return result;
+  }
+
+  function markerId(group, kind, subsets) {
+    if (subsets.length === 1 && subsets[0].kind === kind && subsets[0].events.length === group.events.length) return group.id;
+    return `${group.id}:${String(kind).toLowerCase()}`;
+  }
+
+  function markersForEvents(groups, availableDates, options = {}) {
     const dates = availableDates ? new Set(uniqueDates(availableDates)) : null;
-    return sortMarkers((Array.isArray(groups) ? groups : []).map((group) => {
-      const first = group.events?.[0] || {};
-      const style = eventMarkerStyle(group);
-      return {
-        time: group.time || group.date,
-        sourceDate: group.date,
-        id: group.id,
-        groupId: group.id,
-        eventId: group.events?.length === 1 ? group.events[0].id : null,
-        eventIds: [...(group.eventIds || [])],
-        position: style.position,
-        shape: style.shape,
-        color: markerColor(first),
-        title: group.count > 1 ? `${group.count} 个事件` : eventDisplayLabel(first),
-        text: "",
-        exactDateAvailable: !dates || dates.has(group.date),
-      };
-    }));
+    const showDecisions = options.showDecisions === undefined ? true : asBoolean(options.showDecisions);
+    const result = [];
+    for (const group of (Array.isArray(groups) ? groups : [])) {
+      const subsets = markerEventsForGroup(group, showDecisions);
+      for (const subset of subsets) {
+        const subsetEvents = subset.events;
+        const first = subsetEvents[0] || {};
+        const sourceDates = uniqueDates(subsetEvents.map((event) => event.date));
+        const style = subset.kind === "BUY"
+          ? {position: "belowBar", shape: "arrowUp"}
+          : subset.kind === "SELL"
+            ? {position: "aboveBar", shape: "arrowDown"}
+            : {position: "aboveBar", shape: "square"};
+        const count = subsetEvents.length;
+        const eventIds = subsetEvents.map((event) => event.id);
+        const isCashDecision = subset.kind === "DECISION" && subsetEvents.some((event) => ["CASH", "INITIAL_NOT_FILLED"].includes(String(event.action || "").toUpperCase()));
+        const markerDate = sourceDates[0] || group.date || group.time;
+        result.push({
+          time: markerDate,
+          sourceDate: markerDate,
+          sourceDates,
+          periodDate: group.date,
+          id: markerId(group, subset.kind, subsets),
+          groupId: group.id,
+          eventId: count === 1 ? eventIds[0] : null,
+          eventIds,
+          position: style.position,
+          shape: style.shape,
+          color: subset.kind === "BUY" ? "#2563eb" : subset.kind === "SELL" ? "#b42318" : isCashDecision ? "#b45309" : "#6b7280",
+          markerType: subset.kind,
+          decision: subset.kind === "DECISION",
+          title: subset.kind === "BUY"
+            ? `实际买入 ${count} 笔`
+            : subset.kind === "SELL"
+              ? `实际卖出 ${count} 笔`
+              : count > 1 ? `${count} 个决策` : eventDisplayLabel(first),
+          text: subset.kind === "BUY" ? `买▲${count}` : subset.kind === "SELL" ? `卖▼${count}` : "",
+          exactDateAvailable: !dates || dates.has(markerDate),
+        });
+      }
+    }
+    return sortMarkers(result);
   }
 
   function sortMarkers(markers) {
@@ -744,19 +831,25 @@
     const config = options && typeof options === "object" ? options : {};
     const object = dataObject(config.data || {});
     const initialCash = initialCashFrom(object, config.initialCash ?? config.initial_cash);
-    const rows = normalizeNavRows(object, initialCash);
+    const sourceRows = normalizeNavRows(object, initialCash);
+    const configuredBenchmarkItems = benchmarkConfigs(config).map((item, index) => ({
+      id: String(item.id || `benchmark-${index + 1}`),
+      name: String(item.name || item.id || `基准 ${index + 1}`),
+      color: String(item.color || ["#2563eb", "#7c3aed", "#d97706", "#059669"][index % 4]),
+      rows: normalizeNavRows(item.rows ?? item.nav ?? item, initialCash),
+      legacy: Boolean(item.legacy),
+    }));
+    const pluralBenchmarkMode = Array.isArray(config.benchmarks) && config.benchmarks.length > 0;
+    const comparisonAnchor = pluralBenchmarkMode ? firstValidUnitNav(sourceRows) : null;
+    const comparisonRows = comparisonAnchor === null ? sourceRows : rebaseNavRows(sourceRows, comparisonAnchor);
+    const rows = sourceRows;
     const events = (Array.isArray(object.events) ? object.events : []).map((event, index) => normalizeEvent(event, index, object.run_id));
-    const rowByDate = new Map(rows.map((row) => [row.date, row]));
     const eventsByDate = new Map();
     for (const event of events) {
       if (!event.date) continue;
       if (!eventsByDate.has(event.date)) eventsByDate.set(event.date, []);
       eventsByDate.get(event.date).push(event);
     }
-    const benchmarkObject = dataObject(config.benchmark || {});
-    const benchmarkRows = Array.isArray(config.benchmark)
-      ? normalizeNavRows(config.benchmark, initialCash)
-      : normalizeNavRows(benchmarkObject, initialCashFrom(benchmarkObject, initialCash));
     const document = container?.ownerDocument || root?.document || null;
     const mainContainer = createElement(document, "div", "portfolio-review-chart-main");
     const drawdownContainer = createElement(document, "div", "portfolio-review-chart-drawdown");
@@ -766,12 +859,26 @@
       if (mainContainer) container.appendChild(mainContainer);
       if (drawdownContainer) container.appendChild(drawdownContainer);
     }
-    const state = {metric: "unit_nav", period: "1D", range: "all", selectedEventId: null};
+    const initialRange = typeof config.range === "string" && RANGES.has(config.range.toUpperCase())
+      ? (config.range.toLowerCase() === "all" ? "all" : config.range.toUpperCase())
+      : config.range === undefined ? "all" : config.range;
+    const state = {
+      metric: metricName(config.metric),
+      period: periodName(config.period),
+      range: initialRange,
+      selectedEventId: null,
+      showDecisions: asBoolean(config.showDecisions),
+    };
     const charts = {main: null, drawdown: null};
+    const timeGrids = {main: null, drawdown: null};
+    let timelineDates = [];
     const lineSeries = {main: [], drawdown: [], benchmark: []};
     const eventGroupsCache = new Map();
+    const eventGroupIndexCache = new Map();
     const metricPointsCache = new Map();
+    const metricRowIndexCache = new Map();
     const periodBarsCache = new Map();
+    const benchmarkDataCache = new Map();
     const library = resolveLibrary(config);
     let destroyed = false;
     let syncing = false;
@@ -790,6 +897,7 @@
     let usingFallback = true;
     let fallbackReason = null;
     let lastMarkerError = null;
+    let markerLookup = new Map();
 
     function canonicalRangeKey(range) {
       const bounds = dateRangeBounds(rows, range, {
@@ -806,24 +914,49 @@
           endDate: rows.at(-1)?.date,
           validDateRange: rows.validDateRange,
         });
-        eventGroupsCache.set(key, groupEvents(selected, state.period, {runId: object.run_id}));
+        const groups = groupEvents(selected, state.period, {runId: object.run_id});
+        eventGroupsCache.set(key, groups);
+        eventGroupIndexCache.set(key, new Map(groups.map((group) => [state.period === "1D" ? group.date : group.periodKey, group])));
       }
       return eventGroupsCache.get(key);
     }
 
+    function currentGroupForDate(date) {
+      const normalizedDate = asDate(date);
+      if (!normalizedDate) return null;
+      const key = `${state.period}:${canonicalRangeKey(state.range)}`;
+      currentGroups();
+      return eventGroupIndexCache.get(key)?.get(state.period === "1D" ? normalizedDate : periodKeyForDate(normalizedDate, state.period)) || null;
+    }
+
+    function rowsForMetric(metric = state.metric) {
+      return metricName(metric) === "equity" ? rows : comparisonAnchor === null ? rows : comparisonRows;
+    }
+
+    function rowForMetricDate(metric, date) {
+      const normalizedMetric = metricName(metric);
+      if (!metricRowIndexCache.has(normalizedMetric)) {
+        metricRowIndexCache.set(normalizedMetric, new Map(rowsForMetric(normalizedMetric).map((row) => [row.date, row])));
+      }
+      return metricRowIndexCache.get(normalizedMetric).get(asDate(date)) || null;
+    }
+
     function currentPoints() {
-      if (!metricPointsCache.has(state.metric)) metricPointsCache.set(state.metric, toMetricData(rows, state.metric, initialCash));
-      const allPoints = metricPointsCache.get(state.metric);
+      if (!metricPointsCache.has(state.metric)) metricPointsCache.set(state.metric, toMetricData(rowsForMetric(state.metric), state.metric, initialCash));
+      const dailyPoints = metricPointsCache.get(state.metric);
+      const periodDates = state.period !== "1D" && state.metric === "cumulative_return" ? new Set(periodTimelineBars().map(bar => bar.time)) : null;
+      const allPoints = periodDates ? dailyPoints.filter(point => periodDates.has(point.time)) : dailyPoints;
       return filterDateRange(allPoints, state.range, {endDate: rows.at(-1)?.date, validDateRange: rows.validDateRange});
     }
 
-    function periodBarsEntry() {
-      const key = `${state.metric}:${state.period}`;
+    function periodBarsEntry(metricOverride = state.metric) {
+      const metric = metricName(metricOverride);
+      const key = `${metric}:${state.period}`;
       let entry = periodBarsCache.get(key);
       if (entry) return entry;
       periodAggregationCount += 1;
-      const allBars = aggregateObservedClose(rows, state.period, {
-        metric: state.metric,
+      const allBars = aggregateObservedClose(rowsForMetric(metric), state.period, {
+        metric,
         initialCash,
         sessionList: rows.sessionList,
         validDateRange: rows.validDateRange,
@@ -841,14 +974,24 @@
 
     function currentBars() {
       if (state.period === "1D" || state.metric === "cumulative_return") return [];
-      const allBars = periodBarsEntry().allBars;
+      const allBars = periodBarsEntry(state.metric).allBars;
       return filterDateRange(allBars, state.range, {endDate: rows.at(-1)?.date, validDateRange: rows.validDateRange});
     }
 
     function periodBarForDate(date) {
-      if (state.period === "1D" || state.metric === "cumulative_return") return null;
-      const entry = periodBarsEntry();
+      if (state.period === "1D") return null;
+      const entry = periodBarsEntry(state.metric === "cumulative_return" ? "unit_nav" : state.metric);
       return entry.byTime.get(date) || entry.byPeriodKey.get(periodKeyForDate(date, state.period)) || null;
+    }
+
+    function periodTimelineBars() {
+      if (state.period === "1D") return [];
+      return periodBarsEntry(state.metric === "cumulative_return" ? "unit_nav" : state.metric).allBars;
+    }
+
+    function selectedEventDate() {
+      if (!state.selectedEventId) return null;
+      return events.find((event) => event.id === state.selectedEventId)?.date || null;
     }
 
     function mainData() {
@@ -865,7 +1008,15 @@
         layout: {background: {color: "#ffffff"}, textColor: "#182022"},
         grid: {vertLines: {color: "#eef3f4"}, horzLines: {color: "#eef3f4"}},
         rightPriceScale: {borderColor: "#d9e1e3"},
-        timeScale: {borderColor: "#d9e1e3", rightOffset: 4, fixLeftEdge: false, fixRightEdge: false},
+        timeScale: {
+          borderColor: "#d9e1e3",
+          rightOffset: 4,
+          barSpacing: 8,
+          minBarSpacing: 0.1,
+          fixLeftEdge: false,
+          fixRightEdge: false,
+          shiftVisibleRangeOnNewBar: false,
+        },
         crosshair: {mode: 1},
       };
     }
@@ -881,7 +1032,8 @@
         const mainScale = chartTimeScale(charts.main);
         const drawdownScale = chartTimeScale(charts.drawdown);
         syncUsesTimeRange = Boolean(
-          typeof mainScale?.subscribeVisibleTimeRangeChange === "function"
+          !(typeof mainScale?.subscribeVisibleLogicalRangeChange === "function" && typeof drawdownScale?.subscribeVisibleLogicalRangeChange === "function")
+          &&           typeof mainScale?.subscribeVisibleTimeRangeChange === "function"
           && typeof drawdownScale?.subscribeVisibleTimeRangeChange === "function"
           && typeof mainScale?.setVisibleRange === "function"
           && typeof drawdownScale?.setVisibleRange === "function",
@@ -937,7 +1089,8 @@
         validDateRange: rows.validDateRange,
       });
       if (!bounds.start || !bounds.end || bounds.start > bounds.end) return null;
-      return {from: bounds.start, to: bounds.end};
+      const paddingDays = state.period === "1M" ? 7 : state.period === "1W" ? 2 : 2;
+      return {from: shiftDate(bounds.start, -paddingDays), to: shiftDate(bounds.end, paddingDays)};
     }
 
     function eventContextRange(date) {
@@ -978,6 +1131,12 @@
       if (usingFallback) return;
       const range = visibleDateRange();
       if (!range) return;
+      const bounds = dateRangeBounds(rows, state.range, {endDate: rows.at(-1)?.date, validDateRange: rows.validDateRange});
+      const fromIndex = Math.max(0, timelineDates.findIndex(date => date >= bounds.start));
+      let toIndex = timelineDates.findLastIndex(date => date <= bounds.end);
+      if (toIndex < fromIndex) toIndex = fromIndex;
+      const padding = Math.max(2, (toIndex - fromIndex) * 0.05);
+      const logicalRange = {from: fromIndex - padding, to: toIndex + padding};
       const scales = [
         [chartTimeScale(charts.main), lineSeries.main],
         [chartTimeScale(charts.drawdown), lineSeries.drawdown],
@@ -985,9 +1144,9 @@
       syncing = true;
       try {
         for (const scale of scales) {
-          if (state.range === "all") scale.fitContent?.();
-          if (typeof scale.setVisibleRange === "function") scale.setVisibleRange(range);
-          else scale.setVisibleLogicalRange?.(range);
+          if (timelineDates.length && typeof scale.setVisibleLogicalRange === "function") scale.setVisibleLogicalRange(logicalRange);
+          else if (typeof scale.setVisibleRange === "function") scale.setVisibleRange(range);
+
         }
       } finally { syncing = false; }
     }
@@ -1005,24 +1164,37 @@
       lineSeries[kind] = [];
     }
 
-    function setLineSegments(chart, key, segments, color, area) {
-      clearSeries(key, chart);
+    function setLineSegments(chart, key, segments, color, area, options = {}) {
+      if (!options.append) clearSeries(key, chart);
       if (!chart) return [];
       const result = [];
-      for (const segment of segments) {
+      const sourceSegments = Array.isArray(segments) ? segments : [];
+      const metric = options.metric || (key === "drawdown" ? "drawdown" : state.metric);
+      for (const [segmentIndex, segment] of sourceSegments.entries()) {
         if (!segment.length) continue;
         const series = area && typeof chart.addAreaSeries === "function"
-          ? chart.addAreaSeries(seriesOptions(color, true, key === "drawdown" ? "drawdown" : state.metric, key === "drawdown"))
+          ? chart.addAreaSeries(seriesOptions(color, true, metric, key === "drawdown"))
           : typeof chart.addLineSeries === "function"
-            ? chart.addLineSeries(seriesOptions(color, false, key === "drawdown" ? "drawdown" : state.metric, key === "drawdown"))
+            ? chart.addLineSeries(seriesOptions(color, false, metric, key === "drawdown"))
             : null;
         if (!series) continue;
-        const data = segment.map((point) => ({time: point.time, value: point.value}));
+        let data = segment.map((point) => ({time: point.time, value: point.value}));
+        if (options.dashed && data.length) {
+          try { series.applyOptions?.({lineStyle: 1, lineWidth: 1, title: options.title || ""}); } catch (_) {}
+        }
+        if (options.pad && state.period !== "1D") {
+          const paddingDays = state.period === "1M" ? 7 : 2;
+          if (segmentIndex === 0) data = [{time: shiftDate(data[0].time, -paddingDays)}, ...data];
+          if (segmentIndex === sourceSegments.length - 1) data = [...data, {time: shiftDate(data.at(-1).time, paddingDays)}];
+        }
+        if (options.selectedEventDate && !data.some((point) => asDate(point.time) === options.selectedEventDate)) {
+          data = [...data, {time: options.selectedEventDate}].sort((left, right) => compareDates(asDate(left.time), asDate(right.time)));
+        }
         series.setData(data);
         series.__portfolioReviewTimes = new Set(data.map((point) => asDate(point.time)).filter(Boolean));
         result.push(series);
       }
-      lineSeries[key] = result;
+      lineSeries[key] = options.append ? [...(lineSeries[key] || []), ...result] : result;
       return result;
     }
 
@@ -1044,6 +1216,7 @@
 
     function applyMarkers(markers) {
       const sorted = sortMarkers(markers);
+      markerLookup = new Map(sorted.map((marker) => [String(marker.id), marker]));
       const targets = [...lineSeries.main];
       lastMarkerError = null;
       for (const series of targets) {
@@ -1063,7 +1236,7 @@
     }
 
     function crosshairPrice(chart, date) {
-      const row = rows.find((candidate) => candidate.date === date);
+      const row = rowForMetricDate(state.metric, date);
       if (chart === charts.drawdown) return asFiniteNumber(row?.drawdown);
       if (state.period !== "1D" && state.metric !== "cumulative_return") {
         const bar = periodBarForDate(date);
@@ -1141,19 +1314,102 @@
     function chartMarkers(data, metricData) {
       const availableDates = metricData.filter((point) => point.value !== null).map((point) => point.time);
       const candleMode = state.period !== "1D" && state.metric !== "cumulative_return" && data.bars.length > 0;
-      const periodBars = new Map(data.bars.map((bar) => [bar.periodKey, bar]));
-      const eventMarkers = markersForEvents(data.groups, availableDates).map((marker) => {
-        if (!candleMode) return marker;
-        const group = data.groups.find((candidate) => candidate.id === marker.id);
+      const periodBars = new Map(periodTimelineBars().map((bar) => [bar.periodKey, bar]));
+      const eventMarkers = markersForEvents(data.groups, availableDates, {showDecisions: state.showDecisions}).map((marker) => {
+        if (state.period === "1D") return marker;
+        const group = data.groups.find((candidate) => candidate.id === marker.groupId);
         const bar = group ? periodBars.get(group.periodKey) : null;
         return bar
-          ? {...marker, time: bar.time, sourceDate: marker.sourceDate || marker.time, exactDateAvailable: true}
+          ? {...marker, time: bar.time, mappedDate: bar.time, sourceDate: marker.sourceDate || marker.time, sourceDates: [...(marker.sourceDates || [])], exactDateAvailable: true}
           : {...marker, exactDateAvailable: false};
       });
       return sortMarkers(eventMarkers.concat(
         staleMarkers(metricData, candleMode ? data.bars : [], candleMode ? state.period : "1D"),
         candleMode ? warningMarkers(data.bars) : [],
       ));
+    }
+
+    function benchmarkMetricValue(row, metric) {
+      const normalizedMetric = metricName(metric);
+      if (normalizedMetric === "equity") return null;
+      if (normalizedMetric === "unit_nav") return asFiniteNumber(row?.unit_nav);
+      const unit = asFiniteNumber(row?.unit_nav);
+      return unit === null ? null : unit - 1;
+    }
+
+    function benchmarkEntry(item) {
+      const key = `${item.id}:${state.metric}:${state.period}`;
+      const cached = benchmarkDataCache.get(key);
+      if (cached) return cached;
+      const metric = metricName(state.metric);
+      if (metric === "equity") {
+        const empty = {points: [], byTime: new Map()};
+        benchmarkDataCache.set(key, empty);
+        return empty;
+      }
+      const source = rebaseNavRows(item.rows, firstValidUnitNav(item.rows));
+      const candidates = source.filter((row) => row?.date);
+      const timeline = state.period === "1D"
+        ? rows.map((row) => ({time: row.date}))
+        : periodTimelineBars().map((bar) => ({time: bar.time}));
+      const points = [];
+      const byTime = new Map();
+      let cursor = 0;
+      let latest = null;
+      for (const target of timeline) {
+        while (cursor < candidates.length && candidates[cursor].date <= target.time) latest = candidates[cursor++];
+        const value = latest ? benchmarkMetricValue(latest, metric) : null;
+        const point = {
+          time: target.time,
+          date: target.time,
+          value,
+          observed_date: latest?.observed_date || latest?.date || null,
+          benchmark_id: item.id,
+          benchmark_name: item.name,
+        };
+        points.push(point);
+        byTime.set(target.time, point);
+      }
+      const entry = {points, byTime};
+      benchmarkDataCache.set(key, entry);
+      return entry;
+    }
+
+    function benchmarkPointsForHover(date) {
+      if (state.metric === "equity" || !configuredBenchmarkItems.length) return [];
+      const target = state.period === "1D" ? asDate(date) : periodBarForDate(asDate(date))?.time;
+      if (!target) return [];
+      return configuredBenchmarkItems.map((item) => {
+        const point = benchmarkEntry(item).byTime.get(target);
+        return point && point.value !== null ? {
+          id: item.id,
+          name: item.name,
+          color: item.color,
+          value: point.value,
+          observed_date: point.observed_date,
+          date: target,
+        } : null;
+      }).filter(Boolean);
+    }
+
+    function renderBenchmarkLines() {
+      clearSeries("benchmark", charts.main);
+      if (!charts.main || state.metric === "equity" || !configuredBenchmarkItems.length) return;
+      for (const [index, item] of configuredBenchmarkItems.entries()) {
+        const entry = benchmarkEntry(item);
+        const filtered = filterDateRange(entry.points, state.range, {
+          endDate: rows.at(-1)?.date,
+          validDateRange: rows.validDateRange,
+        });
+        const segments = contiguousSegments(filtered);
+        for (const segment of segments) {
+          setLineSegments(charts.main, "benchmark", [segment], item.color, false, {
+            append: index > 0 || lineSeries.benchmark.length > 0,
+            dashed: true,
+            title: item.name,
+          });
+        }
+      }
     }
 
     function candleSeriesData(bars) {
@@ -1164,20 +1420,48 @@
         low: bar.low,
         close: bar.close,
       }]));
-      const bounds = visibleDateRange();
-      const factualDates = uniqueDates([
-        ...(rows.sessionList || []),
-        ...rows.map((row) => row.date),
-        ...(bounds ? [bounds.from, bounds.to] : []),
-      ]).filter((date) => !bounds || (date >= bounds.from && date <= bounds.to));
-      return uniqueDates([...factualDates, ...actual.keys()]).map((date) => actual.get(date) || {time: date});
+      const dates = uniqueDates([...actual.keys()]);
+      if (!dates.length) return [];
+      const paddingDays = state.period === "1M" ? 7 : 2;
+      const selectedDate = selectedEventDate();
+      const displayDates = uniqueDates([...dates, ...(selectedDate ? [selectedDate] : [])]);
+      return [
+        {time: shiftDate(displayDates[0], -paddingDays)},
+        ...displayDates.map((date) => actual.get(date) || {time: date}),
+        {time: shiftDate(displayDates.at(-1), paddingDays)},
+      ];
+    }
+
+    function syncTimeGrids() {
+      for (const key of ["main", "drawdown"]) {
+        removeSeries(charts[key], timeGrids[key]); timeGrids[key] = null;
+      }
+      timelineDates = uniqueDates([...lineSeries.main, ...lineSeries.drawdown, ...lineSeries.benchmark].flatMap(series => [...(series.__portfolioReviewTimes || [])]));
+      for (const key of ["main", "drawdown"]) {
+        const series = charts[key]?.addLineSeries?.({visible:false, priceLineVisible:false, lastValueVisible:false});
+        if (series) { series.setData(timelineDates.map(time => ({time}))); timeGrids[key] = series; }
+      }
     }
 
     function renderCharts() {
       const data = mainData();
       const metricData = data.points;
       const segments = contiguousSegments(metricData);
-      const drawdownPoints = toMetricData(rows, "unit_nav", initialCash).map((point) => ({...point, value: point.drawdown}));
+      const drawdownPoints = state.period === "1D"
+        ? toMetricData(rows, "unit_nav", initialCash).map((point) => ({...point, value: point.drawdown}))
+        : (() => {
+          const byPeriod = new Map();
+          for (const row of rows) {
+            if (asFiniteNumber(row.drawdown) === null) continue;
+            const key = periodKeyForDate(row.date, state.period);
+            if (!byPeriod.has(key)) byPeriod.set(key, []);
+            byPeriod.get(key).push(row);
+          }
+          return periodTimelineBars().map((bar) => {
+          const row = (byPeriod.get(bar.periodKey) || []).filter((candidate) => candidate.date <= bar.time).at(-1);
+          return {time: bar.time, date: bar.time, value: asFiniteNumber(row?.drawdown)};
+          });
+        })();
       const drawdownFiltered = filterDateRange(drawdownPoints, state.range, {endDate: rows.at(-1)?.date, validDateRange: rows.validDateRange});
       syncReady = false;
       clearSeries("main", charts.main);
@@ -1195,16 +1479,17 @@
         addReferenceLine(candle, state.metric);
         lineSeries.main = [candle];
       } else {
-        const mainSeries = setLineSegments(charts.main, "main", segments, "#0f766e", state.period === "1D" && state.metric !== "cumulative_return");
+        const mainSeries = setLineSegments(charts.main, "main", segments, "#0f766e", state.period === "1D" && state.metric !== "cumulative_return", {pad: state.period !== "1D"});
         addReferenceLine(mainSeries[0], state.metric);
       }
-      const drawdownSeries = setLineSegments(charts.drawdown, "drawdown", contiguousSegments(drawdownFiltered), "#b45309", false);
+      const drawdownSeries = setLineSegments(charts.drawdown, "drawdown", contiguousSegments(drawdownFiltered), "#b45309", false, {
+        pad: state.period !== "1D",
+        selectedEventDate: state.period !== "1D" ? selectedEventDate() : null,
+      });
       addReferenceLine(drawdownSeries[0], "drawdown", true);
-      if (benchmarkRows.length && state.period === "1D" && charts.main) {
-        const benchmarkPoints = filterDateRange(toMetricData(benchmarkRows, state.metric, initialCash), state.range, {endDate: rows.at(-1)?.date, validDateRange: rows.validDateRange});
-        setLineSegments(charts.main, "benchmark", contiguousSegments(benchmarkPoints), "#2563eb", false);
-      }
+      renderBenchmarkLines();
       applyMarkers(chartMarkers(data, metricData));
+      syncTimeGrids();
       syncReady = true;
       applyVisibleRange();
       renderCount += 1;
@@ -1234,7 +1519,7 @@
       const event = eventById(id);
       if (!event || destroyed) return null;
       state.selectedEventId = event.id;
-      if (notify) safeCallback(config.onSelectEvent, {...event});
+      if (notify) { safeCallback(config.onSelectEvent, {...event}); return {...event}; }
       const markerDate = event.date;
       expandRangeForEvent(markerDate);
       if (!usingFallback) {
@@ -1260,7 +1545,7 @@
       if (!parameter || typeof parameter !== "object") return null;
       if (parameter.eventId) return parameter.eventId;
       if (parameter.marker?.eventId) return parameter.marker.eventId;
-      if (parameter.marker?.id) return parameter.marker.id;
+      if (parameter.marker?.eventIds?.length === 1) return parameter.marker.eventIds[0];
       if (parameter.hoveredObjectId) return parameter.hoveredObjectId;
       if (Array.isArray(parameter.eventIds) && parameter.eventIds.length) return parameter.eventIds[0];
       return null;
@@ -1268,10 +1553,33 @@
 
     function handleClick(parameter) {
       const groups = currentGroups();
+      const markerId = parameter?.marker?.id || parameter?.hoveredObjectId || null;
+      const knownMarker = markerId ? markerLookup.get(String(markerId)) : null;
+      const marker = parameter?.marker || knownMarker;
+      const markerEventIds = [
+        ...(Array.isArray(parameter?.eventIds) ? parameter.eventIds : []),
+        ...(Array.isArray(marker?.eventIds) ? marker.eventIds : []),
+      ].map(String).filter((id, index, values) => values.indexOf(id) === index && eventById(id));
+      if (markerEventIds.length === 1) {
+        selectEvent(markerEventIds[0], true);
+        return;
+      }
+      if (markerEventIds.length > 1) {
+        const markerGroupId = String(marker?.groupId || parameter?.groupId || "");
+        const markerGroup = groups.find((item) => item.id === markerGroupId) || null;
+        safeCallback(config.onSelectEvent, {
+          type: "group",
+          groupId: markerGroupId || marker?.id || null,
+          date: markerGroup?.date || marker?.sourceDate || asDate(parameter?.time),
+          period: markerGroup?.period || state.period,
+          events: markerEventIds.map((id) => eventById(id)).filter(Boolean).map((event) => ({...event})),
+        });
+        return;
+      }
+      if (knownMarker && !knownMarker.eventIds?.length) return;
       const groupCandidates = [
         parameter?.groupId,
         parameter?.marker?.groupId,
-        parameter?.marker?.id,
         parameter?.hoveredObjectId,
       ].filter(Boolean).map(String);
       let group = groups.find((item) => groupCandidates.includes(String(item.id))) || null;
@@ -1301,13 +1609,18 @@
       if (destroyed || !parameter) return;
       const date = asDate(parameter.time || parameter.date);
       if (!date) return;
-      const row = rowByDate.get(date) || null;
-      const dayEvents = eventsByDate.get(date) || [];
+      const row = rowForMetricDate(state.metric, date);
+      const periodGroup = state.period === "1D" ? null : currentGroupForDate(date);
+      const dayEvents = periodGroup ? periodGroup.events : eventsByDate.get(date) || [];
+      const bar = periodBarForDate(date);
+      const value = state.period !== "1D" && state.metric !== "cumulative_return"
+        ? asFiniteNumber(bar?.close)
+        : row ? metricValue(row, state.metric, initialCash) : null;
       safeCallback(config.onHover, {
         date,
         row: row ? {...row} : null,
         metric: state.metric,
-        value: row ? metricValue(row, state.metric, initialCash) : null,
+        value,
         unit_nav: row?.unit_nav ?? null,
         equity: row?.equity ?? null,
         cumulative_return: row?.cumulative_return ?? null,
@@ -1316,7 +1629,8 @@
         events: dayEvents.map((event) => ({...event})),
         eventCount: dayEvents.length,
         period: state.period,
-        bar: periodBarForDate(date),
+        bar,
+        benchmarks: benchmarkPointsForHover(date),
       });
     }
 
@@ -1338,6 +1652,7 @@
       try { charts.drawdown?.remove?.(); } catch (_) {}
       charts.main = null;
       charts.drawdown = null;
+      timeGrids.main = null; timeGrids.drawdown = null; timelineDates = [];
       syncUsesTimeRange = false;
       lineSeries.main = [];
       lineSeries.drawdown = [];
@@ -1359,8 +1674,12 @@
       if (next.metric !== undefined) state.metric = metricName(next.metric);
       if (next.period !== undefined) state.period = periodName(next.period);
       if (next.range !== undefined) state.range = typeof next.range === "string" && RANGES.has(next.range.toUpperCase()) ? (next.range.toLowerCase() === "all" ? "all" : next.range.toUpperCase()) : next.range;
+      if (next.showDecisions !== undefined) state.showDecisions = asBoolean(next.showDecisions);
       if (next.selectedEventId !== undefined) state.selectedEventId = next.selectedEventId === null ? null : String(next.selectedEventId);
-      const changed = previous.metric !== state.metric || previous.period !== state.period || JSON.stringify(previous.range) !== JSON.stringify(state.range);
+      const changed = previous.metric !== state.metric
+        || previous.period !== state.period
+        || previous.showDecisions !== state.showDecisions
+        || JSON.stringify(previous.range) !== JSON.stringify(state.range);
       if (changed) render();
       else if (previous.selectedEventId !== state.selectedEventId && state.selectedEventId) selectEvent(state.selectedEventId, false);
       return controller;

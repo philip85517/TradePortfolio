@@ -704,12 +704,31 @@
 
   function toolbarHtml(model, state) {
     const capability = model.data?.capabilities || {};
-    const benchmark = capability.comparable_frozen_benchmark ? `<label class="portfolio-review-benchmark"><input type="checkbox" data-review-toggle="benchmark" ${state.benchmark ? "checked" : ""}>显示冻结基准</label>` : `<span class="portfolio-review-benchmark-disabled">本次运行未保存可比较冻结基准</span>`;
+    const benchmark = capability.comparable_frozen_benchmark ? `<label class="portfolio-review-benchmark"><input type="checkbox" data-review-toggle="benchmark" ${state.benchmark ? "checked" : ""}>显示冻结基准</label>` : `<span class="portfolio-review-benchmark-disabled">同期指数可在下方多选对比</span>`;
     const custom = state.range && typeof state.range === "object" ? state.range : {start: "", end: ""};
     const metricButtons = [["unit_nav", "单位净值"], ["equity", "权益（元）"], ["cumulative_return", "累计收益（%）"]].map(([value, label]) => `<button type="button" data-review-metric="${value}" class="${state.metric === value ? "active" : ""}" aria-pressed="${state.metric === value ? "true" : "false"}">${label}</button>`).join("");
     const periodButtons = [["1D", "日终"], ["1W", "周"], ["1M", "月"]].map(([value, label]) => `<button type="button" data-review-period="${value}" class="${state.period === value ? "active" : ""}" aria-pressed="${state.period === value ? "true" : "false"}">${label}</button>`).join("");
     const rangeButtons = [["all", "全部"], ["1M", "近 1 月"], ["3M", "近 3 月"], ["6M", "近 6 月"], ["1Y", "近 1 年"]].map(([value, label]) => `<button type="button" data-review-range="${value}" class="${state.range === value ? "active" : ""}" aria-pressed="${state.range === value ? "true" : "false"}">${label}</button>`).join("");
-    return `<div class="portfolio-review-toolbar" role="toolbar" aria-label="组合图表工具栏"><div class="portfolio-review-control-group" role="group" aria-label="指标"><span>指标</span>${metricButtons}</div><div class="portfolio-review-control-group" role="group" aria-label="周期"><span>周期</span>${periodButtons}</div><div class="portfolio-review-control-group" role="group" aria-label="范围"><span>范围</span>${rangeButtons}<label class="portfolio-review-custom-range">自定义<input type="date" data-review-range-input="start" value="${escapeHtml(custom.start || "")}"><span>至</span><input type="date" data-review-range-input="end" value="${escapeHtml(custom.end || "")}"></label><button type="button" data-review-action="apply-range">应用</button><button type="button" data-review-action="reset-range">重置</button></div><div class="portfolio-review-chart-note"><span>1W / 1M 为实际日终净值聚合的 K 线（开高低收），不代表盘中 OHLC。</span>${benchmark}<button type="button" data-review-export-nav>下载 NAV CSV</button></div></div>`;
+    return `<div class="portfolio-review-toolbar" role="toolbar" aria-label="组合图表工具栏"><div class="portfolio-review-control-group" role="group" aria-label="指标"><span>指标</span>${metricButtons}</div><div class="portfolio-review-control-group" role="group" aria-label="周期"><span>周期</span>${periodButtons}</div><div class="portfolio-review-control-group" role="group" aria-label="范围"><span>范围</span>${rangeButtons}<label class="portfolio-review-custom-range">自定义<input type="date" data-review-range-input="start" value="${escapeHtml(custom.start || "")}"><span>至</span><input type="date" data-review-range-input="end" value="${escapeHtml(custom.end || "")}"></label><button type="button" data-review-action="apply-range">应用</button><button type="button" data-review-action="reset-range">重置</button></div><div class="portfolio-review-chart-note"><span>1W / 1M 为实际日终净值聚合的 K 线（开高低收），不代表盘中 OHLC。</span>${benchmark}<label class="portfolio-review-benchmark"><input type="checkbox" data-review-toggle="decisions" ${state.showDecisions ? "checked" : ""}>显示决策与顺延</label><button type="button" data-review-export-nav>下载 NAV CSV</button></div></div>`;
+  }
+
+  const INDEX_COLORS = {sp500: "#7c3aed", csi300: "#2563eb", hsi: "#d97706"};
+
+  function comparisonHtml(model, state) {
+    const items = state.comparisons?.series || [["sp500", "标普500", "USD"], ["csi300", "沪深300", "CNY"], ["hsi", "恒生指数", "HKD"]].map(([id, name, currency]) => ({id, name, currency, error: state.comparisonStatus === "loading" ? "等待读取历史数据" : "暂未取得历史数据"}));
+    const rows = model.data.nav || [];
+    const first = rows.find(row => finite(row.unit_nav) > 0);
+    const last = rows.at(-1);
+    const portfolioReturn = first && finite(last?.unit_nav) !== null ? last.unit_nav / first.unit_nav - 1 : null;
+    const body = items.map(item => {
+      const available = item.status === "ready" && item.rows?.length > 0;
+      const lastRow = item.rows?.at(-1);
+      const total = available ? finite(lastRow?.cumulative_return) ?? (finite(lastRow?.unit_nav) === null ? null : lastRow.unit_nav - 1) : null;
+      const difference = total !== null && portfolioReturn !== null ? portfolioReturn - total : null;
+      const color = INDEX_COLORS[item.id] || "#64748b";
+      return `<div class="portfolio-review-index-card"><label><input type="checkbox" data-review-index="${escapeHtml(item.id)}" ${state.comparisonIds.includes(item.id) ? "checked" : ""} ${available ? "" : "disabled"}><i style="background:${color}"></i><strong>${escapeHtml(item.name)}</strong><span>${escapeHtml(item.currency || "")}</span></label><div>${available ? `<b>${formatPercent(total)}</b><span>组合收益差 ${difference === null ? "—" : (difference * 100).toFixed(2) + " 个百分点"}</span>` : `<span>${escapeHtml(item.error || "指数数据暂不可用")}</span>`}</div><small>${isSafeUrl(item.source_url) ? `<a href="${escapeHtml(item.source_url)}" target="_blank" rel="noopener noreferrer">${escapeHtml(item.source || "数据来源")}</a>` : escapeHtml(item.source || "")}${lastRow?.observed_date ? ` · 最新采用 ${escapeHtml(lastRow.observed_date)}` : ""}</small>${item.warnings?.length ? `<small class="portfolio-review-index-warning">${escapeHtml(item.warnings.map(w => typeof w === "string" ? w : w.message || w.reason || "存在数据缺口").join("；"))}</small>` : ""}</div>`;
+    }).join("");
+    return `<section class="portfolio-review-comparisons" aria-label="同期指数对比"><div class="portfolio-review-comparison-heading"><strong>同期指数对比</strong><span>组合区间收益 ${formatPercent(portfolioReturn)}</span>${state.comparisonStatus === "loading" ? `<span role="status">正在读取指数历史数据…</span>` : ""}${state.comparisonStatus === "error" ? `<span role="status">${escapeHtml(state.comparisonError)}</span>` : ""}<button type="button" data-review-action="retry-comparisons">重新读取指数</button></div><div class="portfolio-review-index-grid">${body}</div><p>以首个组合估值日为 1，对比收盘到收盘收益；与上方包含首日建仓收益的运行总收益口径不同。指数使用本币价格收益，不含分红、不换汇；组合为研究总回报口径，收益差仅作参考。按北京时间 15:00 已公布的收盘价对齐，港美市场通常采用前一交易日；沿用值保留原始日期。指数为事后加载的独立参考数据。</p>${state.metric === "equity" ? `<p>权益视图保留实际人民币金额；切换单位净值或累计收益查看指数曲线。</p>` : ""}</section>`;
   }
 
   function tabsHtml(state) {
@@ -750,7 +769,8 @@
     const chartModule = Object.prototype.hasOwnProperty.call(config, "charts") ? config.charts : root?.PortfolioReviewCharts;
     const state = {
       status: config.data ? (config.fallback ? "fallback" : "ready") : "loading",
-      metric: "unit_nav", period: "1D", range: "all", tab: "events", benchmark: false,
+      metric: "unit_nav", period: "1D", range: "all", tab: "events", benchmark: false, showDecisions: false,
+      comparisons: null, comparisonIds: [], comparisonStatus: "loading", comparisonError: "",
       selectedEventId: null, eventGroup: null, filters: {symbol: "", action: "", reason: "", dateStart: "", dateEnd: ""},
       eventLimit: 160, filterNotice: "", errorMessage: "", evidence: null, evidenceById: Object.create(null), evidenceError: "", hover: null,
       renderCount: 0,
@@ -789,12 +809,15 @@
       const host = query(container, '[data-review-region="chart"]');
       if (!host || !model) return;
       destroyChart();
+      state.hover = null; state.chartError = "";
       host.innerHTML = "";
       const data = chartData();
       if (chartModule && typeof chartModule.create === "function") {
         try {
           chartController = chartModule.create(host, {
             data,
+            metric: state.metric, period: state.period, range: state.range, showDecisions: state.showDecisions,
+            benchmarks: state.metric === "equity" ? [] : (state.comparisons?.series || []).filter(item => item.status === "ready" && state.comparisonIds.includes(item.id)).map(item => ({...item, color: INDEX_COLORS[item.id] || "#64748b"})),
             initialCash: model.data.initial_cash ?? model.data.summary?.initial_cash,
             benchmark: state.benchmark && model.data.benchmark_nav ? model.data.benchmark_nav : null,
             onSelectEvent: (event) => {
@@ -825,8 +848,8 @@
       const capability = data.capabilities || {};
       const periodText = state.period === "1D" ? "日终净值折线" : "周期内实际日终净值聚合 K 线";
       const gapText = capability.weekly_monthly_completeness === "complete" ? "冻结交易日历标记为完整" : capability.weekly_monthly_completeness ? `冻结周期完整性：${capability.weekly_monthly_completeness}` : "周期完整性以冻结交易日历为准";
-      const markerGuide = "图例：蓝色上箭头=买入，红色下箭头=卖出，灰色方块=决策，橙色方块=保留现金/数据提示，圆点=混合事件；点击图标查看事件";
-      const hoverEvents = Array.isArray(state.hover?.events) ? state.hover.events.map(actionLabel).filter(Boolean) : [];
+      const markerGuide = "图例：蓝色买▲=实际买入，红色卖▼=实际卖出，数字为成交笔数；灰色方块=决策、橙色方块=保留现金/数据提示（默认隐藏决策）。周/月显示该周期内全部事件，详情保留真实日期；点击图标固定详情";
+      const hoverEvents = Array.isArray(state.hover?.events) ? state.hover.events.map(event => `${event.date || ""} ${actionLabel(event)}${event.symbol ? ` ${event.symbol}` : ""}`).filter(Boolean) : [];
       const hoverBar = state.hover?.bar;
       const hoverRow = state.hover?.row;
       const staleDays = finite(hoverRow?.max_valuation_stale_days);
@@ -836,12 +859,14 @@
       ].filter(Boolean);
       const hoverDetails = [
         hoverEvents.length ? `事件：${hoverEvents.join("、")}` : "",
+        ...(state.hover?.benchmarks || []).map(item => `${item.name}: ${state.metric === "cumulative_return" ? formatPercent(item.value) : formatNumber(item.value, 4)}${item.observed_date ? `（采用 ${item.observed_date}）` : ""}`),
         ...hoverWarnings,
       ].filter(Boolean).join("；");
       const hoverText = state.hover
-        ? `${state.hover.date} · ${state.hover.value == null ? "净值未知" : formatNumber(state.hover.value, 4)}${state.hover.eventCount ? ` · ${state.hover.eventCount} 个事件` : ""}${hoverDetails ? ` · ${hoverDetails}` : ""}`
+        ? `${state.hover.date} · ${state.hover.value == null ? "数值未知" : state.metric === "cumulative_return" ? formatPercent(state.hover.value) : formatNumber(state.hover.value, 4)}${state.hover.eventCount ? ` · ${state.hover.eventCount} 个事件` : ""}${hoverDetails ? ` · ${hoverDetails}` : ""}`
         : "悬停图表查看冻结日终值";
-      note.textContent = `${periodText}；${gapText}。${markerGuide}。${state.chartError ? ` ${state.chartError}。` : ""} ${hoverText}。图表库：TradingView Lightweight Charts 4.2.3`;
+      const comparisonNote = state.metric !== "equity" && state.comparisonIds.length ? "当前图表按首个估值日归一化，组合与指数同起点；切换范围仅缩放。" : "当前图表保留原始运行净值口径。";
+      note.textContent = `${comparisonNote}${periodText}；${gapText}。${markerGuide}。${state.chartError ? ` ${state.chartError}。` : ""} ${hoverText}。图表库：TradingView Lightweight Charts 4.2.3`;
     }
 
     function renderLoading() {
@@ -859,7 +884,7 @@
 
     function renderShell() {
       if (!container || !model) { renderLoading(); return; }
-      container.innerHTML = `<div class="portfolio-review-shell" data-review-root="true"><div data-review-region="state"></div><div data-review-region="header"></div><div data-review-region="metrics"></div><div data-review-region="facts"></div><div data-review-region="toolbar"></div><div class="portfolio-review-chart-wrap"><div data-review-region="chart"></div><p class="portfolio-review-chart-note" data-review-chart-note></p></div><div data-review-region="tabs"></div><div data-review-region="details"></div></div>`;
+      container.innerHTML = `<div class="portfolio-review-shell" data-review-root="true"><div data-review-region="state"></div><div data-review-region="header"></div><div data-review-region="metrics"></div><div data-review-region="facts"></div><div data-review-region="toolbar"></div><div data-review-region="comparisons"></div><div class="portfolio-review-chart-wrap"><div data-review-region="chart"></div><p class="portfolio-review-chart-note" data-review-chart-note></p></div><div data-review-region="tabs"></div><div data-review-region="details"></div></div>`;
       shellReady = true;
       bindListeners();
       renderAllRegions();
@@ -872,6 +897,7 @@
       setRegion("header", resultHeaderHtml(model, state));
       setRegion("metrics", `<section class="portfolio-review-metrics"><div class="portfolio-review-primary-grid">${compactMetricGrid(model.data)}</div><div class="portfolio-review-secondary-grid">${secondaryMetricGrid(model.data)}</div></section>`);
       setRegion("facts", summaryFactsHtml(model.data));
+      setRegion("comparisons", comparisonHtml(model, state));
       setRegion("toolbar", toolbarHtml(model, state));
       setRegion("tabs", tabsHtml(state));
       setRegion("details", state.tab === "events" ? eventTabHtml(model, state) : state.tab === "holdings" ? holdingsTabHtml(model) : evidenceText(model, state));
@@ -939,6 +965,8 @@
 
     function openEventGroup(group) {
       if (destroyed || !group || !Array.isArray(group.events) || group.events.length < 2) return null;
+      state.tab = "events";
+      setRegion("tabs", tabsHtml(state));
       state.selectedEventId = null;
       state.eventGroup = {
         groupId: String(group.groupId || group.id || ""),
@@ -958,6 +986,7 @@
       const oldIdentity = identity();
       const changedIdentity = JSON.stringify(nextIdentity) !== JSON.stringify(oldIdentity);
       const dataExpanded = Boolean(model && !model.data.nav.length && next.data.nav.length);
+      if (changedIdentity) { state.comparisons = null; state.comparisonIds = []; state.comparisonStatus = "loading"; state.comparisonError = ""; }
       if (changedIdentity || dataExpanded) { destroyChart(); shellReady = false; state.selectedEventId = null; state.eventGroup = null; state.filters = {symbol: "", action: "", reason: "", dateStart: "", dateEnd: ""}; }
       model = next;
       state.portfolioId = next.portfolioId; state.horizon = next.horizon;
@@ -982,6 +1011,19 @@
       return controller;
     }
 
+    function setComparisons(payload) {
+      if (destroyed) return controller;
+      const firstLoad = !state.comparisons;
+      state.comparisons = payload && typeof payload === "object" ? payload : {series: []};
+      state.comparisonStatus = "ready"; state.comparisonError = "";
+      const readyIds = (state.comparisons.series || []).filter(item => item.status === "ready" && item.rows?.length).map(item => item.id);
+      state.comparisonIds = firstLoad ? readyIds : state.comparisonIds.filter(id => readyIds.includes(id));
+      if (shellReady && model) { setRegion("comparisons", comparisonHtml(model, state)); renderChart(); }
+      return controller;
+    }
+    function setComparisonsLoading() { if (destroyed) return controller; state.comparisonStatus = "loading"; if (model && shellReady) setRegion("comparisons", comparisonHtml(model, state)); return controller; }
+    function setComparisonsError(error) { if (destroyed) return controller; state.comparisonStatus = "error"; state.comparisonError = String(error?.message || error || "指数读取失败"); if (model && shellReady) setRegion("comparisons", comparisonHtml(model, state)); return controller; }
+
     function setEvidence(payload) { state.evidence = payload && typeof payload === "object" ? payload : null; state.evidenceById = buildEvidenceIndex(state.evidence); state.evidenceError = ""; if (shellReady && state.tab === "evidence") setRegion("details", evidenceText(model, state)); else if (shellReady && state.tab === "events") setRegion("details", eventTabHtml(model, state)); return controller; }
     function setEvidenceError(error) { state.evidenceError = String(error?.message || error || "摘要证据读取失败"); if (shellReady && state.tab === "evidence") setRegion("details", evidenceText(model, state)); return controller; }
 
@@ -989,6 +1031,9 @@
       if (destroyed || !next || typeof next !== "object") return controller;
       const chartUpdate = {};
       let benchmarkChanged = false;
+      if (next.comparisonIds !== undefined) { state.comparisonIds = Array.isArray(next.comparisonIds) ? next.comparisonIds.map(String) : []; benchmarkChanged = true; }
+      if (next.showDecisions !== undefined) { state.showDecisions = Boolean(next.showDecisions); chartUpdate.showDecisions = state.showDecisions; }
+      if (next.metric !== undefined && state.comparisons) benchmarkChanged = true;
       if (next.metric !== undefined) { state.metric = String(next.metric); chartUpdate.metric = state.metric; }
       if (next.period !== undefined) { state.eventGroup = null; state.period = String(next.period); chartUpdate.period = state.period; }
       if (next.range !== undefined) { state.range = next.range; chartUpdate.range = state.range; }
@@ -998,11 +1043,12 @@
         state.selectedEventId = null;
         chartUpdate.selectedEventId = null;
       }
-      if (next.benchmark !== undefined) { benchmarkChanged = state.benchmark !== Boolean(next.benchmark); state.benchmark = Boolean(next.benchmark); chartUpdate.benchmark = state.benchmark; }
+      if (next.benchmark !== undefined) { benchmarkChanged = benchmarkChanged || state.benchmark !== Boolean(next.benchmark); state.benchmark = Boolean(next.benchmark); chartUpdate.benchmark = state.benchmark; }
       if (benchmarkChanged && chartController) renderChart();
       else if (Object.keys(chartUpdate).length && chartController) chartController.update({...chartUpdate, selectedEventId: state.selectedEventId});
-      if (next.metric !== undefined || next.period !== undefined || next.range !== undefined || next.benchmark !== undefined) setRegion("toolbar", toolbarHtml(model, state));
+      if (next.metric !== undefined || next.period !== undefined || next.range !== undefined || next.benchmark !== undefined || next.showDecisions !== undefined) setRegion("toolbar", toolbarHtml(model, state));
       if (next.tab !== undefined || next.period !== undefined || next.filters) { setRegion("tabs", tabsHtml(state)); setRegion("details", state.tab === "events" ? eventTabHtml(model, state) : state.tab === "holdings" ? holdingsTabHtml(model) : evidenceText(model, state)); }
+      if (model && (next.comparisonIds !== undefined || next.metric !== undefined)) setRegion("comparisons", comparisonHtml(model, state));
       renderChartNote();
       return controller;
     }
@@ -1012,6 +1058,7 @@
       listenersBound = true;
       container.addEventListener("click", (event) => {
         const target = event.target;
+        if (target?.closest?.("[data-review-action]")?.getAttribute?.("data-review-action") === "retry-comparisons") { config.onReloadComparisons?.(identity()); return; }
         const groupEvent = target?.closest?.("[data-review-group-event]");
         if (groupEvent) { event.preventDefault(); state.eventGroup = null; selectEvent(groupEvent.getAttribute("data-review-group-event"), {fromChart: true}); return; }
         const eventButton = target?.closest?.("[data-review-event]");
@@ -1061,6 +1108,9 @@
           if (select === "horizon") config.onSelectionChange?.({...identity(), horizon: value});
           return;
         }
+        const indexId = event.target?.getAttribute?.("data-review-index");
+        if (indexId) { update({comparisonIds: event.target.checked ? [...new Set([...state.comparisonIds, indexId])] : state.comparisonIds.filter(id => id !== indexId)}); return; }
+        if (event.target?.getAttribute?.("data-review-toggle") === "decisions") { update({showDecisions: event.target.checked}); return; }
         const toggle = event.target?.getAttribute?.("data-review-toggle"); if (toggle === "benchmark") update({benchmark: event.target.checked});
       });
       container.addEventListener("keydown", (event) => {
@@ -1088,6 +1138,9 @@
       setData,
       setLoading,
       setError,
+      setComparisons,
+      setComparisonsLoading,
+      setComparisonsError,
       setEvidence,
       setEvidenceError,
       setIdentity,

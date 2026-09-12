@@ -152,8 +152,9 @@
     const query=id.portfolioId ? `?portfolio_id=${encodeURIComponent(id.portfolioId)}` : '';
     return `/research/review/${runId}/api/portfolio${query}`;
   }
+  function reviewComparisonsUrl(identity) { return `/research/review/${encodeURIComponent(identity?.runId || '')}/api/index-comparisons?portfolio_id=${encodeURIComponent(identity?.portfolioId || 'strategy')}&horizon=${encodeURIComponent(identity?.horizon || '')}`; }
   function reviewSummaryUrl(identity) { return `/research/review/${encodeURIComponent(identity?.runId || '')}/api/summary`; }
-  if (typeof module !== 'undefined') module.exports = {validateScope, acceptResponse, coverageHtml, calendarLabel, gates, unfinishedDrafts, selectionSymbols, repairLabel, filterIssues, issuesHtml, attemptSummary, diagnosticLabel, taskForDraft, taskTiming, liquidationHtml, adjustmentHtml, pendingReadinessHtml, readinessHeadline, readinessGate, explorationHelp, previewPendingHtml, restoredStep, executionHtml, submissionKey, clearSubmissionKey, reviewIdentity, reviewUrl, reviewSummaryUrl};
+  if (typeof module !== 'undefined') module.exports = {validateScope, acceptResponse, coverageHtml, calendarLabel, gates, unfinishedDrafts, selectionSymbols, repairLabel, filterIssues, issuesHtml, attemptSummary, diagnosticLabel, taskForDraft, taskTiming, liquidationHtml, adjustmentHtml, pendingReadinessHtml, readinessHeadline, readinessGate, explorationHelp, previewPendingHtml, restoredStep, executionHtml, submissionKey, clearSubmissionKey, reviewIdentity, reviewUrl, reviewSummaryUrl, reviewComparisonsUrl};
   if (typeof document === 'undefined') return;
   const $ = id => document.getElementById(id);
   const fmt = v => v == null ? '—' : typeof v === 'number' ? v.toLocaleString('zh-CN',{maximumFractionDigits:2}) : String(v);
@@ -194,15 +195,28 @@
     reviewOwnerKey=ownerKey; reviewSourceResult=result;
     reviewController=window.PortfolioReviewUI.create($('results'),{data:result,fallback:true,portfolioId:base.portfolioId,horizon:base.horizon,
       onRetry:(identity)=>loadPortfolioReview(result,identity,true),
+      onReloadComparisons:()=>loadComparisons(),
       onSelectionChange:(identity)=>loadPortfolioReview(result,identity)});
     const requestToken=++reviewEpoch, ownerDraft=draft?.id, ownerTask=task?.id, controller=reviewController;
     reviewAbort=typeof AbortController==='function'?new AbortController():null;
     controller.setLoading({data:result,portfolioId:base.portfolioId,horizon:base.horizon});
+    const abortSignal=reviewAbort?.signal;
+    let comparisonRequest=0;
+    function loadComparisons() {
+      const serial=++comparisonRequest;
+      controller.setComparisonsLoading();
+      reviewFetch(reviewComparisonsUrl(base),abortSignal).then(payload=>{
+        if(serial===comparisonRequest && requestToken===reviewEpoch && controller===reviewController && reviewOwnerKey===ownerKey) controller.setComparisons(payload);
+      }).catch(error=>{
+        if(serial===comparisonRequest && requestToken===reviewEpoch && controller===reviewController && error?.name!=='AbortError') controller.setComparisonsError(error);
+      });
+    }
     const runPath=reviewUrl(base);
     reviewFetch(runPath,reviewAbort?.signal).then((payload)=>{
       if(requestToken!==reviewEpoch || controller!==reviewController || draft?.id!==ownerDraft || task?.id!==ownerTask || reviewOwnerKey!==ownerKey) return;
       const detailIdentity=reviewIdentity(payload,base.portfolioId,base.horizon);
       controller.setData(payload,{portfolioId:detailIdentity.portfolioId,horizon:detailIdentity.horizon});
+      loadComparisons();
       reviewFetch(reviewSummaryUrl(base),reviewAbort?.signal).then((summary)=>{
         if(requestToken===reviewEpoch && controller===reviewController && reviewOwnerKey===ownerKey) controller.setEvidence(summary);
       }).catch((summaryError)=>{

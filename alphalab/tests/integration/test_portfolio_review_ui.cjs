@@ -276,9 +276,9 @@ test('DOM review lifecycle exposes evidence chronology, selected side detail, gr
     bar: {warning: '末段未完整'},
   });
   const chartNote = container.querySelector('[data-review-chart-note]').textContent;
-  assert.match(chartNote, /蓝色上箭头=买入/);
-  assert.match(chartNote, /点击图标查看事件/);
-  assert.match(chartNote, /事件：卖出、入选/);
+  assert.match(chartNote, /蓝色买▲=实际买入/);
+  assert.match(chartNote, /点击图标固定详情/);
+  assert.match(chartNote, /事件： 卖出、 入选/);
   assert.match(chartNote, /末段未完整/);
   assert.match(chartNote, /估值陈旧：000001/);
   controller.setEvidence({spec: {wizard_metadata: {delisting_events: [{
@@ -387,4 +387,32 @@ test('holdings render ending market value and settlement evidence separately fro
   assert.doesNotMatch(unknownHtml, /全部清算后现金/);
   assert.doesNotMatch(unknownHtml, /冻结证据显示期末没有持仓/);
   unknownController.destroy();
+});
+
+test('index comparisons load independently, select multiple series, and preserve chart controls', () => {
+  const container = observableContainer();
+  const creations = [];
+  const charts = {create(host, options) { creations.push(options); return {update() {}, destroy() {}}; }};
+  const controller = ui.create(container, {data: {review: sampleReview()}, charts});
+  assert.equal(typeof controller.setComparisons, 'function');
+  controller.update({period: '1M', range: '1Y', showDecisions: true});
+  controller.setComparisons({series: [
+    {id: 'sp500', name: '标普500', status: 'ready', currency: 'USD', source: 'Test source', rows: [{date:'2025-06-12', unit_nav:1}, {date:'2025-12-03', unit_nav:1.2}]},
+    {id: 'csi300', name: '沪深300', status: 'unavailable', error:'来源暂不可用', rows:[]},
+    {id: 'hsi', name: '恒生指数', status: 'ready', currency: 'HKD', rows: [{date:'2025-06-12',unit_nav:1}, {date:'2025-12-03',unit_nav:1.1}]},
+  ]});
+  assert.match(container.region('comparisons'), /标普500/);
+  assert.match(container.region('comparisons'), /来源暂不可用/);
+  assert.match(container.region('comparisons'), /20.00%/);
+  assert.match(container.region('comparisons'), /收益差/);
+  assert.equal(creations.at(-1).benchmarks.length, 2);
+  assert.equal(creations.at(-1).period, '1M');
+  assert.equal(creations.at(-1).range, '1Y');
+  assert.equal(creations.at(-1).showDecisions, true);
+  controller.update({comparisonIds: ['hsi']});
+  assert.deepEqual(creations.at(-1).benchmarks.map(item=>item.id), ['hsi']);
+  controller.update({metric: 'equity'});
+  assert.equal(creations.at(-1).benchmarks.length, 0);
+  assert.match(container.region('comparisons'), /权益/);
+  controller.destroy();
 });

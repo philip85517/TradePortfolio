@@ -350,6 +350,19 @@ class ReviewState:
         )
         return payload
 
+    def index_comparisons(self, portfolio_id: str | None = None, horizon: str | None = None) -> dict[str, Any]:
+        """Load optional reference indices separately from immutable research artifacts."""
+        from .index_comparison import load_index_comparisons
+
+        detail = self.portfolio_detail(portfolio_id)
+        by_horizon = detail["review"].get("by_horizon", {})
+        selected = str(horizon or next(iter(by_horizon), ""))
+        if selected not in by_horizon:
+            raise ValueError("观察周期不存在")
+        dates = [row["date"] for row in by_horizon[selected].get("nav", []) if row.get("date")]
+        result = load_index_comparisons(self.run.run_dir.parent / ".index-comparison-cache", dates)
+        return {**result, "run_id": self.run.run_dir.name, "portfolio_id": detail["portfolio_id"], "horizon": selected}
+
     def candidates(
         self,
         *,
@@ -584,6 +597,9 @@ class ReviewRequestHandler(BaseHTTPRequestHandler):
             elif parsed.path == "/api/portfolio":
                 params = parse_qs(parsed.query)
                 self._send_json(self.review_state.portfolio_detail(_first(params, "portfolio_id")))
+            elif parsed.path == "/api/index-comparisons":
+                params = parse_qs(parsed.query)
+                self._send_json(self.review_state.index_comparisons(_first(params, "portfolio_id"), _first(params, "horizon")))
             elif parsed.path == "/api/candidates":
                 params = parse_qs(parsed.query)
                 self._send_json(
