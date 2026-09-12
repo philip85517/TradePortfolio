@@ -38,6 +38,26 @@ function navData() {
   };
 }
 
+function longNavData() {
+  const data = navData();
+  data.scope.valid_date_range = ['2023-01-03', '2025-12-03'];
+  data.nav = [
+    {date: '2023-01-03', equity: 1000, daily_return: 0, drawdown: 0},
+    {date: '2024-12-03', equity: 1100, daily_return: 0.1, drawdown: 0},
+    {date: '2025-12-03', equity: 1200, daily_return: 0.09, drawdown: 0},
+  ];
+  data.events = [
+    {id: 'buy-1', date: '2023-01-03', action: 'BUY', action_label: '买入', filled: true, symbol: '000001'},
+    {id: 'sell-1', date: '2025-12-03', action: 'SELL', action_label: '卖出', filled: true, symbol: '000001'},
+  ];
+  data.capabilities = {
+    session_list: ['2023-01-03', '2024-12-03', '2025-12-03'],
+    valid_date_range: ['2023-01-03', '2025-12-03'],
+    missing_session_dates: [],
+  };
+  return data;
+}
+
 function fakeElement(width = 640, height = 360) {
   const element = {
     children: [],
@@ -68,7 +88,8 @@ function fakeDocument() {
   return document;
 }
 
-function fakeChartApi(log) {
+function fakeChartApi(log, options = {}) {
+  const strict = Boolean(options.strict);
   const dateKey = (value) => {
     if (typeof value === 'string') return value;
     if (value && typeof value === 'object' && value.year) return `${String(value.year).padStart(4, '0')}-${String(value.month).padStart(2, '0')}-${String(value.day).padStart(2, '0')}`;
@@ -100,6 +121,7 @@ function fakeChartApi(log) {
       series: [],
       ranges: [],
       dateRanges: [],
+      visibleRanges: [],
       removed: false,
       crosshairPositions: [],
       clearedCrosshair: 0,
@@ -118,7 +140,17 @@ function fakeChartApi(log) {
           unsubscribeVisibleTimeRangeChange(fn) { timeRangeHandlers.delete(fn); },
           setVisibleRange(value) {
             if (!object.series.some((item) => item.times?.size)) throw new Error(`Value is null: ${name} has no data`);
-            object.dateRanges.push(value); log.push(['dateRange', name, value]);
+            const requested = {from: dateKey(value.from), to: dateKey(value.to)};
+            const available = [...new Set(object.series.flatMap((item) => [...(item.times || [])]))].sort();
+            const actual = strict && available.length
+              ? {
+                from: available.find((date) => date >= requested.from) || available[0],
+                to: [...available].reverse().find((date) => date <= requested.to) || available.at(-1),
+              }
+              : value;
+            object.dateRanges.push(value);
+            object.visibleRanges.push(actual);
+            log.push(['dateRange', name, value]);
           },
           fitContent() { log.push(['fit', name]); },
         };
@@ -332,6 +364,46 @@ test('successive custom ranges use distinct canonical event groups on one contro
   controller.destroy();
 });
 
+test('locateEvent expands a bounded range before positioning an out-of-range factual event', () => {
+  const h = charts();
+  const document = fakeDocument();
+  const container = fakeElement();
+  container.ownerDocument = document;
+  const log = [];
+  const library = fakeChartApi(log, {strict: true});
+  const errors = [];
+  const controller = h.create(container, {data: longNavData(), initialCash: 1000, library, onError: (error) => errors.push(error)});
+  controller.update({range: '1Y'});
+  assert.equal(controller.getState().range, '1Y');
+  controller.locateEvent('buy-1');
+  assert.equal(controller.getState().range, 'all');
+  assert.equal(controller.getState().selectedEventId, 'buy-1');
+  for (const chart of library.charts) {
+    const visible = chart.visibleRanges.at(-1);
+    assert.ok(visible.from <= '2023-01-03' && visible.to >= '2023-01-03');
+    assert.ok(visible.to > visible.from);
+  }
+  assert.equal(errors.length, 0);
+  controller.destroy();
+});
+
+test('cumulative return line keeps grouped markers in weekly and monthly modes', () => {
+  const h = charts();
+  const document = fakeDocument();
+  const container = fakeElement();
+  container.ownerDocument = document;
+  const log = [];
+  const library = fakeChartApi(log);
+  const controller = h.create(container, {data: navData(), initialCash: 1000, library});
+  for (const period of ['1W', '1M']) {
+    controller.update({period, metric: 'cumulative_return'});
+    const mainLines = library.charts[0].series.filter((series) => series.kind === 'line');
+    assert.ok(mainLines.some((series) => series.markers.some((marker) => marker.eventIds.includes('buy-1'))), period);
+    assert.ok(mainLines.every((series) => series.markers.every((marker) => series.data.some((point) => point.time === marker.time))), period);
+  }
+  controller.destroy();
+});
+
 test('native marker sets are sorted, series-time compatible, and period markers retain factual event dates', () => {
   const h = charts();
   const document = fakeDocument();
@@ -344,9 +416,11 @@ test('native marker sets are sorted, series-time compatible, and period markers 
   controller.update({ period: '1W' });
   const candle = library.charts[0].series.find((series) => series.kind === 'candlestick');
   assert.ok(candle);
-  assert.deepEqual(candle.data.filter((point) => point.open !== undefined).map((point) => point.time), ['2025-01-03', '2025-01-08']);
+  assert.deepEqual(candle.data.filter((point) => point.open !== undefined).map((point) => point.time), ['2025-01-03']);
+  assert.ok(candle.data.some((point) => point.time === '2025-01-08' && point.open === undefined));
   assert.equal(candle.markers.every((marker, index) => index === 0 || marker.time >= candle.markers[index - 1].time), true);
   assert.equal(candle.markers.every((marker) => candle.data.some((point) => point.time === marker.time)), true);
+  assert.ok(candle.markers.some((marker) => marker.id.startsWith('warning-') && marker.sourceDate === '2025-01-08'));
   const marker = candle.markers.find((item) => item.eventIds.includes('sell-1'));
   assert.equal(marker.sourceDate, '2025-01-09');
   assert.equal(errors.length, 0);

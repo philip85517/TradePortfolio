@@ -619,23 +619,34 @@
     return element;
   }
 
+  function barHasUsableOHLC(bar) {
+    return Boolean(
+      bar
+      && !(bar.missingDates?.length)
+      && !(bar.unknownDates?.length)
+      && [bar.open, bar.high, bar.low, bar.close].every((value) => asFiniteNumber(value) !== null),
+    );
+  }
+
   function fallbackSvg(points, bars, metric, drawdown) {
     const width = 760;
     const height = drawdown ? 120 : 220;
     const padding = {left: 42, right: 12, top: 12, bottom: 26};
-    const values = bars?.length
-      ? bars.flatMap((bar) => [bar.low, bar.high]).filter((value) => asFiniteNumber(value) !== null)
+    const candleBars = (Array.isArray(bars) ? bars : []).filter(barHasUsableOHLC);
+    const values = candleBars.length
+      ? candleBars.flatMap((bar) => [bar.low, bar.high]).filter((value) => asFiniteNumber(value) !== null)
       : points.flatMap((point) => [point.value]).filter((value) => asFiniteNumber(value) !== null);
     let min = values.length ? Math.min(...values) : 0;
     let max = values.length ? Math.max(...values) : 1;
     if (drawdown) min = Math.min(min, 0);
     if (max === min) max = min + 1;
-    const source = bars?.length ? bars.map((bar) => ({time: bar.time, value: bar.close})) : points;
+    const source = bars?.length ? bars.map((bar) => ({time: bar.time, value: barHasUsableOHLC(bar) ? bar.close : null})) : points;
     const x = (index) => padding.left + (width - padding.left - padding.right) * (source.length <= 1 ? 0 : index / (source.length - 1));
     const y = (value) => padding.top + (max - value) / (max - min) * (height - padding.top - padding.bottom);
     const paths = [];
     if (bars?.length) {
       bars.forEach((bar, index) => {
+        if (!barHasUsableOHLC(bar)) return;
         const middle = x(index);
         const open = y(bar.open); const close = y(bar.close); const high = y(bar.high); const low = y(bar.low);
         paths.push(`<line x1="${middle}" y1="${high}" x2="${middle}" y2="${low}" stroke="#2563eb"/><rect x="${middle - 4}" y="${Math.min(open, close)}" width="8" height="${Math.max(1, Math.abs(close - open))}" fill="${close >= open ? "#15803d" : "#b42318"}"/>`);
@@ -885,6 +896,32 @@
       return {from: bounds.start, to: bounds.end};
     }
 
+    function eventContextRange(date) {
+      const source = filterDateRange(rows, "all", {
+        endDate: rows.at(-1)?.date,
+        validDateRange: rows.validDateRange,
+      });
+      if (!source.length) return {from: date, to: date};
+      const dates = source.map((row) => row.date);
+      let index = dates.findIndex((value) => value >= date);
+      if (index < 0) index = dates.length - 1;
+      const from = dates[Math.max(0, index - 10)] || date;
+      const to = dates[Math.min(dates.length - 1, index + 10)] || date;
+      return {from: date < from ? date : from, to: date > to ? date : to};
+    }
+
+    function expandRangeForEvent(date) {
+      if (!date) return false;
+      const bounds = dateRangeBounds(rows, state.range, {
+        endDate: rows.at(-1)?.date,
+        validDateRange: rows.validDateRange,
+      });
+      if ((!bounds.start || date >= bounds.start) && (!bounds.end || date <= bounds.end)) return false;
+      state.range = "all";
+      render();
+      return true;
+    }
+
     function applyVisibleRange() {
       if (usingFallback) return;
       const range = visibleDateRange();
@@ -1028,36 +1065,47 @@
     }
 
     function warningMarkers(bars) {
-      return (Array.isArray(bars) ? bars : []).filter((bar) => bar.warning || bar.isPartial).map((bar) => ({
-        time: bar.time,
-        sourceDate: bar.periodEnd || bar.time,
-        id: `warning-${bar.periodKey || bar.time}`,
-        eventId: null,
-        eventIds: [],
-        position: "aboveBar",
-        shape: "square",
-        color: "#b45309",
-        text: bar.partialLabel || "周期完整性警告",
-        exactDateAvailable: true,
-      }));
+      const source = Array.isArray(bars) ? bars : [];
+      const usable = source.filter(barHasUsableOHLC);
+      return source.filter((bar) => bar.warning || bar.isPartial).map((bar) => {
+        const target = barHasUsableOHLC(bar)
+          ? bar
+          : usable.find((candidate) => candidate.time >= bar.time) || usable.at(-1);
+        return target ? {
+          time: target.time,
+          sourceDate: bar.periodEnd || bar.time,
+          id: `warning-${bar.periodKey || bar.time}`,
+          eventId: null,
+          eventIds: [],
+          position: "aboveBar",
+          shape: "square",
+          color: "#b45309",
+          text: bar.partialLabel || "周期完整性警告",
+          exactDateAvailable: true,
+        } : null;
+      }).filter(Boolean);
     }
 
     function chartMarkers(data, metricData) {
       const availableDates = metricData.filter((point) => point.value !== null).map((point) => point.time);
+      const candleMode = state.period !== "1D" && state.metric !== "cumulative_return" && data.bars.length > 0;
       const periodBars = new Map(data.bars.map((bar) => [bar.periodKey, bar]));
       const eventMarkers = markersForEvents(data.groups, availableDates).map((marker) => {
-        if (state.period === "1D") return marker;
+        if (!candleMode) return marker;
         const group = data.groups.find((candidate) => candidate.id === marker.id);
         const bar = group ? periodBars.get(group.periodKey) : null;
         return bar
           ? {...marker, time: bar.time, sourceDate: marker.sourceDate || marker.time, exactDateAvailable: true}
           : {...marker, exactDateAvailable: false};
       });
-      return sortMarkers(eventMarkers.concat(staleMarkers(metricData, data.bars, state.period), warningMarkers(data.bars)));
+      return sortMarkers(eventMarkers.concat(
+        staleMarkers(metricData, candleMode ? data.bars : [], candleMode ? state.period : "1D"),
+        candleMode ? warningMarkers(data.bars) : [],
+      ));
     }
 
     function candleSeriesData(bars) {
-      const actual = new Map((Array.isArray(bars) ? bars : []).map((bar) => [bar.time, {
+      const actual = new Map((Array.isArray(bars) ? bars : []).filter(barHasUsableOHLC).map((bar) => [bar.time, {
         time: bar.time,
         open: bar.open,
         high: bar.high,
@@ -1135,16 +1183,21 @@
       if (!event || destroyed) return null;
       state.selectedEventId = event.id;
       if (notify) safeCallback(config.onSelectEvent, {...event});
+      const markerDate = event.date;
+      expandRangeForEvent(markerDate);
       if (!usingFallback) {
-        const markerDate = event.date;
-        for (const chart of [charts.main, charts.drawdown]) {
-          const scale = chartTimeScale(chart);
-          if (!scale || !markerDate) continue;
-          try {
-            if (typeof scale.setVisibleRange === "function") scale.setVisibleRange({from: markerDate, to: markerDate});
-            else if (typeof scale.setVisibleLogicalRange === "function") scale.setVisibleLogicalRange({from: markerDate, to: markerDate});
-          } catch (_) { /* an event outside the available axis remains in the accessible list */ }
-        }
+        const contextRange = eventContextRange(markerDate);
+        syncing = true;
+        try {
+          for (const chart of [charts.main, charts.drawdown]) {
+            const scale = chartTimeScale(chart);
+            if (!scale || !markerDate) continue;
+            try {
+              if (typeof scale.setVisibleRange === "function") scale.setVisibleRange(contextRange);
+              else if (typeof scale.setVisibleLogicalRange === "function") scale.setVisibleLogicalRange(contextRange);
+            } catch (_) { /* a compatible chart may reject an unavailable event date */ }
+          }
+        } finally { syncing = false; }
         const data = mainData();
         applyMarkers(chartMarkers(data, data.points));
       }
