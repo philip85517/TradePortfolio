@@ -421,8 +421,9 @@ test('native marker sets are sorted, series-time compatible, and period markers 
   assert.equal(candle.markers.every((marker, index) => index === 0 || marker.time >= candle.markers[index - 1].time), true);
   assert.equal(candle.markers.every((marker) => candle.data.some((point) => point.time === marker.time)), true);
   assert.ok(candle.markers.some((marker) => marker.id.startsWith('warning-') && marker.sourceDate === '2025-01-08'));
-  const marker = candle.markers.find((item) => item.eventIds.includes('sell-1'));
-  assert.equal(marker.sourceDate, '2025-01-09');
+  const marker = candle.markers.find((item) => item.eventIds.includes('buy-1'));
+  assert.equal(marker.sourceDate, '2025-01-02');
+  assert.equal(candle.markers.some((item) => item.eventIds.includes('sell-1')), false);
   assert.equal(errors.length, 0);
   controller.destroy();
 });

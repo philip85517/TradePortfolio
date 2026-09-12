@@ -1139,7 +1139,7 @@
         });
         const candleData = candleSeriesData(data.bars);
         candle.setData(candleData);
-        candle.__portfolioReviewTimes = new Set(data.bars.map((bar) => asDate(bar.time)).filter(Boolean));
+        candle.__portfolioReviewTimes = new Set(data.bars.filter(barHasUsableOHLC).map((bar) => asDate(bar.time)).filter(Boolean));
         addReferenceLine(candle, state.metric);
         lineSeries.main = [candle];
       } else {
