@@ -825,8 +825,23 @@
       const capability = data.capabilities || {};
       const periodText = state.period === "1D" ? "日终净值折线" : "周期内实际日终净值聚合 K 线";
       const gapText = capability.weekly_monthly_completeness === "complete" ? "冻结交易日历标记为完整" : capability.weekly_monthly_completeness ? `冻结周期完整性：${capability.weekly_monthly_completeness}` : "周期完整性以冻结交易日历为准";
-      const hoverText = state.hover ? `${state.hover.date} · ${state.hover.value == null ? "净值未知" : formatNumber(state.hover.value, 4)}${state.hover.eventCount ? ` · ${state.hover.eventCount} 个事件` : ""}` : "悬停图表查看冻结日终值";
-      note.textContent = `${periodText}；${gapText}。${state.chartError ? ` ${state.chartError}。` : ""} ${hoverText}。图表库：TradingView Lightweight Charts 4.2.3`;
+      const markerGuide = "图例：蓝色上箭头=买入，红色下箭头=卖出，灰色方块=决策，橙色方块=保留现金/数据提示，圆点=混合事件；点击图标查看事件";
+      const hoverEvents = Array.isArray(state.hover?.events) ? state.hover.events.map(actionLabel).filter(Boolean) : [];
+      const hoverBar = state.hover?.bar;
+      const hoverRow = state.hover?.row;
+      const staleDays = finite(hoverRow?.max_valuation_stale_days);
+      const hoverWarnings = [
+        hoverBar?.warning || hoverBar?.partialLabel || "",
+        hoverRow?.stale_symbols ? `估值陈旧：${hoverRow.stale_symbols}` : staleDays !== null && staleDays > 0 ? `估值陈旧 ${staleDays} 天` : "",
+      ].filter(Boolean);
+      const hoverDetails = [
+        hoverEvents.length ? `事件：${hoverEvents.join("、")}` : "",
+        ...hoverWarnings,
+      ].filter(Boolean).join("；");
+      const hoverText = state.hover
+        ? `${state.hover.date} · ${state.hover.value == null ? "净值未知" : formatNumber(state.hover.value, 4)}${state.hover.eventCount ? ` · ${state.hover.eventCount} 个事件` : ""}${hoverDetails ? ` · ${hoverDetails}` : ""}`
+        : "悬停图表查看冻结日终值";
+      note.textContent = `${periodText}；${gapText}。${markerGuide}。${state.chartError ? ` ${state.chartError}。` : ""} ${hoverText}。图表库：TradingView Lightweight Charts 4.2.3`;
     }
 
     function renderLoading() {

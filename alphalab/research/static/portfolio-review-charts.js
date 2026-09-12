@@ -534,10 +534,20 @@
     return String(label || event?.action || "事件");
   }
 
+  function eventMarkerStyle(group) {
+    const events = Array.isArray(group?.events) ? group.events : [];
+    const fillActions = [...new Set(events.filter(eventIsFill).map((event) => String(event.action || "").toUpperCase()))];
+    if (fillActions.length === 1 && fillActions[0] === "BUY") return {position: "belowBar", shape: "arrowUp"};
+    if (fillActions.length === 1 && fillActions[0] === "SELL") return {position: "aboveBar", shape: "arrowDown"};
+    if (fillActions.length) return {position: "aboveBar", shape: "circle"};
+    return {position: "aboveBar", shape: "square"};
+  }
+
   function markersForEvents(groups, availableDates) {
     const dates = availableDates ? new Set(uniqueDates(availableDates)) : null;
     return sortMarkers((Array.isArray(groups) ? groups : []).map((group) => {
       const first = group.events?.[0] || {};
+      const style = eventMarkerStyle(group);
       return {
         time: group.time || group.date,
         sourceDate: group.date,
@@ -545,10 +555,11 @@
         groupId: group.id,
         eventId: group.events?.length === 1 ? group.events[0].id : null,
         eventIds: [...(group.eventIds || [])],
-        position: group.hasFill ? (group.fills && !group.decisions ? "belowBar" : "aboveBar") : "aboveBar",
-        shape: group.hasFill ? (group.fills && !group.decisions ? "arrowUp" : "circle") : "square",
+        position: style.position,
+        shape: style.shape,
         color: markerColor(first),
-        text: group.count > 1 ? `${group.count} 个事件` : eventDisplayLabel(first),
+        title: group.count > 1 ? `${group.count} 个事件` : eventDisplayLabel(first),
+        text: "",
         exactDateAvailable: !dates || dates.has(group.date),
       };
     }));
@@ -1097,7 +1108,8 @@
         position: "aboveBar",
         shape: "square",
         color: "#b45309",
-        text: "估值陈旧",
+        title: "估值陈旧",
+        text: "",
         exactDateAvailable: true,
         };
       }).filter(Boolean);
@@ -1119,7 +1131,8 @@
           position: "aboveBar",
           shape: "square",
           color: "#b45309",
-          text: bar.partialLabel || "周期完整性警告",
+          title: bar.partialLabel || "周期完整性警告",
+          text: "",
           exactDateAvailable: true,
         } : null;
       }).filter(Boolean);

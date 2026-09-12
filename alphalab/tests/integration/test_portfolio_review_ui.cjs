@@ -264,6 +264,23 @@ test('DOM review lifecycle exposes evidence chronology, selected side detail, gr
   };
   const controller = ui.create(container, {data: sampleReview(), charts});
   assert.match(container.region('metrics'), /盈亏金额（元）/);
+  chartOptions.onHover({
+    date: '2025-06-13',
+    value: 0.9,
+    eventCount: 2,
+    events: [
+      {action: 'SELL', action_label: '卖出'},
+      {action: 'SELECT', action_label: '入选'},
+    ],
+    row: {stale_symbols: '000001'},
+    bar: {warning: '末段未完整'},
+  });
+  const chartNote = container.querySelector('[data-review-chart-note]').textContent;
+  assert.match(chartNote, /蓝色上箭头=买入/);
+  assert.match(chartNote, /点击图标查看事件/);
+  assert.match(chartNote, /事件：卖出、入选/);
+  assert.match(chartNote, /末段未完整/);
+  assert.match(chartNote, /估值陈旧：000001/);
   controller.setEvidence({spec: {wizard_metadata: {delisting_events: [{
     event_id: 'cninfo:002336:2025-039', published_at: '2025-06-06', trading_resumes_on: '2025-06-13',
     delisted_date: '2025-07-04', source_title: '正式退市决定公告', evidence_note: '首个可成交日来自冻结公告。',

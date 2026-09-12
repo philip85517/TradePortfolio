@@ -369,6 +369,29 @@ test('grouped marker click returns the full period context for an accessible cho
   controller.destroy();
 });
 
+test('dense adjacent event markers stay glyph-sized while retaining event groups', () => {
+  const h = charts();
+  const events = [
+    {id: 'defer-sell', date: '2025-06-03', action: 'DEFER_SELL', action_label: '延后卖出', filled: false, symbol: '000001'},
+    {id: 'sell-2', date: '2025-06-04', action: 'SELL', action_label: '卖出', filled: true, symbol: '000001'},
+    {id: 'select-2', date: '2025-06-05', action: 'SELECT', action_label: '入选', filled: false, symbol: '000002'},
+    {id: 'cash-2', date: '2025-06-06', action: 'CASH', action_label: '保留现金', filled: false, symbol: null},
+  ];
+  const groups = h.groupEvents(events, '1D');
+  const markers = h.markersForEvents(groups, events.map((event) => event.date));
+
+  assert.equal(markers.length, events.length);
+  assert.ok(markers.every((marker) => marker.text === ''), 'native markers must not carry collision-prone prose');
+  assert.deepEqual(markers.map((marker) => marker.title), ['延后卖出', '卖出', '入选', '保留现金']);
+  assert.deepEqual(markers.map((marker) => [marker.id, marker.shape, marker.position, marker.color]), [
+    [groups[0].id, 'square', 'aboveBar', '#6b7280'],
+    [groups[1].id, 'arrowDown', 'aboveBar', '#b42318'],
+    [groups[2].id, 'square', 'aboveBar', '#6b7280'],
+    [groups[3].id, 'square', 'aboveBar', '#b45309'],
+  ]);
+  assert.deepEqual(markers.map((marker) => marker.eventIds), events.map((event) => [event.id]));
+});
+
 test('weekly main candles and daily drawdown synchronize by factual dates and apply all/bounded ranges', () => {
   const h = charts();
   const document = fakeDocument();
@@ -479,8 +502,11 @@ test('native marker sets are sorted, series-time compatible, and period markers 
   container.ownerDocument = document;
   const log = [];
   const errors = [];
+  const data = navData();
+  data.nav[1].stale_symbols = '000001';
+  data.nav[1].max_valuation_stale_days = 2;
   const library = fakeChartApi(log);
-  const controller = h.create(container, { data: navData(), initialCash: 1000, library, onError: (error) => errors.push(error) });
+  const controller = h.create(container, { data, initialCash: 1000, library, onError: (error) => errors.push(error) });
   controller.update({ period: '1W' });
   const candle = library.charts[0].series.find((series) => series.kind === 'candlestick');
   assert.ok(candle);
@@ -488,7 +514,14 @@ test('native marker sets are sorted, series-time compatible, and period markers 
   assert.ok(candle.data.some((point) => point.time === '2025-01-08' && point.open === undefined));
   assert.equal(candle.markers.every((marker, index) => index === 0 || marker.time >= candle.markers[index - 1].time), true);
   assert.equal(candle.markers.every((marker) => candle.data.some((point) => point.time === marker.time)), true);
-  assert.ok(candle.markers.some((marker) => marker.id.startsWith('warning-') && marker.sourceDate === '2025-01-08'));
+  const warning = candle.markers.find((marker) => marker.id.startsWith('warning-') && marker.sourceDate === '2025-01-08');
+  assert.ok(warning);
+  assert.equal(warning.text, '');
+  assert.equal(warning.title, '末段未完整');
+  const stale = candle.markers.find((marker) => marker.id === 'stale-2025-01-03');
+  assert.ok(stale);
+  assert.equal(stale.text, '');
+  assert.equal(stale.title, '估值陈旧');
   const marker = candle.markers.find((item) => item.eventIds.includes('buy-1'));
   assert.equal(marker.sourceDate, '2025-01-02');
   assert.equal(candle.markers.some((item) => item.eventIds.includes('sell-1')), false);
