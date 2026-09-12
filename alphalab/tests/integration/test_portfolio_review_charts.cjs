@@ -26,9 +26,9 @@ function navData() {
       { date: '2025-01-08', equity: 1100, daily_return: null, drawdown: 0 },
     ],
     events: [
-      { id: 'buy-1', date: '2025-01-02', action: 'BUY', filled: true, symbol: '000001', shares: 10 },
-      { id: 'select-1', date: '2025-01-02', action: 'SELECT', filled: false, symbol: '000002' },
-      { id: 'sell-1', date: '2025-01-09', action: 'SELL', filled: true, symbol: '000001', shares: 10 },
+      { id: 'buy-1', date: '2025-01-02', action: 'BUY', action_label: '买入', filled: true, symbol: '000001', shares: 10 },
+      { id: 'select-1', date: '2025-01-02', action: 'SELECT', action_text: '入选', filled: false, symbol: '000002' },
+      { id: 'sell-1', date: '2025-01-09', action: 'SELL', action_label: '卖出', filled: true, symbol: '000001', shares: 10 },
     ],
     capabilities: {
       session_list: ['2025-01-02', '2025-01-03', '2025-01-06', '2025-01-07', '2025-01-08', '2025-01-09', '2025-01-10'],
@@ -69,28 +69,43 @@ function fakeDocument() {
 }
 
 function fakeChartApi(log) {
-  function series(kind) {
+  const dateKey = (value) => {
+    if (typeof value === 'string') return value;
+    if (value && typeof value === 'object' && value.year) return `${String(value.year).padStart(4, '0')}-${String(value.month).padStart(2, '0')}-${String(value.day).padStart(2, '0')}`;
+    return String(value);
+  };
+  function series(kind, options, owner) {
     return {
       kind,
+      options,
       data: [],
       markers: [],
-      setData(value) { this.data = value; log.push(['setData', kind, value.length]); },
-      setMarkers(value) { this.markers = value; log.push(['setMarkers', kind, value.length]); },
+      setData(value) { this.data = value; this.times = new Set(value.map((item) => dateKey(item.time))); log.push(['setData', kind, value.length]); owner.emitTimeRange({from: value[0]?.time || null, to: value.at(-1)?.time || null}); },
+      setMarkers(value) {
+        const sorted = value.every((marker, index) => index === 0 || dateKey(value[index - 1].time) <= dateKey(marker.time));
+        if (!sorted) throw new Error('Lightweight Charts markers must be sorted by time');
+        if (value.some((marker) => !this.times.has(dateKey(marker.time)))) throw new Error('marker time is not a series time');
+        this.markers = value; log.push(['setMarkers', kind, value.length]);
+      },
       applyOptions(value) { log.push(['applyOptions', kind, value]); },
     };
   }
   function chart(name) {
     const visibleHandlers = new Set();
+    const timeRangeHandlers = new Set();
     const crosshairHandlers = new Set();
     const clickHandlers = new Set();
     const object = {
       name,
       series: [],
       ranges: [],
+      dateRanges: [],
       removed: false,
-      addLineSeries() { const value = series('line'); this.series.push(value); return value; },
-      addAreaSeries() { const value = series('area'); this.series.push(value); return value; },
-      addCandlestickSeries() { const value = series('candlestick'); this.series.push(value); return value; },
+      crosshairPositions: [],
+      clearedCrosshair: 0,
+      addLineSeries(options) { const value = series('line', options, this); this.series.push(value); return value; },
+      addAreaSeries(options) { const value = series('area', options, this); this.series.push(value); return value; },
+      addCandlestickSeries(options) { const value = series('candlestick', options, this); this.series.push(value); return value; },
       removeSeries(value) { this.series = this.series.filter((item) => item !== value); log.push(['removeSeries', name]); },
       resize(width, height) { log.push(['resize', name, width, height]); },
       remove() { this.removed = true; log.push(['remove', name]); },
@@ -99,16 +114,24 @@ function fakeChartApi(log) {
           subscribeVisibleLogicalRangeChange(fn) { visibleHandlers.add(fn); },
           unsubscribeVisibleLogicalRangeChange(fn) { visibleHandlers.delete(fn); },
           setVisibleLogicalRange(value) { object.ranges.push(value); log.push(['range', name, value]); },
-          setVisibleRange(value) { object.ranges.push(value); log.push(['dateRange', name, value]); },
+          subscribeVisibleTimeRangeChange(fn) { timeRangeHandlers.add(fn); },
+          unsubscribeVisibleTimeRangeChange(fn) { timeRangeHandlers.delete(fn); },
+          setVisibleRange(value) {
+            if (!object.series.some((item) => item.times?.size)) throw new Error(`Value is null: ${name} has no data`);
+            object.dateRanges.push(value); log.push(['dateRange', name, value]);
+          },
           fitContent() { log.push(['fit', name]); },
         };
       },
       subscribeCrosshairMove(fn) { crosshairHandlers.add(fn); },
       unsubscribeCrosshairMove(fn) { crosshairHandlers.delete(fn); },
+      setCrosshairPosition(price, time, targetSeries) { object.crosshairPositions.push({price, time, targetSeries}); },
+      clearCrosshairPosition() { object.clearedCrosshair += 1; },
       subscribeClick(fn) { clickHandlers.add(fn); },
       unsubscribeClick(fn) { clickHandlers.delete(fn); },
       emitCrosshair(value) { crosshairHandlers.forEach((fn) => fn(value)); },
       emitClick(value) { clickHandlers.forEach((fn) => fn(value)); },
+      emitTimeRange(value) { timeRangeHandlers.forEach((fn) => fn(value)); },
     };
     return object;
   }
@@ -173,6 +196,29 @@ test('weekly and monthly candles use observed close values and mark only a genui
   assert.equal(monthly[0].isPartial, false);
 });
 
+test('producer trailing partial capability survives an exact session end and is visible in fallback warnings', () => {
+  const h = charts();
+  const data = navData();
+  data.capabilities.valid_date_range = ['2025-01-02', '2025-01-08'];
+  data.capabilities.session_list = ['2025-01-02', '2025-01-03', '2025-01-06', '2025-01-07', '2025-01-08'];
+  data.capabilities.missing_session_dates = [];
+  data.capabilities.aggregation = {
+    weekly: { last_period_may_be_partial: true },
+    monthly: { last_period_may_be_partial: true },
+  };
+  const weekly = h.aggregateObservedClose(data, '1W');
+  assert.equal(weekly.at(-1).isPartial, true);
+  assert.match(weekly.at(-1).warning, /末段未完整/);
+  const document = fakeDocument();
+  const container = fakeElement();
+  container.ownerDocument = document;
+  const controller = h.create(container, { data, initialCash: 1000, library: null });
+  controller.update({ period: '1W' });
+  const output = container.children.map((child) => child.innerHTML).join('\n');
+  assert.match(output, /末段未完整/);
+  assert.match(output, /可信交易日历|警告|缺口/);
+});
+
 test('date range and event grouping retain factual dates, fills, decisions, and stable IDs', () => {
   const h = charts();
   const data = navData();
@@ -212,31 +258,99 @@ test('controller uses a guarded shared time range, callbacks, bounded event grou
   const library = fakeChartApi(log);
   const selected = [];
   const hovered = [];
+  const errors = [];
   const controller = h.create(container, {
     data: navData(),
     initialCash: 1000,
     library,
     onSelectEvent: (event) => selected.push(event.id),
     onHover: (value) => hovered.push(value),
+    onError: (error) => errors.push(error),
   });
   controller.update({ metric: 'cumulative_return', period: '1D', range: 'all' });
   assert.equal(library.charts.length, 2);
   assert.equal(library.charts[0].series[0].kind, 'line');
   assert.ok(Math.abs(library.charts[0].series[0].data[0].value - 0.05) < 1e-12);
+  assert.equal(library.charts[0].series[0].options.priceFormat.formatter(0.05), '5.00%');
   assert.equal(controller.getEventGroups().length, 2);
   library.charts[0].emitCrosshair({ time: '2025-01-02' });
   assert.equal(hovered.length, 1);
   assert.equal(hovered[0].date, '2025-01-02');
   assert.equal(hovered[0].eventCount, 2);
+  for (const field of ['unit_nav', 'equity', 'cumulative_return', 'daily_return', 'drawdown', 'events']) assert.ok(Object.prototype.hasOwnProperty.call(hovered[0], field), field);
+  library.charts[1].emitCrosshair({ time: '2025-01-03' });
+  assert.equal(library.charts[0].crosshairPositions.at(-1).time, '2025-01-03');
+  library.charts[0].emitCrosshair({ time: '2025-01-02' });
+  assert.equal(library.charts[1].crosshairPositions.at(-1).time, '2025-01-02');
   library.charts[0].emitClick({ eventId: 'buy-1' });
   assert.deepEqual(selected, ['buy-1']);
   controller.locateEvent('sell-1');
   assert.equal(controller.getState().selectedEventId, 'sell-1');
   assert.ok(log.some((item) => item[0] === 'range' || item[0] === 'dateRange'));
+  assert.equal(errors.length, 0);
   controller.resize();
   controller.destroy();
   controller.destroy();
   assert.equal(library.charts.every((chart) => chart.removed), true);
+});
+
+test('weekly main candles and daily drawdown synchronize by factual dates and apply all/bounded ranges', () => {
+  const h = charts();
+  const document = fakeDocument();
+  const container = fakeElement();
+  container.ownerDocument = document;
+  const log = [];
+  const errors = [];
+  const library = fakeChartApi(log);
+  const controller = h.create(container, { data: navData(), initialCash: 1000, library, onError: (error) => errors.push(error) });
+  const initialFits = log.filter((item) => item[0] === 'fit');
+  assert.equal(initialFits.length, 2);
+  assert.deepEqual(library.charts[0].dateRanges[0], {from: '2025-01-02', to: '2025-01-10'});
+  assert.deepEqual(library.charts[1].dateRanges[0], {from: '2025-01-02', to: '2025-01-10'});
+  controller.update({ period: '1W' });
+  library.charts[1].emitCrosshair({ time: '2025-01-06' });
+  assert.equal(library.charts[0].crosshairPositions.at(-1).time, '2025-01-06');
+  library.charts[0].emitTimeRange({ from: '2025-01-02', to: '2025-01-08' });
+  assert.deepEqual(library.charts[1].dateRanges.at(-1), { from: '2025-01-02', to: '2025-01-08' });
+  controller.update({ range: { start: '2025-01-03', end: '2025-01-07' } });
+  assert.deepEqual(library.charts[0].dateRanges.at(-1), { from: '2025-01-03', to: '2025-01-07' });
+  assert.deepEqual(library.charts[1].dateRanges.at(-1), { from: '2025-01-03', to: '2025-01-07' });
+  assert.equal(errors.length, 0);
+  controller.destroy();
+});
+
+test('successive custom ranges use distinct canonical event groups on one controller', () => {
+  const h = charts();
+  const document = fakeDocument();
+  const container = fakeElement();
+  container.ownerDocument = document;
+  const controller = h.create(container, { data: navData(), initialCash: 1000, library: null });
+  controller.update({ range: { start: '2025-01-01', end: '2025-01-03' } });
+  assert.deepEqual(controller.getEventGroups()[0].eventIds, ['buy-1', 'select-1']);
+  controller.update({ range: { start: '2025-01-08', end: '2025-01-10' } });
+  assert.deepEqual(controller.getEventGroups().map((group) => group.eventIds), [['sell-1']]);
+  controller.destroy();
+});
+
+test('native marker sets are sorted, series-time compatible, and period markers retain factual event dates', () => {
+  const h = charts();
+  const document = fakeDocument();
+  const container = fakeElement();
+  container.ownerDocument = document;
+  const log = [];
+  const errors = [];
+  const library = fakeChartApi(log);
+  const controller = h.create(container, { data: navData(), initialCash: 1000, library, onError: (error) => errors.push(error) });
+  controller.update({ period: '1W' });
+  const candle = library.charts[0].series.find((series) => series.kind === 'candlestick');
+  assert.ok(candle);
+  assert.deepEqual(candle.data.filter((point) => point.open !== undefined).map((point) => point.time), ['2025-01-03', '2025-01-08']);
+  assert.equal(candle.markers.every((marker, index) => index === 0 || marker.time >= candle.markers[index - 1].time), true);
+  assert.equal(candle.markers.every((marker) => candle.data.some((point) => point.time === marker.time)), true);
+  const marker = candle.markers.find((item) => item.eventIds.includes('sell-1'));
+  assert.equal(marker.sourceDate, '2025-01-09');
+  assert.equal(errors.length, 0);
+  controller.destroy();
 });
 
 test('offline fallback renders gaps, values, and event choices when the chart library is unavailable', () => {
@@ -251,6 +365,8 @@ test('offline fallback renders gaps, values, and event choices when the chart li
   assert.match(output, /1\.05/);
   assert.match(output, /缺失|未知|空值/);
   assert.match(output, /buy-1|sell-1/);
+  assert.match(output, /买入|卖出|入选/);
+  assert.doesNotMatch(output, /DEFER_SELL|INITIAL_NOT_FILLED/);
   assert.doesNotMatch(output, /NaN|undefined/);
 });
 

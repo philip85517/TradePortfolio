@@ -152,6 +152,7 @@
     defineMeta(rows, "validDateRange", uniqueDates(object.scope?.valid_date_range || object.capabilities?.valid_date_range));
     defineMeta(rows, "sessionList", uniqueDates(object.capabilities?.session_list || object.session_list));
     defineMeta(rows, "missingSessionDates", uniqueDates(object.capabilities?.missing_session_dates || object.missing_session_dates));
+    defineMeta(rows, "aggregation", object.capabilities?.aggregation || object.aggregation || {});
     defineMeta(rows, "runId", object.run_id || null);
     defineMeta(rows, "portfolioId", object.portfolio_id || null);
     return rows;
@@ -346,6 +347,18 @@
     const sessionList = uniqueDates(options.sessionList || options.session_list || rows.sessionList || object.capabilities?.session_list);
     const validDateRange = uniqueDates(options.validDateRange || options.valid_date_range || rows.validDateRange || object.capabilities?.valid_date_range);
     const declaredMissing = uniqueDates(options.missingSessionDates || options.missing_session_dates || rows.missingSessionDates || object.capabilities?.missing_session_dates);
+    const aggregation = options.aggregation || object.capabilities?.aggregation || rows.aggregation || {};
+    const aggregationKey = normalizedPeriod === "1W" ? "weekly" : normalizedPeriod === "1M" ? "monthly" : null;
+    const capabilityPartial = aggregationKey && aggregation?.[aggregationKey]
+      ? aggregation?.[aggregationKey]?.last_period_may_be_partial
+      : null;
+    const authoritativePartial = typeof capabilityPartial === "boolean"
+      ? capabilityPartial
+      : ["true", "1", "yes"].includes(String(capabilityPartial ?? "").trim().toLowerCase())
+        ? true
+        : ["false", "0", "no"].includes(String(capabilityPartial ?? "").trim().toLowerCase())
+          ? false
+          : null;
     const grouped = new Map();
     for (const row of rows) {
       const key = periodKeyForDate(row.date, normalizedPeriod);
@@ -378,7 +391,8 @@
       const firstRow = groupRows[0];
       const lastKnown = known.at(-1).row;
       const isLast = key === sortedKeys.at(-1);
-      const isPartial = Boolean(isLast && expectedEnd && actualEnd && actualEnd < expectedEnd);
+      const derivedPartial = Boolean(expectedEnd && actualEnd && actualEnd < expectedEnd);
+      const isPartial = Boolean(isLast && (authoritativePartial !== null ? authoritativePartial : derivedPartial));
       let completeness = "unknown";
       if (sessionList.length) completeness = missingDates.length || unknownDates.length ? "incomplete" : "complete";
       let warning = null;
@@ -515,22 +529,35 @@
     return "#6b7280";
   }
 
+  function eventDisplayLabel(event) {
+    const label = event?.action_label ?? event?.action_text;
+    return String(label || event?.action || "事件");
+  }
+
   function markersForEvents(groups, availableDates) {
     const dates = availableDates ? new Set(uniqueDates(availableDates)) : null;
-    return (Array.isArray(groups) ? groups : []).map((group) => {
+    return sortMarkers((Array.isArray(groups) ? groups : []).map((group) => {
       const first = group.events?.[0] || {};
       return {
         time: group.time || group.date,
+        sourceDate: group.date,
         id: group.id,
         eventId: group.events?.length === 1 ? group.events[0].id : null,
         eventIds: [...(group.eventIds || [])],
         position: group.hasFill ? (group.fills && !group.decisions ? "belowBar" : "aboveBar") : "aboveBar",
         shape: group.hasFill ? (group.fills && !group.decisions ? "arrowUp" : "circle") : "square",
         color: markerColor(first),
-        text: group.count > 1 ? `${group.count} 个事件` : String(first.action || "事件"),
+        text: group.count > 1 ? `${group.count} 个事件` : eventDisplayLabel(first),
         exactDateAvailable: !dates || dates.has(group.date),
       };
-    });
+    }));
+  }
+
+  function sortMarkers(markers) {
+    return (Array.isArray(markers) ? markers : []).filter((marker) => asDate(marker?.time)).slice().sort((left, right) => (
+      compareDates(asDate(left.time), asDate(right.time))
+      || compareDates(left.id || "", right.id || "")
+    ));
   }
 
   function escapeHtml(value) {
@@ -544,7 +571,23 @@
     return number === null ? "未知" : number.toLocaleString("zh-CN", {minimumFractionDigits: digits, maximumFractionDigits: digits});
   }
 
-  function seriesOptions(color, area) {
+  function axisPriceFormat(metric, drawdown = false) {
+    const normalizedMetric = metricName(metric);
+    if (drawdown || normalizedMetric === "cumulative_return") {
+      return {
+        type: "custom",
+        formatter: (value) => {
+          const number = asFiniteNumber(value);
+          return number === null ? "未知" : `${(number * 100).toFixed(2)}%`;
+        },
+      };
+    }
+    if (normalizedMetric === "unit_nav") return {type: "price", precision: 4, minMove: 0.0001};
+    return {type: "price", precision: 2, minMove: 0.01};
+  }
+
+  function seriesOptions(color, area, metric, drawdown = false) {
+    const priceFormat = axisPriceFormat(metric, drawdown);
     return area ? {
       lineColor: color,
       topColor: `${color}33`,
@@ -552,11 +595,13 @@
       lineWidth: 2,
       priceLineVisible: false,
       lastValueVisible: true,
+      priceFormat,
     } : {
       color,
       lineWidth: 2,
       priceLineVisible: false,
       lastValueVisible: true,
+      priceFormat,
     };
   }
 
@@ -626,11 +671,19 @@
     const visible = groups.length <= maxGroups ? groups : [...groups.slice(0, Math.floor(maxGroups / 2)), ...groups.slice(-Math.ceil(maxGroups / 2))];
     const omitted = groups.length - visible.length;
     const rows = visible.map((group) => {
-      const choices = group.events.map((event) => `<li><button type="button" data-portfolio-review-event="${escapeHtml(event.id)}">${escapeHtml(event.date)} · ${escapeHtml(event.action || "事件")} · ${escapeHtml(event.symbol || "")}</button></li>`).join("");
+      const choices = group.events.map((event) => `<li><button type="button" data-portfolio-review-event="${escapeHtml(event.id)}">${escapeHtml(event.date)} · ${escapeHtml(eventDisplayLabel(event))} · ${escapeHtml(event.symbol || "")}</button></li>`).join("");
       return `<li><strong>${escapeHtml(group.date)}</strong> · ${group.count} 个事件<ol>${choices}</ol></li>`;
     }).join("");
     const note = omitted ? `<p>中间 ${omitted} 个事件组保留在控制器中，回退列表展示首尾。</p>` : "";
     return `<details class="portfolio-review-event-list"><summary>交易与事件</summary>${note}<ol>${rows}</ol></details>`;
+  }
+
+  function fallbackBarWarnings(bars) {
+    const warnings = (Array.isArray(bars) ? bars : []).filter((bar) => bar?.warning || bar?.isPartial).map((bar) => {
+      const label = bar.partialLabel || bar.warning || "周期完整性未知";
+      return `<li><strong>${escapeHtml(bar.periodKey || bar.date)}</strong> · ${escapeHtml(label)}</li>`;
+    }).join("");
+    return warnings ? `<details class="portfolio-review-period-warnings" open><summary>周期完整性与缺口</summary><ul>${warnings}</ul></details>` : "";
   }
 
   function renderFallback(element, points, bars, metric, period, drawdown, groups, reason) {
@@ -640,7 +693,7 @@
       return;
     }
     const note = reason || (period === "1D" ? "日终观测值；未知区间不会连线。" : "K 线由周期内实际日终净值的首/末/最高/最低观测值聚合，非盘中 OHLC。");
-    element.innerHTML = `<div class="portfolio-review-fallback" data-fallback="main"><p>${escapeHtml(note)}</p>${fallbackSvg(points, bars, metric, false)}${fallbackTable(points, metric)}${fallbackEvents(groups)}</div>`;
+    element.innerHTML = `<div class="portfolio-review-fallback" data-fallback="main"><p>${escapeHtml(note)}</p>${fallbackBarWarnings(bars)}${fallbackSvg(points, bars, metric, false)}${fallbackTable(points, metric)}${fallbackEvents(groups)}</div>`;
     if (typeof element.querySelectorAll === "function") {
       element.querySelectorAll("[data-portfolio-review-event]").forEach((button) => {
         if (typeof button.addEventListener === "function") button.addEventListener("click", () => {
@@ -690,18 +743,31 @@
     const library = resolveLibrary(config);
     let destroyed = false;
     let syncing = false;
+    let syncingCrosshair = false;
+    let syncReady = false;
+    let syncUsesTimeRange = false;
     let observer = null;
     let ownerWindow = root?.window || root;
     let mainRangeHandler = null;
     let drawdownRangeHandler = null;
     let crosshairHandler = null;
+    let drawdownCrosshairHandler = null;
     let clickHandler = null;
     let renderCount = 0;
     let usingFallback = true;
     let fallbackReason = null;
+    let lastMarkerError = null;
+
+    function canonicalRangeKey(range) {
+      const bounds = dateRangeBounds(rows, range, {
+        endDate: rows.at(-1)?.date,
+        validDateRange: rows.validDateRange,
+      });
+      return `${bounds.start || ""}:${bounds.end || ""}`;
+    }
 
     function currentGroups() {
-      const key = `${state.period}:${state.range}`;
+      const key = `${state.period}:${canonicalRangeKey(state.range)}`;
       if (!eventGroupsCache.has(key)) {
         const selected = filterDateRange(events, state.range, {
           endDate: rows.at(-1)?.date,
@@ -725,6 +791,7 @@
         sessionList: rows.sessionList,
         validDateRange: rows.validDateRange,
         missingSessionDates: rows.missingSessionDates,
+        aggregation: rows.aggregation,
       });
       return filterDateRange(allBars, state.range, {endDate: rows.at(-1)?.date, validDateRange: rows.validDateRange});
     }
@@ -758,21 +825,46 @@
         charts.drawdown = library.createChart(drawdownContainer, chartOptions(120));
         const mainScale = chartTimeScale(charts.main);
         const drawdownScale = chartTimeScale(charts.drawdown);
+        syncUsesTimeRange = Boolean(
+          typeof mainScale?.subscribeVisibleTimeRangeChange === "function"
+          && typeof drawdownScale?.subscribeVisibleTimeRangeChange === "function"
+          && typeof mainScale?.setVisibleRange === "function"
+          && typeof drawdownScale?.setVisibleRange === "function",
+        );
         mainRangeHandler = (range) => {
-          if (syncing || !range || !drawdownScale || typeof drawdownScale.setVisibleLogicalRange !== "function") return;
+          if (syncing || !syncReady || !range || !drawdownScale || !lineSeries.drawdown.length) return;
           syncing = true;
-          try { drawdownScale.setVisibleLogicalRange(range); } finally { syncing = false; }
+          try {
+            if (syncUsesTimeRange) drawdownScale.setVisibleRange?.(range);
+            else drawdownScale.setVisibleLogicalRange?.(range);
+          } finally { syncing = false; }
         };
         drawdownRangeHandler = (range) => {
-          if (syncing || !range || !mainScale || typeof mainScale.setVisibleLogicalRange !== "function") return;
+          if (syncing || !syncReady || !range || !mainScale || !lineSeries.main.length) return;
           syncing = true;
-          try { mainScale.setVisibleLogicalRange(range); } finally { syncing = false; }
+          try {
+            if (syncUsesTimeRange) mainScale.setVisibleRange?.(range);
+            else mainScale.setVisibleLogicalRange?.(range);
+          } finally { syncing = false; }
         };
-        mainScale?.subscribeVisibleLogicalRangeChange?.(mainRangeHandler);
-        drawdownScale?.subscribeVisibleLogicalRangeChange?.(drawdownRangeHandler);
-        crosshairHandler = (parameter) => handleHover(parameter);
+        if (syncUsesTimeRange) {
+          mainScale.subscribeVisibleTimeRangeChange(mainRangeHandler);
+          drawdownScale.subscribeVisibleTimeRangeChange(drawdownRangeHandler);
+        } else {
+          mainScale?.subscribeVisibleLogicalRangeChange?.(mainRangeHandler);
+          drawdownScale?.subscribeVisibleLogicalRangeChange?.(drawdownRangeHandler);
+        }
+        crosshairHandler = (parameter) => {
+          handleHover(parameter);
+          syncCrosshair(charts.main, charts.drawdown, parameter);
+        };
+        drawdownCrosshairHandler = (parameter) => {
+          handleHover(parameter);
+          syncCrosshair(charts.drawdown, charts.main, parameter);
+        };
         clickHandler = (parameter) => handleClick(parameter);
         charts.main.subscribeCrosshairMove?.(crosshairHandler);
+        charts.drawdown.subscribeCrosshairMove?.(drawdownCrosshairHandler);
         charts.main.subscribeClick?.(clickHandler);
         usingFallback = false;
         return true;
@@ -781,6 +873,34 @@
         removeCharts();
         return false;
       }
+    }
+
+    function visibleDateRange() {
+      if (!rows.length) return null;
+      const bounds = dateRangeBounds(rows, state.range, {
+        endDate: rows.at(-1)?.date,
+        validDateRange: rows.validDateRange,
+      });
+      if (!bounds.start || !bounds.end || bounds.start > bounds.end) return null;
+      return {from: bounds.start, to: bounds.end};
+    }
+
+    function applyVisibleRange() {
+      if (usingFallback) return;
+      const range = visibleDateRange();
+      if (!range) return;
+      const scales = [
+        [chartTimeScale(charts.main), lineSeries.main],
+        [chartTimeScale(charts.drawdown), lineSeries.drawdown],
+      ].filter((entry) => entry[0] && entry[1].length).map((entry) => entry[0]);
+      syncing = true;
+      try {
+        for (const scale of scales) {
+          if (state.range === "all") scale.fitContent?.();
+          if (typeof scale.setVisibleRange === "function") scale.setVisibleRange(range);
+          else scale.setVisibleLogicalRange?.(range);
+        }
+      } finally { syncing = false; }
     }
 
     function removeSeries(chart, series) {
@@ -803,12 +923,14 @@
       for (const segment of segments) {
         if (!segment.length) continue;
         const series = area && typeof chart.addAreaSeries === "function"
-          ? chart.addAreaSeries(seriesOptions(color, true))
+          ? chart.addAreaSeries(seriesOptions(color, true, key === "drawdown" ? "drawdown" : state.metric, key === "drawdown"))
           : typeof chart.addLineSeries === "function"
-            ? chart.addLineSeries(seriesOptions(color, false))
+            ? chart.addLineSeries(seriesOptions(color, false, key === "drawdown" ? "drawdown" : state.metric, key === "drawdown"))
             : null;
         if (!series) continue;
-        series.setData(segment.map((point) => ({time: point.time, value: point.value})));
+        const data = segment.map((point) => ({time: point.time, value: point.value}));
+        series.setData(data);
+        series.__portfolioReviewTimes = new Set(data.map((point) => asDate(point.time)).filter(Boolean));
         result.push(series);
       }
       lineSeries[key] = result;
@@ -832,16 +954,67 @@
     }
 
     function applyMarkers(markers) {
-      const targets = [...lineSeries.main, ...lineSeries.benchmark];
-      const dateMarkers = markers.filter((marker) => marker.exactDateAvailable !== false);
+      const sorted = sortMarkers(markers);
+      const targets = [...lineSeries.main];
+      lastMarkerError = null;
       for (const series of targets) {
-        try { series.setMarkers(dateMarkers); } catch (_) { /* markers are optional in old compatible builds */ }
+        const times = series.__portfolioReviewTimes || null;
+        const compatible = sorted.filter((marker) => marker.exactDateAvailable !== false && (!times || times.has(asDate(marker.time))));
+        try {
+          series.setMarkers(compatible);
+        } catch (error) {
+          lastMarkerError = {
+            type: "marker",
+            message: String(error?.message || error),
+            markerIds: compatible.map((marker) => marker.id),
+          };
+          safeCallback(config.onError, {...lastMarkerError});
+        }
       }
     }
 
-    function staleMarkers(points) {
-      return points.filter((point) => point.stale_symbols || (asFiniteNumber(point.max_valuation_stale_days) || 0) > 0).map((point) => ({
-        time: point.time,
+    function crosshairPrice(chart, date) {
+      const row = rows.find((candidate) => candidate.date === date);
+      if (chart === charts.drawdown) return asFiniteNumber(row?.drawdown);
+      if (state.period !== "1D" && state.metric !== "cumulative_return") {
+        const bars = currentBars();
+        const bar = bars.find((candidate) => candidate.time === date)
+          || bars.find((candidate) => candidate.periodStart <= date && candidate.periodEnd >= date);
+        return asFiniteNumber(bar?.close);
+      }
+      return row ? metricValue(row, state.metric, initialCash) : null;
+    }
+
+    function syncCrosshair(source, target, parameter) {
+      if (syncingCrosshair || destroyed || !target) return;
+      const date = asDate(parameter?.time || parameter?.date);
+      syncingCrosshair = true;
+      try {
+        if (!date) {
+          target.clearCrosshairPosition?.();
+          return;
+        }
+        const series = target === charts.drawdown ? lineSeries.drawdown[0] : lineSeries.main[0];
+        const price = crosshairPrice(target, date);
+        if (series && price !== null && typeof target.setCrosshairPosition === "function") {
+          target.setCrosshairPosition(price, date, series);
+        } else {
+          target.clearCrosshairPosition?.();
+        }
+      } finally { syncingCrosshair = false; }
+    }
+
+    function staleMarkers(points, bars, period) {
+      const barByPeriod = new Map((Array.isArray(bars) ? bars : []).map((bar) => [bar.periodKey, bar]));
+      return points.filter((point) => (
+        point.value !== null
+        && (point.stale_symbols || (asFiniteNumber(point.max_valuation_stale_days) || 0) > 0)
+      )).map((point) => {
+        const bar = period === "1D" ? null : barByPeriod.get(periodKeyForDate(point.time, period));
+        if (period !== "1D" && !bar) return null;
+        return {
+        time: bar?.time || point.time,
+        sourceDate: point.time,
         id: `stale-${point.time}`,
         eventId: null,
         eventIds: [],
@@ -850,7 +1023,54 @@
         color: "#b45309",
         text: "估值陈旧",
         exactDateAvailable: true,
+        };
+      }).filter(Boolean);
+    }
+
+    function warningMarkers(bars) {
+      return (Array.isArray(bars) ? bars : []).filter((bar) => bar.warning || bar.isPartial).map((bar) => ({
+        time: bar.time,
+        sourceDate: bar.periodEnd || bar.time,
+        id: `warning-${bar.periodKey || bar.time}`,
+        eventId: null,
+        eventIds: [],
+        position: "aboveBar",
+        shape: "square",
+        color: "#b45309",
+        text: bar.partialLabel || "周期完整性警告",
+        exactDateAvailable: true,
       }));
+    }
+
+    function chartMarkers(data, metricData) {
+      const availableDates = metricData.filter((point) => point.value !== null).map((point) => point.time);
+      const periodBars = new Map(data.bars.map((bar) => [bar.periodKey, bar]));
+      const eventMarkers = markersForEvents(data.groups, availableDates).map((marker) => {
+        if (state.period === "1D") return marker;
+        const group = data.groups.find((candidate) => candidate.id === marker.id);
+        const bar = group ? periodBars.get(group.periodKey) : null;
+        return bar
+          ? {...marker, time: bar.time, sourceDate: marker.sourceDate || marker.time, exactDateAvailable: true}
+          : {...marker, exactDateAvailable: false};
+      });
+      return sortMarkers(eventMarkers.concat(staleMarkers(metricData, data.bars, state.period), warningMarkers(data.bars)));
+    }
+
+    function candleSeriesData(bars) {
+      const actual = new Map((Array.isArray(bars) ? bars : []).map((bar) => [bar.time, {
+        time: bar.time,
+        open: bar.open,
+        high: bar.high,
+        low: bar.low,
+        close: bar.close,
+      }]));
+      const bounds = visibleDateRange();
+      const factualDates = uniqueDates([
+        ...(rows.sessionList || []),
+        ...rows.map((row) => row.date),
+        ...(bounds ? [bounds.from, bounds.to] : []),
+      ]).filter((date) => !bounds || (date >= bounds.from && date <= bounds.to));
+      return uniqueDates([...factualDates, ...actual.keys()]).map((date) => actual.get(date) || {time: date});
     }
 
     function renderCharts() {
@@ -859,6 +1079,7 @@
       const segments = contiguousSegments(metricData);
       const drawdownPoints = toMetricData(rows, "unit_nav", initialCash).map((point) => ({...point, value: point.drawdown}));
       const drawdownFiltered = filterDateRange(drawdownPoints, state.range, {endDate: rows.at(-1)?.date, validDateRange: rows.validDateRange});
+      syncReady = false;
       clearSeries("main", charts.main);
       clearSeries("drawdown", charts.drawdown);
       clearSeries("benchmark", charts.main);
@@ -866,8 +1087,11 @@
         const candle = charts.main.addCandlestickSeries({
           upColor: "#15803d", downColor: "#b42318", borderVisible: false, wickUpColor: "#15803d", wickDownColor: "#b42318",
           priceLineVisible: false,
+          priceFormat: axisPriceFormat(state.metric),
         });
-        candle.setData(data.bars.map((bar) => ({time: bar.time, open: bar.open, high: bar.high, low: bar.low, close: bar.close})));
+        const candleData = candleSeriesData(data.bars);
+        candle.setData(candleData);
+        candle.__portfolioReviewTimes = new Set(data.bars.map((bar) => asDate(bar.time)).filter(Boolean));
         addReferenceLine(candle, state.metric);
         lineSeries.main = [candle];
       } else {
@@ -880,7 +1104,9 @@
         const benchmarkPoints = filterDateRange(toMetricData(benchmarkRows, state.metric, initialCash), state.range, {endDate: rows.at(-1)?.date, validDateRange: rows.validDateRange});
         setLineSegments(charts.main, "benchmark", contiguousSegments(benchmarkPoints), "#2563eb", false);
       }
-      applyMarkers(markersForEvents(data.groups, rows.map((row) => row.date)).concat(staleMarkers(metricData)));
+      applyMarkers(chartMarkers(data, metricData));
+      syncReady = true;
+      applyVisibleRange();
       renderCount += 1;
     }
 
@@ -919,9 +1145,8 @@
             else if (typeof scale.setVisibleLogicalRange === "function") scale.setVisibleLogicalRange({from: markerDate, to: markerDate});
           } catch (_) { /* an event outside the available axis remains in the accessible list */ }
         }
-        const groups = currentGroups();
-        const metricData = toMetricData(rows, state.metric, initialCash);
-        applyMarkers(markersForEvents(groups, rows.map((row) => row.date)).concat(staleMarkers(metricData)));
+        const data = mainData();
+        applyMarkers(chartMarkers(data, data.points));
       }
       return {...event};
     }
@@ -965,20 +1190,30 @@
         drawdown: row?.drawdown ?? null,
         events: dayEvents.map((event) => ({...event})),
         eventCount: dayEvents.length,
+        period: state.period,
+        bar: currentBars().find((candidate) => candidate.time === date) || null,
       });
     }
 
     function removeCharts() {
+      syncReady = false;
       const mainScale = chartTimeScale(charts.main);
       const drawdownScale = chartTimeScale(charts.drawdown);
-      try { mainScale?.unsubscribeVisibleLogicalRangeChange?.(mainRangeHandler); } catch (_) {}
-      try { drawdownScale?.unsubscribeVisibleLogicalRangeChange?.(drawdownRangeHandler); } catch (_) {}
+      if (syncUsesTimeRange) {
+        try { mainScale?.unsubscribeVisibleTimeRangeChange?.(mainRangeHandler); } catch (_) {}
+        try { drawdownScale?.unsubscribeVisibleTimeRangeChange?.(drawdownRangeHandler); } catch (_) {}
+      } else {
+        try { mainScale?.unsubscribeVisibleLogicalRangeChange?.(mainRangeHandler); } catch (_) {}
+        try { drawdownScale?.unsubscribeVisibleLogicalRangeChange?.(drawdownRangeHandler); } catch (_) {}
+      }
       try { charts.main?.unsubscribeCrosshairMove?.(crosshairHandler); } catch (_) {}
+      try { charts.drawdown?.unsubscribeCrosshairMove?.(drawdownCrosshairHandler); } catch (_) {}
       try { charts.main?.unsubscribeClick?.(clickHandler); } catch (_) {}
       try { charts.main?.remove?.(); } catch (_) {}
       try { charts.drawdown?.remove?.(); } catch (_) {}
       charts.main = null;
       charts.drawdown = null;
+      syncUsesTimeRange = false;
       lineSeries.main = [];
       lineSeries.drawdown = [];
       lineSeries.benchmark = [];
@@ -1032,7 +1267,7 @@
       resize,
       destroy,
       getEventGroups: () => currentGroups().map((group) => ({...group, events: group.events.map((event) => ({...event}))})),
-      getState: () => ({...state, renderCount, usingFallback}),
+      getState: () => ({...state, renderCount, usingFallback, markerError: lastMarkerError ? {...lastMarkerError} : null}),
       getData: () => ({rows: rows.map((row) => ({...row})), events: events.map((event) => ({...event})), runId: object.run_id || null, portfolioId: object.portfolio_id || null}),
     };
 
