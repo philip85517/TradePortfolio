@@ -150,6 +150,18 @@ test('fallback leaves legacy completion liquidation status unknown without affir
   assert.notEqual(model.data.status.code, 'COMPLETE_LIQUIDATED');
 });
 
+test('fallback keeps nonempty ending holdings from being labelled liquidated by evidence alone', () => {
+  const model = ui.normalizeReviewPayload({
+    run_id: 'legacy-open-ending-run',
+    portfolio_id: 'strategy',
+    horizons: [706],
+    summary: {horizon: 706, status: 'COMPLETE', capabilities: {ending_holdings_evidence: true}},
+    nav: [{horizon: 706, date: '2025-12-03', equity: 100}],
+    ending_holdings: [{symbol: '000001', shares: 10}],
+  }, {fallback: true, portfolioId: 'strategy', horizon: 706});
+  assert.equal(model.data.status.code, 'COMPLETE');
+});
+
 test('event filters and factual summary separate fills, decisions, deferred attempts, and terminal exits', () => {
   const data = sampleReview().by_horizon['706'];
   assert.equal(ui.eventIsFill(data.events[0]), true);

@@ -139,7 +139,7 @@
     const liquidation = String(summary?.liquidation_status || "").toUpperCase();
     if (liquidation === "UNSETTLED_DELISTING") return {code: "UNSETTLED", label: "含未结算股份", explanation: "研究已保存，但冻结证据未能结算全部退市股份。"};
     if (liquidation === "OPEN_POSITION") return {code: "COMPLETE_OPEN", label: "完成但有未平仓", explanation: "研究已完成，期末仍有持仓，期末权益包含冻结估值。"};
-    if ((raw === "COMPLETE" || raw === "SUCCEEDED") && (liquidation === "LIQUIDATED" || endingEvidence === true)) return {code: "COMPLETE_LIQUIDATED", label: "完成且清算", explanation: "研究已完成，冻结证据显示期末持仓已全部清算。"};
+    if ((raw === "COMPLETE" || raw === "SUCCEEDED") && (liquidation === "LIQUIDATED" || (endingEvidence === true && ending.length === 0))) return {code: "COMPLETE_LIQUIDATED", label: "完成且清算", explanation: "研究已完成，冻结证据显示期末持仓已全部清算。"};
     if (nav.length) return {code: "COMPLETE", label: "结果已保存", explanation: "冻结净值可查看；清算状态以保存的执行证据为准。"};
     if (raw === "FAILED" || raw === "ERROR") return {code: "FAILED", label: "结果读取失败", explanation: "运行摘要可用，但详细净值尚未读取。"};
     return {code: "NO_EVIDENCE", label: "证据不足", explanation: "冻结运行未提供可展示的净值或期末证据。"};
