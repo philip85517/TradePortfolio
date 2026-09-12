@@ -904,10 +904,10 @@
       const chartUpdate = {};
       let benchmarkChanged = false;
       if (next.metric !== undefined) { state.metric = String(next.metric); chartUpdate.metric = state.metric; }
-      if (next.period !== undefined) { state.period = String(next.period); chartUpdate.period = state.period; }
+      if (next.period !== undefined) { state.eventGroup = null; state.period = String(next.period); chartUpdate.period = state.period; }
       if (next.range !== undefined) { state.range = next.range; chartUpdate.range = state.range; }
       if (next.tab !== undefined && ["events", "holdings", "evidence"].includes(String(next.tab))) state.tab = String(next.tab);
-      if (next.filters) state.filters = {...state.filters, ...next.filters};
+      if (next.filters) { state.eventGroup = null; state.filters = {...state.filters, ...next.filters}; }
       if (next.filters && state.selectedEventId && !filterEvents(model?.data?.events, state.filters).some((event) => String(event.id) === String(state.selectedEventId))) {
         state.selectedEventId = null;
         chartUpdate.selectedEventId = null;
@@ -916,7 +916,7 @@
       if (benchmarkChanged && chartController) renderChart();
       else if (Object.keys(chartUpdate).length && chartController) chartController.update({...chartUpdate, selectedEventId: state.selectedEventId});
       if (next.metric !== undefined || next.period !== undefined || next.range !== undefined || next.benchmark !== undefined) setRegion("toolbar", toolbarHtml(model, state));
-      if (next.tab !== undefined || next.filters) { setRegion("tabs", tabsHtml(state)); setRegion("details", state.tab === "events" ? eventTabHtml(model, state) : state.tab === "holdings" ? holdingsTabHtml(model) : evidenceText(model, state)); }
+      if (next.tab !== undefined || next.period !== undefined || next.filters) { setRegion("tabs", tabsHtml(state)); setRegion("details", state.tab === "events" ? eventTabHtml(model, state) : state.tab === "holdings" ? holdingsTabHtml(model) : evidenceText(model, state)); }
       renderChartNote();
       return controller;
     }
@@ -956,6 +956,7 @@
         const selectionStart = typeof event.target.selectionStart === "number" ? event.target.selectionStart : null;
         const selectionEnd = typeof event.target.selectionEnd === "number" ? event.target.selectionEnd : selectionStart;
         state.filters[field] = event.target.value;
+        state.eventGroup = null;
         state.filterNotice = "";
         renderEventsRegion();
         const nextField = query(container, `[data-review-filter="${field}"]`);

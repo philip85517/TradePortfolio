@@ -254,3 +254,28 @@ test('no-model failure is observable and retry invokes the owner callback', () =
   assert.match(container.innerHTML, /正在读取冻结组合结果/);
   controller.destroy();
 });
+
+test('period and filter changes clear a stale grouped event chooser', () => {
+  const container = observableContainer();
+  let chartOptions;
+  const charts = {create(_host, options) { chartOptions = options; return {update() {}, destroy() {}, getState() { return {range: 'all'}; }}; }};
+  const controller = ui.create(container, {data: sampleReview(), charts});
+  const events = sampleReview().by_horizon['706'].events.slice(3, 5);
+  const openGroup = () => chartOptions.onSelectEvent({type: 'group', groupId: 'period-group', period: '1M', date: '2025-06-01', events});
+
+  openGroup();
+  assert.equal(controller.getState().eventGroup.events.length, 2);
+  controller.update({period: '1D'});
+  assert.equal(controller.getState().eventGroup, null);
+  assert.doesNotMatch(container.region('details'), /选择要查看的单个事件/);
+
+  openGroup();
+  controller.update({period: '1W'});
+  assert.equal(controller.getState().eventGroup, null);
+
+  openGroup();
+  container.dispatch('input', {getAttribute(name) { return name === 'data-review-filter' ? 'symbol' : null; }, value: '300204', selectionStart: 0, selectionEnd: 0});
+  assert.equal(controller.getState().eventGroup, null);
+  assert.doesNotMatch(container.region('details'), /选择要查看的单个事件/);
+  controller.destroy();
+});
