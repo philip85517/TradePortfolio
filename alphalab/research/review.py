@@ -21,15 +21,24 @@ import pandas as pd
 
 from .engine import DuckDBMarketDataAdapter
 from .chart_data import DEFAULT_EMA_PERIODS, SUPPORTED_TIMEFRAMES, normalize_timeframe, prepare_chart_data
+from .result_projection import build_review_projection
 
 STATIC_ROOT = Path(__file__).resolve().parent / "static"
 REQUIRED_ARTIFACTS = (
     "manifest.json",
     "candidates.csv",
     "portfolio.csv",
-    "nav.csv",
     "portfolio_returns.csv",
 )
+OPTIONAL_REVIEW_ARTIFACTS = {
+    "nav.csv",
+    "benchmark_nav.csv",
+    "benchmark_navs.csv",
+    "portfolios.csv",
+    "portfolio_nav.csv",
+    "portfolio_metrics.csv",
+    "market_data.duckdb",
+}
 
 
 @dataclass(frozen=True)
@@ -69,8 +78,15 @@ def load_review_run(runs_dir: str | Path, run_id: str) -> ReviewRun:
     artifact_hashes = manifest.get("artifact_hashes", {})
     if isinstance(artifact_hashes, dict):
         for name, expected in artifact_hashes.items():
-            path = run_dir / str(name)
+            relative_name = Path(str(name))
+            if relative_name.is_absolute() or ".." in relative_name.parts:
+                raise ValueError(f"研究运行产物路径无效: {name}")
+            path = (run_dir / relative_name).resolve()
+            if path.parent != run_dir and run_dir not in path.parents:
+                raise ValueError(f"研究运行产物路径无效: {name}")
             if not path.is_file():
+                if relative_name.name in OPTIONAL_REVIEW_ARTIFACTS:
+                    continue
                 raise ValueError(f"研究运行产物缺失: {name}")
             actual = hashlib.sha256(path.read_bytes()).hexdigest()
             if actual != str(expected):
@@ -82,18 +98,22 @@ def load_review_run(runs_dir: str | Path, run_id: str) -> ReviewRun:
     if "selected" not in candidates.columns:
         candidates["selected"] = False
     candidates["selected"] = candidates["selected"].map(_as_bool).fillna(False)
-    portfolio = pd.read_csv(run_dir / "portfolio.csv", dtype={"symbol": "string"})
+    portfolio = pd.read_csv(run_dir / "portfolio.csv", dtype={"symbol": "string", "portfolio_id": "string"})
     if "target_weight" not in candidates.columns:
         weights = portfolio.set_index("symbol").get("target_weight", pd.Series(dtype=float))
         candidates["target_weight"] = candidates["symbol"].map(weights)
-    nav = pd.read_csv(run_dir / "nav.csv")
+    nav_path = run_dir / "nav.csv"
+    nav = pd.read_csv(nav_path) if nav_path.is_file() else pd.DataFrame()
     portfolio_returns = pd.read_csv(run_dir / "portfolio_returns.csv", dtype={"symbol": "string"})
     benchmark_path = run_dir / "benchmark_nav.csv"
     benchmark_nav = pd.read_csv(benchmark_path) if benchmark_path.is_file() else pd.DataFrame()
     portfolios_path = run_dir / "portfolios.csv"
     portfolio_nav_path = run_dir / "portfolio_nav.csv"
     benchmark_navs_path = run_dir / "benchmark_navs.csv"
-    portfolios = pd.read_csv(portfolios_path, dtype={"symbol": "string"}) if portfolios_path.is_file() else pd.DataFrame()
+    portfolios = pd.read_csv(
+        portfolios_path,
+        dtype={"symbol": "string", "portfolio_id": "string"},
+    ) if portfolios_path.is_file() else pd.DataFrame()
     portfolio_nav = pd.read_csv(portfolio_nav_path) if portfolio_nav_path.is_file() else pd.DataFrame()
     benchmark_navs = pd.read_csv(benchmark_navs_path) if benchmark_navs_path.is_file() else pd.DataFrame()
     return ReviewRun(
@@ -113,9 +133,9 @@ def load_review_run(runs_dir: str | Path, run_id: str) -> ReviewRun:
 class ReviewState:
     """为页面提供只读的候选、行情和绩效查询。"""
 
-    def __init__(self, run: ReviewRun, db_path: str | Path):
+    def __init__(self, run: ReviewRun, db_path: str | Path | None = None):
         self.run = run
-        self.db_path = Path(db_path).expanduser()
+        self.db_path = Path(db_path).expanduser() if db_path else None
         self.market = str(run.manifest.get("spec", {}).get("market", "a_share"))
         self.signal_date = date.fromisoformat(str(run.manifest["signal_date"]))
         horizons = run.manifest.get("spec", {}).get("horizons", [21, 42])
@@ -298,7 +318,7 @@ class ReviewState:
         nav = self._portfolio_nav_frame(selected_portfolio_id)
         if not nav.empty and "horizon" in nav.columns:
             nav["horizon"] = pd.to_numeric(nav["horizon"], errors="coerce").astype("Int64")
-        return {
+        payload = {
             "status": "OK" if not portfolio_frame.empty else "EMPTY_PORTFOLIO",
             "portfolio_id": selected_portfolio_id,
             "portfolio_ids": self.portfolio_ids(),
@@ -313,6 +333,16 @@ class ReviewState:
             "comparison": _jsonable(comparison),
             "benchmark_nav": _records(self._benchmark_nav_frame(selected_portfolio_id)),
         }
+        payload["review"] = build_review_projection(
+            self.run,
+            portfolio_id=selected_portfolio_id,
+            portfolio_frame=portfolio_frame,
+            nav_frame=nav,
+            portfolios_frame=self.run.portfolios_frame,
+            portfolio_nav_frame=self.run.portfolio_nav_frame,
+            candidates_frame=self.run.candidates_frame,
+        )
+        return payload
 
     def candidates(
         self,
@@ -471,6 +501,8 @@ class ReviewState:
         }
 
     def _load_bars(self, symbol: str) -> pd.DataFrame:
+        if self.db_path is None:
+            raise FileNotFoundError("行情数据库不存在")
         adapter = DuckDBMarketDataAdapter(self.db_path, industry_db_path=self.industry_db_path)
         start = self.signal_date - timedelta(days=450)
         end = self.signal_date + timedelta(days=max(self.horizons) * 3 + 15)
@@ -488,7 +520,7 @@ class ReviewState:
         """从绑定的只读行情/行业源补充冻结候选缺失的展示元数据。"""
 
         symbols = self.candidates_frame.get("symbol", pd.Series(dtype=str)).astype(str).dropna().unique().tolist()
-        if not symbols or not self.db_path.is_file():
+        if not symbols or self.db_path is None or not self.db_path.is_file():
             return
         try:
             adapter = DuckDBMarketDataAdapter(self.db_path, industry_db_path=self.industry_db_path)
@@ -613,7 +645,7 @@ def create_review_server(
 def serve_review(
     run_id: str,
     runs_dir: str | Path,
-    db_path: str | Path,
+    db_path: str | Path | None = None,
     host: str = "127.0.0.1",
     port: int = 8787,
 ) -> None:

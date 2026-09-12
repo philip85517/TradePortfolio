@@ -3,7 +3,6 @@ from __future__ import annotations
 
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
-from pathlib import Path
 from urllib.parse import unquote, urlparse
 
 from .review import ReviewRequestHandler, ReviewState, load_review_run, STATIC_ROOT
@@ -61,9 +60,8 @@ class WorkbenchHTTPMixin:
                     return True
                 run = load_review_run(flow.runs_dir, run_id)
                 data_source = run.manifest.get('diagnostics', {}).get('data_source', {})
+                data_source = data_source if isinstance(data_source, dict) else {}
                 db_path = data_source.get('db_path')
-                if not db_path or not Path(db_path).is_file():
-                    raise WorkflowError('此运行的冻结行情不可用，请从创建记录检查数据', 'DATA_UNAVAILABLE', 5)
                 self.review_state = ReviewState(run, db_path)
                 original = self.path
                 parsed = urlparse(original)

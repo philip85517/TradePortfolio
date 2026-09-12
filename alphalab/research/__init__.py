@@ -20,6 +20,7 @@ from .data_binding import (
     run_default_industry_updater,
 )
 from .review import ReviewRun, ReviewState, create_review_server, load_review_run, serve_review
+from .result_projection import build_review_projection, project_portfolio_review, project_result_review
 from .plugins import (
     FixedV0Plugin,
     ResearchFactorPlugin,
@@ -76,4 +77,7 @@ __all__ = [
     "create_review_server",
     "load_review_run",
     "serve_review",
+    "build_review_projection",
+    "project_portfolio_review",
+    "project_result_review",
 ]
