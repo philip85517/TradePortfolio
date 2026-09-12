@@ -5,7 +5,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 from urllib.parse import unquote, urlparse
 
-from .review import ReviewRequestHandler, ReviewState, load_review_run, STATIC_ROOT
+from .review import REVIEW_STATIC_ASSETS, ReviewRequestHandler, ReviewState, load_review_run, STATIC_ROOT
 from .workflow import ResearchWorkflow, WorkflowError
 
 
@@ -58,9 +58,18 @@ class WorkbenchHTTPMixin:
                     self.send_response(302); self.send_header('Location', path + '/'); self.end_headers()
                     return True
                 review_asset = parts[4:]
-                if review_asset in ([''], ['app.js'], ['styles.css']):
-                    filename = 'index.html' if review_asset == [''] else review_asset[0]
-                    self._send_file(STATIC_ROOT / filename)
+                asset_name = '/'.join(review_asset)
+                if review_asset == ['']:
+                    self._send_file(STATIC_ROOT / 'index.html')
+                    return True
+                if asset_name in REVIEW_STATIC_ASSETS:
+                    self._send_file(STATIC_ROOT / REVIEW_STATIC_ASSETS[asset_name])
+                    return True
+                if any(part in {'.', '..'} for part in review_asset):
+                    self._send_json({'error': '静态资源不存在'}, status=404)
+                    return True
+                if not review_asset or review_asset[0] != 'api':
+                    self._send_json({'error': '静态资源不存在'}, status=404)
                     return True
                 flow = self.get_workflow()
                 run = load_review_run(flow.runs_dir, run_id)

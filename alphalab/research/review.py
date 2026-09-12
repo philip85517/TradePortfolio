@@ -24,6 +24,12 @@ from .chart_data import DEFAULT_EMA_PERIODS, SUPPORTED_TIMEFRAMES, normalize_tim
 from .result_projection import build_review_projection
 
 STATIC_ROOT = Path(__file__).resolve().parent / "static"
+REVIEW_STATIC_ASSETS = {
+    "app.js": "app.js",
+    "styles.css": "styles.css",
+    "portfolio-review-charts.js": "portfolio-review-charts.js",
+    "vendor/lightweight-charts.standalone.production.js": "vendor/lightweight-charts.standalone.production.js",
+}
 REQUIRED_ARTIFACTS = (
     "manifest.json",
     "candidates.csv",
@@ -568,8 +574,9 @@ class ReviewRequestHandler(BaseHTTPRequestHandler):
         try:
             if parsed.path == "/":
                 self._send_file(STATIC_ROOT / "index.html")
-            elif parsed.path in {"/app.js", "/styles.css"}:
-                self._send_file(STATIC_ROOT / parsed.path.removeprefix("/"))
+            elif parsed.path.removeprefix("/") in REVIEW_STATIC_ASSETS:
+                asset_name = parsed.path.removeprefix("/")
+                self._send_file(STATIC_ROOT / REVIEW_STATIC_ASSETS[asset_name])
             elif parsed.path == "/api/health":
                 self._send_json({"ok": True})
             elif parsed.path == "/api/summary":
