@@ -43,11 +43,17 @@ class WorkbenchHTTPMixin:
 
     def handle_workbench(self):
         path = urlparse(self.path).path
-        if not (path in {'/wizard', '/wizard/', '/wizard.js', '/wizard.css'}
+        if not (path in {
+            '/wizard', '/wizard/', '/wizard.js', '/wizard.css', '/portfolio-review.js', '/portfolio-review.css',
+            '/portfolio-review-charts.js', '/vendor/lightweight-charts.standalone.production.js',
+        }
                 or path.startswith('/api/wizard/') or path.startswith('/research/review/')):
             return False
         try:
-            if self.command == 'GET' and path in {'/wizard', '/wizard/', '/wizard.js', '/wizard.css'}:
+            if self.command == 'GET' and path in {
+                '/wizard', '/wizard/', '/wizard.js', '/wizard.css', '/portfolio-review.js', '/portfolio-review.css',
+                '/portfolio-review-charts.js', '/vendor/lightweight-charts.standalone.production.js',
+            }:
                 filename = 'wizard.html' if path in {'/wizard', '/wizard/'} else path[1:]
                 self._send_file(STATIC_ROOT / filename)
                 return True

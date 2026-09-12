@@ -141,7 +141,19 @@
     return request;
   }
   function clearSubmissionKey(value, storage) { storage.removeItem(submissionStorageKey(value)); }
-  if (typeof module !== 'undefined') module.exports = {validateScope, acceptResponse, coverageHtml, calendarLabel, gates, unfinishedDrafts, selectionSymbols, repairLabel, filterIssues, issuesHtml, attemptSummary, diagnosticLabel, taskForDraft, taskTiming, liquidationHtml, adjustmentHtml, pendingReadinessHtml, readinessHeadline, readinessGate, explorationHelp, previewPendingHtml, restoredStep, executionHtml, submissionKey, clearSubmissionKey};
+  function reviewIdentity(result, portfolioId, horizon) {
+    const review=result?.review || result || {}, summary=result?.summary || {};
+    const horizons=Array.isArray(review.horizons) && review.horizons.length ? review.horizons : Array.isArray(result?.horizons) && result.horizons.length ? result.horizons : summary.horizon == null ? [] : [summary.horizon];
+    return {runId:String(review.run_id || result?.run_id || ''),portfolioId:String(portfolioId ?? review.portfolio_id ?? result?.portfolio_id ?? 'strategy'),horizon:String(horizon ?? horizons[0] ?? '')};
+  }
+  function reviewUrl(identity) {
+    const id=identity || {};
+    const runId=encodeURIComponent(id.runId || '');
+    const query=id.portfolioId ? `?portfolio_id=${encodeURIComponent(id.portfolioId)}` : '';
+    return `/research/review/${runId}/api/portfolio${query}`;
+  }
+  function reviewSummaryUrl(identity) { return `/research/review/${encodeURIComponent(identity?.runId || '')}/api/summary`; }
+  if (typeof module !== 'undefined') module.exports = {validateScope, acceptResponse, coverageHtml, calendarLabel, gates, unfinishedDrafts, selectionSymbols, repairLabel, filterIssues, issuesHtml, attemptSummary, diagnosticLabel, taskForDraft, taskTiming, liquidationHtml, adjustmentHtml, pendingReadinessHtml, readinessHeadline, readinessGate, explorationHelp, previewPendingHtml, restoredStep, executionHtml, submissionKey, clearSubmissionKey, reviewIdentity, reviewUrl, reviewSummaryUrl};
   if (typeof document === 'undefined') return;
   const $ = id => document.getElementById(id);
   const fmt = v => v == null ? '—' : typeof v === 'number' ? v.toLocaleString('zh-CN',{maximumFractionDigits:2}) : String(v);
@@ -150,6 +162,7 @@
   const defaults = {scope:{market:'a_share',start_date:'2021-03-01',end_date:'2025-06-30',selection_mode:'manual',symbols:[],rule_version:'fixed_v0',top_n:10,quality_mode:'strict'},portfolio:{name:'我的股票组合',initial_cash:100000,weighting:'equal',weights:{},commission_rate:0.0003,slippage_rate:0.001,max_single_weight:1,max_industry_weight:1,min_holdings:1}};
   let statusUnavailable=false, coveragePage=0, issueFilters={}, readinessRendered=undefined;
   let draft = null, task = null, step = 1, opening = 0, epoch = 0, dirty = false, busy = false, pendingOperation = null, saveTimer, saving = null, pollTimer;
+  let reviewController = null, reviewOwnerKey = '', reviewEpoch = 0, reviewAbort = null, reviewSourceResult = null;
   async function api(path, method='GET', body) {
     const r = await fetch('/api/wizard'+path,{method,headers:{Accept:'application/json',...(body ? {'Content-Type':'application/json'} : {})},body:body ? JSON.stringify(body) : undefined,cache:'no-store'});
     let p; try { p=await r.json(); } catch { throw new Error('服务未返回有效响应，请稍后重试。'); }
@@ -158,6 +171,48 @@
   }
   function error(e) { $('error').textContent=e.message || String(e); $('error').hidden=false; $('error').focus(); }
   function clearError() {$('error').hidden=true;}
+  async function reviewFetch(path, signal) {
+    const response=await fetch(path,{headers:{Accept:'application/json'},cache:'no-store',signal});
+    let payload; try { payload=await response.json(); } catch { throw new Error('冻结结果接口未返回有效 JSON。'); }
+    if (!response.ok) { const e=new Error(payload.error || `结果读取失败 (${response.status})`); Object.assign(e,{code:payload.code}); throw e; }
+    return payload;
+  }
+  function legacyResultHtml(result) {
+    return result?.run_id ? `<div class="notice success"><h3>运行已保存</h3><p>冻结配置及结果可从最近运行重新打开。</p><a href="/research/review/${encodeURIComponent(result.run_id)}/">打开净值、收益、回撤与持仓审阅 →</a></div>`+metrics([['总收益率',result.summary?.total_return == null ? '—' : (result.summary.total_return*100).toFixed(2)+'%'],['绝对盈亏',result.summary?.profit_loss],['期末权益',result.summary?.ending_equity]])+liquidationHtml(result.summary)+executionHtml(result.summary?.execution_events)+details(result.summary || {},'运行摘要'):'';
+  }
+  function clearPortfolioReview() {
+    reviewEpoch++; reviewOwnerKey=''; reviewSourceResult=null;
+    if(reviewAbort) { try { reviewAbort.abort(); } catch {} reviewAbort=null; }
+    if(reviewController) { try { reviewController.destroy(); } catch {} reviewController=null; }
+  }
+  function loadPortfolioReview(result, requestedIdentity) {
+    if(!result?.run_id || typeof window.PortfolioReviewUI==='undefined') { $('results').innerHTML=legacyResultHtml(result); return; }
+    const base=reviewIdentity(result,requestedIdentity?.portfolioId,requestedIdentity?.horizon);
+    const ownerKey=JSON.stringify(base);
+    if(reviewController && reviewOwnerKey===ownerKey && reviewSourceResult?.run_id===result.run_id) return;
+    clearPortfolioReview();
+    reviewOwnerKey=ownerKey; reviewSourceResult=result;
+    reviewController=window.PortfolioReviewUI.create($('results'),{data:result,fallback:true,portfolioId:base.portfolioId,horizon:base.horizon,
+      onRetry:(identity)=>loadPortfolioReview(result,identity),
+      onSelectionChange:(identity)=>loadPortfolioReview(result,identity)});
+    const requestToken=++reviewEpoch, ownerDraft=draft?.id, ownerTask=task?.id, controller=reviewController;
+    reviewAbort=typeof AbortController==='function'?new AbortController():null;
+    controller.setLoading({data:result,portfolioId:base.portfolioId,horizon:base.horizon});
+    const runPath=reviewUrl(base);
+    reviewFetch(runPath,reviewAbort?.signal).then((payload)=>{
+      if(requestToken!==reviewEpoch || controller!==reviewController || draft?.id!==ownerDraft || task?.id!==ownerTask || reviewOwnerKey!==ownerKey) return;
+      const detailIdentity=reviewIdentity(payload,base.portfolioId,base.horizon);
+      controller.setData(payload,{portfolioId:detailIdentity.portfolioId,horizon:detailIdentity.horizon});
+      reviewFetch(reviewSummaryUrl(base),reviewAbort?.signal).then((summary)=>{
+        if(requestToken===reviewEpoch && controller===reviewController && reviewOwnerKey===ownerKey) controller.setEvidence(summary);
+      }).catch((summaryError)=>{
+        if(requestToken===reviewEpoch && controller===reviewController && reviewOwnerKey===ownerKey && summaryError?.name!=='AbortError') controller.setEvidenceError(summaryError);
+      });
+    }).catch((loadError)=>{
+      if(requestToken!==reviewEpoch || controller!==reviewController || reviewOwnerKey!==ownerKey || loadError?.name==='AbortError') return;
+      controller.setError(loadError,result);
+    }).finally(()=>{ if(requestToken===reviewEpoch) reviewAbort=null; });
+  }
   function localKey(id) { return 'alphalab.wizard.buffer.'+id; }
   function remember() { if (!draft) return; try { localStorage.setItem(localKey(draft.id),JSON.stringify({scope:draft.scope,portfolio:draft.portfolio,weightsText:$('weights').value,revision:draft.revision})); } catch { $('saveStatus').textContent='浏览器无法保存备份，请保持页面直到服务端保存成功。'; } }
   function readScope() { return {market:$('market').value,start_date:$('startDate').value,end_date:$('endDate').value,selection_mode:$('selectionMode').value,symbols:selectionSymbols($('selectionMode').value,$('symbols').value),rule_version:$('ruleVersion').value,top_n:Number($('topN').value),quality_mode:document.querySelector('[name=quality]:checked').value}; }
@@ -268,6 +323,8 @@
   function render() {
     if (!draft) return;
     const permissions=gates(draft,task,dirty,busy || statusUnavailable), {ready,running}=permissions, preview=ready && Boolean(draft.preview);
+    const result=task?.kind==='run' && task.status==='SUCCEEDED' ? task.result : null;
+    document.body.classList.toggle('portfolio-review-result-mode',Boolean(result?.run_id));
     $('steps').innerHTML=names.map((n,i)=>`<button type="button" data-step="${i+1}" ${i+1===step?'aria-current="step"':''} ${(i===2&&!ready)||(i===3&&!preview)||(i===4&&!permissions.canViewResult)?'disabled':''}>${i+1}. ${n}<small>${i===1?(ready?'可继续':'需检查'):i===2?(!ready?'等待数据就绪':preview?'预览已完成':'待配置'):i===3?(!preview?'等待预览':'可提交'):i===4?(task?.kind==='run'?'已创建任务':'等待运行'): '范围在先'}</small></button>`).join('');
     for(let i=1;i<=5;i++) $('step'+i).hidden=i!==step;
     const previewButton=$('portfolioForm').querySelector('button[type="submit"]');
@@ -289,15 +346,15 @@
     $('cancelPrepare').textContent=task?.kind==='check'?'取消检查':task?.kind==='retry_source'?'取消来源核实':'取消数据准备';
     $('cancelPrepare').hidden=!(['check','prepare','retry_source'].includes(task?.kind) && running);
     $('prepareTask').innerHTML=['check','prepare','retry_source'].includes(task?.kind)?renderTask(task)+(task.result?.repair_attempts?.length?details(task.result.repair_attempts,'本轮处理记录与未解决原因'):''):'';
-    $('runTask').innerHTML=pendingOperation==='run'?'<div class="notice" role="status"><strong>正在校验并提交运行</strong><p>正在验证保存的数据与配置，较大股票池可能需要数分钟，无需重复点击。</p></div>':task?.kind==='run'?renderTask(task):'<p>尚未启动运行，请先完成配置与确认。</p>';
+    $('runTask').innerHTML=pendingOperation==='run'?'<div class="notice" role="status"><strong>正在校验并提交运行</strong><p>正在验证保存的数据与配置，较大股票池可能需要数分钟，无需重复点击。</p></div>':result?.run_id?`<div class="portfolio-review-run-status" role="status"><span class="status-dot">任务已完成</span><strong>运行已保存</strong><small>结果详情只读取冻结运行；清算状态在下方组合复盘中单独展示。</small></div>`:task?.kind==='run'?renderTask(task):'<p>尚未启动运行，请先完成配置与确认。</p>';
     $('retryRun').disabled=busy || running || statusUnavailable;
     $('retryRun').textContent=pendingOperation==='run'?'正在校验并提交…':'重试运行';
     $('retryRun').hidden=!(task?.kind==='run' && ['FAILED','CANCELLED','INTERRUPTED'].includes(task.status));
     $('recoverTask').hidden=!(task?.kind==='run' && ['FAILED','CANCELLED','INTERRUPTED'].includes(task.status));
     if (readinessRendered!==draft.readiness) { readinessRendered=draft.readiness; coveragePage=0; renderReadiness(); } renderPreview();
     $('confirmation').innerHTML=metrics([['组合名称',draft.portfolio.name],['初始本金',draft.portfolio.initial_cash],['研究区间',draft.scope.start_date+' → '+draft.scope.end_date],['持有方式',draft.portfolio.delisting_policy==='announcement-replace-v1'?'退市公告退出与替补':'买入并持有至结束日'],['范围',draft.scope.selection_mode==='manual' ? draft.scope.symbols.join(', ') : 'fixed_v0 · '+draft.scope.top_n+' 只'],['数据质量',draft.scope.quality_mode==='strict'?'正式研究':'探索研究'],['佣金',draft.portfolio.commission_rate*100+'%'],['滑点',draft.portfolio.slippage_rate*100+'%'],['权重方式',({equal:'等权',score:'规则评分',custom:'自定义'}[draft.portfolio.weighting])],['最低持仓数',draft.portfolio.min_holdings],['单股权重上限',draft.portfolio.max_single_weight==null?'不限制':draft.portfolio.max_single_weight*100+'%'],['行业权重上限',draft.portfolio.max_industry_weight==null?'不限制':draft.portfolio.max_industry_weight*100+'%']])+(draft.scope.quality_mode==='exploratory'?'<div class="notice danger">本次结果为探索研究，保留数据检查所列历史身份与行业快照限制。</div>':'')+metrics(Object.entries(draft.readiness?.dates || {}).filter(([key])=>['signal_date','entry_date','exit_date','warmup_start_date','horizon','calendar_source'].includes(key)).map(([key,value])=>[({signal_date:'规则信号日',entry_date:'实际建仓日',exit_date:'实际结束日',warmup_start_date:'预热起点',horizon:'持有交易日数',calendar_source:'交易日历来源'}[key]),key==='calendar_source'?calendarLabel(value):value]));
-    const result=task?.kind==='run' && task.status==='SUCCEEDED' ? task.result : null;
-    $('results').innerHTML=result?.run_id?`<div class="notice success"><h3>运行已保存</h3><p>冻结配置及结果可从最近运行重新打开。</p><a href="/research/review/${encodeURIComponent(result.run_id)}/">打开净值、收益、回撤与持仓审阅 →</a></div>`+metrics([['总收益率',result.summary?.total_return == null ? '—' : (result.summary.total_return*100).toFixed(2)+'%'],['绝对盈亏',result.summary?.profit_loss],['期末权益',result.summary?.ending_equity]])+liquidationHtml(result.summary)+executionHtml(result.summary?.execution_events)+details(result.summary || {},'运行摘要'):'';
+    if(result?.run_id) loadPortfolioReview(result);
+    else if(reviewController) { clearPortfolioReview(); $('results').innerHTML=''; }
     document.querySelectorAll('#scopeForm input,#scopeForm select,#scopeForm textarea,#portfolioForm input,#portfolioForm select,#portfolioForm textarea').forEach(el=>el.disabled=running || busy || statusUnavailable);
     syncChoices();
   }
@@ -337,7 +394,7 @@
   async function openDraft(id) {
     const request=++opening; clearError(); const p=await api('/drafts/'+encodeURIComponent(id));
     if(request!==opening)return;
-    epoch++; draft=p.draft; task=null; statusUnavailable=false; readinessRendered=undefined; dirty=false;
+    epoch++; clearPortfolioReview(); draft=p.draft; task=null; statusUnavailable=false; readinessRendered=undefined; dirty=false;
     fill();
     const saved=localStorage.getItem(localKey(id));
     if(saved) { try { const b=JSON.parse(saved); draft.scope=b.scope; draft.portfolio=b.portfolio; draft.readiness=null; draft.preview=null; dirty=true; fill(); if(b.weightsText!=null)$('weights').value=b.weightsText; $('saveStatus').textContent='已恢复本机未保存输入，请重试保存'; $('retrySave').hidden=false; } catch {} }
@@ -348,7 +405,7 @@
     go(step);
   }
   async function home() {
-    if(dirty) await save(); opening++; clearTimeout(pollTimer); draft=null; task=null; epoch++;
+    if(dirty) await save(); opening++; clearTimeout(pollTimer); clearPortfolioReview(); draft=null; task=null; epoch++;
     $('home').hidden=false; $('editor').hidden=true; history.replaceState(null,'','/wizard');
     const [d,r]=await Promise.all([api('/drafts'),api('/runs')]);
     const unfinished=unfinishedDrafts(d.drafts);
