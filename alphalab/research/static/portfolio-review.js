@@ -735,6 +735,10 @@
 
     function renderEventsRegion() {
       if (!model || state.tab !== "events") return;
+      if (state.selectedEventId && !filterEvents(model.data.events, state.filters).some((event) => String(event.id) === String(state.selectedEventId))) {
+        state.selectedEventId = null;
+        chartController?.update?.({selectedEventId: null});
+      }
       setRegion("details", eventTabHtml(model, state));
     }
 
@@ -827,6 +831,10 @@
       if (next.range !== undefined) { state.range = next.range; chartUpdate.range = state.range; }
       if (next.tab !== undefined && ["events", "holdings", "evidence"].includes(String(next.tab))) state.tab = String(next.tab);
       if (next.filters) state.filters = {...state.filters, ...next.filters};
+      if (next.filters && state.selectedEventId && !filterEvents(model?.data?.events, state.filters).some((event) => String(event.id) === String(state.selectedEventId))) {
+        state.selectedEventId = null;
+        chartUpdate.selectedEventId = null;
+      }
       if (next.benchmark !== undefined) { benchmarkChanged = state.benchmark !== Boolean(next.benchmark); state.benchmark = Boolean(next.benchmark); chartUpdate.benchmark = state.benchmark; }
       if (benchmarkChanged && chartController) renderChart();
       else if (Object.keys(chartUpdate).length && chartController) chartController.update({...chartUpdate, selectedEventId: state.selectedEventId});
