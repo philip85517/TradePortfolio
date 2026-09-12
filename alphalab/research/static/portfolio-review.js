@@ -110,11 +110,23 @@
     return value;
   }
 
-  function horizonKeys(payload) {
+  function manifestPerformance(payload) {
+    const manifest = payload?.manifest;
+    const performance = manifest?.portfolio_performance;
+    return performance && typeof performance === "object" && !Array.isArray(performance) ? performance : null;
+  }
+
+  function horizonKeys(payload, portfolioId) {
     const object = dataObject(payload);
     const byHorizon = object.by_horizon && typeof object.by_horizon === "object" ? object.by_horizon : {};
     const values = Object.keys(byHorizon);
     if (values.length) return values.sort((left, right) => Number(left) - Number(right));
+    const manifest = manifestPerformance(payload);
+    if (manifest) {
+      const selected = manifest[String(portfolioId ?? payload?.portfolio_id ?? "strategy")];
+      if (!selected || typeof selected !== "object" || Array.isArray(selected)) return [];
+      return Object.keys(selected).sort((left, right) => Number(left) - Number(right));
+    }
     const performance = payload?.performance && typeof payload.performance === "object" ? payload.performance : {};
     const pValues = Object.keys(performance);
     if (pValues.length) return pValues.sort((left, right) => Number(left) - Number(right));
@@ -122,50 +134,84 @@
     return declared.map((value) => String(value)).filter(Boolean).sort((left, right) => Number(left) - Number(right));
   }
 
-  function statusFor(summary, nav, ending) {
+  function statusFor(summary, nav, ending, endingEvidence = false) {
     const raw = String(summary?.status || "").toUpperCase();
     const liquidation = String(summary?.liquidation_status || "").toUpperCase();
     if (liquidation === "UNSETTLED_DELISTING") return {code: "UNSETTLED", label: "含未结算股份", explanation: "研究已保存，但冻结证据未能结算全部退市股份。"};
     if (liquidation === "OPEN_POSITION") return {code: "COMPLETE_OPEN", label: "完成但有未平仓", explanation: "研究已完成，期末仍有持仓，期末权益包含冻结估值。"};
-    if ((raw === "COMPLETE" || raw === "SUCCEEDED") && (liquidation === "LIQUIDATED" || ending.length === 0)) return {code: "COMPLETE_LIQUIDATED", label: "完成且清算", explanation: "研究已完成，冻结证据显示期末持仓已全部清算。"};
+    if ((raw === "COMPLETE" || raw === "SUCCEEDED") && (liquidation === "LIQUIDATED" || endingEvidence === true)) return {code: "COMPLETE_LIQUIDATED", label: "完成且清算", explanation: "研究已完成，冻结证据显示期末持仓已全部清算。"};
     if (nav.length) return {code: "COMPLETE", label: "结果已保存", explanation: "冻结净值可查看；清算状态以保存的执行证据为准。"};
     if (raw === "FAILED" || raw === "ERROR") return {code: "FAILED", label: "结果读取失败", explanation: "运行摘要可用，但详细净值尚未读取。"};
     return {code: "NO_EVIDENCE", label: "证据不足", explanation: "冻结运行未提供可展示的净值或期末证据。"};
   }
 
-  function fallbackHorizon(payload, key) {
+  function fallbackHorizon(payload, key, options = {}) {
     const source = dataObject(payload);
-    const performance = payload?.performance?.[key] || payload?.summary || {};
-    const navSource = Array.isArray(payload?.nav) ? payload.nav.filter((row) => String(row?.horizon ?? key) === String(key)) : [];
-    const eventSource = Array.isArray(performance.execution_events) ? performance.execution_events : [];
-    const ending = Array.isArray(payload?.ending_holdings) ? payload.ending_holdings : Object.entries(performance.open_positions || {}).map(([symbol, shares]) => ({symbol, shares}));
+    const portfolioId = String(options.portfolioId ?? source.portfolio_id ?? payload?.portfolio_id ?? "strategy");
+    const manifest = manifestPerformance(payload);
+    const manifestPortfolio = manifest?.[portfolioId];
+    const scopedManifest = Boolean(manifest);
+    const manifestSummary = manifestPortfolio && typeof manifestPortfolio === "object" ? manifestPortfolio[key] : null;
+    const directPerformance = payload?.performance?.[key];
+    const legacySummary = payload?.summary;
+    const legacyPortfolioId = String(source.portfolio_id ?? payload?.portfolio_id ?? "strategy");
+    const legacyHorizon = legacySummary?.horizon == null ? null : String(legacySummary.horizon);
+    const legacyIdentityMatches = !scopedManifest
+      && portfolioId === legacyPortfolioId
+      && (legacyHorizon === null || legacyHorizon === String(key));
+    const performance = (scopedManifest ? manifestSummary : directPerformance) || (legacyIdentityMatches ? legacySummary : null);
+    const navSource = Array.isArray(payload?.nav)
+      ? payload.nav.filter((row) => {
+        const rowPortfolio = row?.portfolio_id;
+        const portfolioMatches = rowPortfolio == null
+          ? (!scopedManifest || portfolioId === legacyPortfolioId)
+          : String(rowPortfolio) === portfolioId;
+        return portfolioMatches && String(row?.horizon ?? key) === String(key);
+      })
+      : [];
+    const safePerformance = performance && typeof performance === "object" ? performance : {};
+    const eventSource = Array.isArray(safePerformance.execution_events) ? safePerformance.execution_events : [];
+    const ending = Array.isArray(safePerformance.ending_holdings)
+      ? safePerformance.ending_holdings
+      : Array.isArray(safePerformance.ending_positions)
+        ? safePerformance.ending_positions
+        : legacyIdentityMatches && Array.isArray(payload?.ending_holdings)
+          ? payload.ending_holdings
+          : Object.entries(safePerformance.open_positions || {}).map(([symbol, shares]) => ({symbol, shares}));
+    const endingEvidence = safePerformance.ending_holdings_evidence === true
+      || safePerformance.ending_evidence === true
+      || safePerformance.capabilities?.ending_holdings_evidence === true;
+    const unavailable = performance ? [] : ["所选组合或观察周期没有可用的冻结绩效摘要"];
     return {
-      summary: {...performance},
-      status: statusFor(performance, navSource, ending),
+      ...source,
+      portfolio_id: portfolioId,
+      summary: {...safePerformance},
+      status: statusFor(safePerformance, navSource, ending, endingEvidence),
       nav: navSource,
       events: eventSource,
       chains: [],
-      initial_holdings: Array.isArray(payload?.holdings) ? payload.holdings : [],
+      initial_holdings: legacyIdentityMatches && Array.isArray(payload?.holdings) ? payload.holdings : [],
       ending_holdings: ending,
-      capabilities: {daily_nav: navSource.length > 0, weekly_monthly_aggregation: navSource.length > 0, comparable_frozen_benchmark: Boolean(payload?.benchmark_nav?.length)},
-      unavailable_reasons: navSource.length ? [] : ["运行摘要未包含日终净值，详细结果读取失败"],
-      initial_cash: performance.initial_cash ?? payload?.initial_cash,
-      ending_cash: performance.realized_cash ?? performance.cash_residual,
-      known_assets_value: performance.known_assets_value ?? performance.ending_equity,
-      unsettled_symbols: performance.unsettled_symbols || [],
+      capabilities: {daily_nav: navSource.length > 0, weekly_monthly_aggregation: navSource.length > 0, comparable_frozen_benchmark: Boolean(payload?.benchmark_nav?.length), ending_holdings_evidence: endingEvidence},
+      unavailable_reasons: unavailable.length ? unavailable : navSource.length ? [] : ["运行摘要未包含日终净值，详细结果读取失败"],
+      initial_cash: safePerformance.initial_cash ?? (legacyIdentityMatches ? payload?.initial_cash : undefined),
+      ending_cash: safePerformance.realized_cash ?? safePerformance.cash_residual,
+      known_assets_value: safePerformance.known_assets_value ?? safePerformance.ending_equity,
+      unsettled_symbols: safePerformance.unsettled_symbols || [],
       transaction_count: eventSource.filter(eventIsFill).length,
-      ...source,
     };
   }
 
   function normalizeReviewPayload(payload, options = {}) {
     const input = payload && typeof payload === "object" ? payload : {};
     const source = dataObject(input);
-    const keys = horizonKeys(input);
-    const requested = options.horizon === undefined || options.horizon === null ? keys[0] : String(options.horizon);
-    const horizon = keys.includes(requested) ? requested : (keys[0] || requested || "");
+    const portfolioId = String(options.portfolioId ?? source.portfolio_id ?? input.portfolio_id ?? "strategy");
+    const keys = horizonKeys(input, portfolioId);
+    const hasRequestedHorizon = options.horizon !== undefined && options.horizon !== null;
+    const requested = hasRequestedHorizon ? String(options.horizon) : keys[0];
+    const horizon = hasRequestedHorizon ? requested : (keys[0] || requested || "");
     const byHorizon = source.by_horizon && typeof source.by_horizon === "object" ? source.by_horizon : {};
-    const detail = byHorizon[horizon] || fallbackHorizon(input, horizon);
+    const detail = byHorizon[horizon] || fallbackHorizon(input, horizon, {portfolioId});
     const summary = detail.summary || input.summary || {};
     const nav = Array.isArray(detail.nav) ? detail.nav : [];
     const events = Array.isArray(detail.events) ? detail.events : [];
@@ -184,9 +230,13 @@
       scope: source.scope || input.scope,
       quality_mode: source.quality_mode || input.quality_mode,
     };
-    const portfolioId = String(options.portfolioId ?? review.portfolio_id ?? input.portfolio_id ?? "strategy");
     const runId = String(review.run_id || input.run_id || "");
-    const portfolioOptions = Array.isArray(input.portfolios) ? input.portfolios : Array.isArray(review.portfolios) ? review.portfolios : [];
+    const manifest = input?.manifest && typeof input.manifest === "object" ? input.manifest : {};
+    const portfolioOptions = Array.isArray(input.portfolios)
+      ? input.portfolios
+      : Array.isArray(review.portfolios)
+        ? review.portfolios
+        : Array.isArray(manifest.portfolios) ? manifest.portfolios : [];
     return {
       review,
       data: {
@@ -574,9 +624,16 @@
     return `<section class="portfolio-review-tab-panel" data-review-tab-panel="events"><div class="portfolio-review-section-title"><div><span class="portfolio-review-kicker">EVENT TRACE</span><h3>交易与调仓</h3></div><div class="portfolio-review-tab-actions"><span>${escapeHtml(scopeLabel)}</span><button type="button" data-review-export="events-all">下载全部事件 CSV</button><button type="button" data-review-export="events-filtered">下载当前筛选 CSV</button></div></div>${notice}${eventFiltersHtml(data, state.filters)}<div class="portfolio-review-legend" aria-label="事件类型图例"><span class="legend-fill">● 真实成交</span><span class="legend-decision">■ 决策 / 顺延</span><span class="legend-terminal">◆ 期末清算</span></div><div class="portfolio-review-event-layout"><div class="portfolio-review-event-list-column"><div class="portfolio-review-event-list">${rows}</div>${more}${chainRows ? `<div class="portfolio-review-chain-list"><h4>调仓链</h4>${chainRows}</div>` : ""}</div><aside class="portfolio-review-selected-detail" data-review-selected-detail aria-label="选中事件详情">${selectedDetail}</aside></div></section>`;
   }
 
-  function holdingsTable(title, rows, emptyText) {
+  function holdingsTable(title, rows, emptyText, schema = "initial") {
     const list = Array.isArray(rows) ? rows : [];
     if (!list.length) return `<div class="portfolio-review-holdings-card"><h4>${escapeHtml(title)}</h4><p class="portfolio-review-empty">${escapeHtml(emptyText)}</p></div>`;
+    if (schema === "ending") {
+      const body = list.map((row) => {
+        const settlement = row.unsettled === true ? "未结算" : row.unsettled === false ? "已结算" : "未知";
+        return `<tr><th scope="row"><b>${escapeHtml(row.symbol || "未知代码")}</b><small>${escapeHtml(row.name || "")}</small></th><td>${escapeHtml(row.shares == null ? "未知" : formatNumber(row.shares, 0))}</td><td>${escapeHtml(row.market_value == null ? "未知" : formatMoney(row.market_value))}</td><td>${escapeHtml(settlement)}</td><td>${escapeHtml(row.source || row.evidence_kind || "冻结证据")}</td></tr>`;
+      }).join("");
+      return `<div class="portfolio-review-holdings-card"><h4>${escapeHtml(title)}</h4><div class="portfolio-review-table-wrap"><table><thead><tr><th>股票</th><th>股数</th><th>已保存市值</th><th>结算状态</th><th>证据</th></tr></thead><tbody>${body}</tbody></table></div></div>`;
+    }
     const body = list.map((row) => `<tr><th scope="row"><b>${escapeHtml(row.symbol || "未知代码")}</b><small>${escapeHtml(row.name || "")}</small></th><td>${escapeHtml(row.shares == null ? "未知" : formatNumber(row.shares, 0))}</td><td>${escapeHtml(row.entry_price == null ? "未知" : formatPrice(row.entry_price))}</td><td>${escapeHtml(row.entry_date || row.date || "未知")}</td><td>${escapeHtml(row.source || row.evidence_kind || "冻结证据")}</td></tr>`).join("");
     return `<div class="portfolio-review-holdings-card"><h4>${escapeHtml(title)}</h4><div class="portfolio-review-table-wrap"><table><thead><tr><th>股票</th><th>股数</th><th>价格</th><th>日期</th><th>证据</th></tr></thead><tbody>${body}</tbody></table></div></div>`;
   }
@@ -586,8 +643,17 @@
     const summary = data.summary || {};
     const unsettled = Array.isArray(data.unsettled_symbols) && data.unsettled_symbols.length ? data.unsettled_symbols.join("、") : "无";
     const ending = data.ending_holdings || [];
-    const endingText = ending.length ? "冻结期末持仓证据" : "冻结证据显示期末没有持仓";
-    return `<section class="portfolio-review-tab-panel" data-review-tab-panel="holdings"><div class="portfolio-review-section-title"><div><span class="portfolio-review-kicker">POSITION ACCOUNTING</span><h3>初始与期末持仓</h3></div><span>初始持仓 ≠ 当前行情持仓</span></div><div class="portfolio-review-holdings-grid">${holdingsTable("初始实际持仓（冻结建仓）", data.initial_holdings, "没有保存初始持仓证据；不从候选池推断买入。")}${holdingsTable("期末持仓（冻结证据）", ending, endingText)}</div><div class="portfolio-review-cash-summary"><div><span>期末现金</span><strong>${escapeHtml(data.ending_cash == null ? formatMissing(null, "冻结现金余额未提供") : formatMoney(data.ending_cash))}</strong></div><div><span>已知资产</span><strong>${escapeHtml(data.known_assets_value == null ? formatMissing(null, "冻结资产证据未提供") : formatMoney(data.known_assets_value))}</strong></div><div><span>未结算股份</span><strong>${escapeHtml(unsettled)}</strong></div><div><span>估值语义</span><strong>${escapeHtml(ending.length ? "含期末持仓估值" : "全部清算后现金")}</strong></div></div><p class="portfolio-review-muted">${escapeHtml(data.status?.code === "UNSETTLED" ? "未结算股份不包含在完整收益中；已知资产与现金单独列示。" : "表中的初始价格和期末证据均来自冻结运行，不补查新价格。")}</p></section>`;
+    const endingEvidence = data.capabilities?.ending_holdings_evidence === true
+      || data.status?.liquidation_status === "LIQUIDATED"
+      || String(summary.liquidation_status || "").toUpperCase() === "LIQUIDATED"
+      || data.status?.code === "COMPLETE_LIQUIDATED";
+    const endingText = ending.length
+      ? "冻结期末持仓证据"
+      : endingEvidence
+        ? "冻结证据显示期末没有持仓"
+        : "冻结运行未提供期末持仓/清算证据";
+    const valuationText = ending.length ? "含期末持仓估值" : endingEvidence ? "全部清算后现金" : "期末持仓/清算证据未提供";
+    return `<section class="portfolio-review-tab-panel" data-review-tab-panel="holdings"><div class="portfolio-review-section-title"><div><span class="portfolio-review-kicker">POSITION ACCOUNTING</span><h3>初始与期末持仓</h3></div><span>初始持仓 ≠ 当前行情持仓</span></div><div class="portfolio-review-holdings-grid">${holdingsTable("初始实际持仓（冻结建仓）", data.initial_holdings, "没有保存初始持仓证据；不从候选池推断买入。", "initial")}${holdingsTable("期末持仓（冻结证据）", ending, endingText, "ending")}</div><div class="portfolio-review-cash-summary"><div><span>期末现金</span><strong>${escapeHtml(data.ending_cash == null ? formatMissing(null, "冻结现金余额未提供") : formatMoney(data.ending_cash))}</strong></div><div><span>已知资产</span><strong>${escapeHtml(data.known_assets_value == null ? formatMissing(null, "冻结资产证据未提供") : formatMoney(data.known_assets_value))}</strong></div><div><span>未结算股份</span><strong>${escapeHtml(unsettled)}</strong></div><div><span>估值语义</span><strong>${escapeHtml(valuationText)}</strong></div></div><p class="portfolio-review-muted">${escapeHtml(data.status?.code === "UNSETTLED" ? "未结算股份不包含在完整收益中；已知资产与现金单独列示。" : "表中的初始价格和期末证据均来自冻结运行，不补查新价格。")}</p></section>`;
   }
 
   function evidenceText(model, state) {
@@ -621,7 +687,12 @@
   function resultHeaderHtml(model, state) {
     const dates = scopeDates(model.review, model.data);
     const summary = model.data.summary || {};
-    const status = model.data.status || statusFor(summary, model.data.nav || [], model.data.ending_holdings || []);
+    const status = model.data.status || statusFor(
+      summary,
+      model.data.nav || [],
+      model.data.ending_holdings || [],
+      model.data.capabilities?.ending_holdings_evidence === true,
+    );
     const selectedPortfolio = model.portfolioId;
     const portfolioOptions = model.portfolioOptions || [];
     const portfolioSelect = portfolioOptions.length > 1 ? `<label>组合<select data-review-select="portfolio" aria-label="选择组合">${portfolioOptions.map((item) => `<option value="${escapeHtml(item.portfolio_id)}" ${String(item.portfolio_id) === selectedPortfolio ? "selected" : ""}>${escapeHtml(item.name || item.portfolio_id)}</option>`).join("")}</select></label>` : "";

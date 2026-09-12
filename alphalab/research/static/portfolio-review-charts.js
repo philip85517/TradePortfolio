@@ -735,6 +735,13 @@
     const initialCash = initialCashFrom(object, config.initialCash ?? config.initial_cash);
     const rows = normalizeNavRows(object, initialCash);
     const events = (Array.isArray(object.events) ? object.events : []).map((event, index) => normalizeEvent(event, index, object.run_id));
+    const rowByDate = new Map(rows.map((row) => [row.date, row]));
+    const eventsByDate = new Map();
+    for (const event of events) {
+      if (!event.date) continue;
+      if (!eventsByDate.has(event.date)) eventsByDate.set(event.date, []);
+      eventsByDate.get(event.date).push(event);
+    }
     const benchmarkObject = dataObject(config.benchmark || {});
     const benchmarkRows = Array.isArray(config.benchmark)
       ? normalizeNavRows(config.benchmark, initialCash)
@@ -752,6 +759,8 @@
     const charts = {main: null, drawdown: null};
     const lineSeries = {main: [], drawdown: [], benchmark: []};
     const eventGroupsCache = new Map();
+    const metricPointsCache = new Map();
+    const periodBarsCache = new Map();
     const library = resolveLibrary(config);
     let destroyed = false;
     let syncing = false;
@@ -766,6 +775,7 @@
     let drawdownCrosshairHandler = null;
     let clickHandler = null;
     let renderCount = 0;
+    let periodAggregationCount = 0;
     let usingFallback = true;
     let fallbackReason = null;
     let lastMarkerError = null;
@@ -791,12 +801,16 @@
     }
 
     function currentPoints() {
-      const allPoints = toMetricData(rows, state.metric, initialCash);
+      if (!metricPointsCache.has(state.metric)) metricPointsCache.set(state.metric, toMetricData(rows, state.metric, initialCash));
+      const allPoints = metricPointsCache.get(state.metric);
       return filterDateRange(allPoints, state.range, {endDate: rows.at(-1)?.date, validDateRange: rows.validDateRange});
     }
 
-    function currentBars() {
-      if (state.period === "1D" || state.metric === "cumulative_return") return [];
+    function periodBarsEntry() {
+      const key = `${state.metric}:${state.period}`;
+      let entry = periodBarsCache.get(key);
+      if (entry) return entry;
+      periodAggregationCount += 1;
       const allBars = aggregateObservedClose(rows, state.period, {
         metric: state.metric,
         initialCash,
@@ -805,7 +819,25 @@
         missingSessionDates: rows.missingSessionDates,
         aggregation: rows.aggregation,
       });
+      entry = {
+        allBars,
+        byTime: new Map(allBars.map((bar) => [bar.time, bar])),
+        byPeriodKey: new Map(allBars.map((bar) => [bar.periodKey, bar])),
+      };
+      periodBarsCache.set(key, entry);
+      return entry;
+    }
+
+    function currentBars() {
+      if (state.period === "1D" || state.metric === "cumulative_return") return [];
+      const allBars = periodBarsEntry().allBars;
       return filterDateRange(allBars, state.range, {endDate: rows.at(-1)?.date, validDateRange: rows.validDateRange});
+    }
+
+    function periodBarForDate(date) {
+      if (state.period === "1D" || state.metric === "cumulative_return") return null;
+      const entry = periodBarsEntry();
+      return entry.byTime.get(date) || entry.byPeriodKey.get(periodKeyForDate(date, state.period)) || null;
     }
 
     function mainData() {
@@ -1023,9 +1055,7 @@
       const row = rows.find((candidate) => candidate.date === date);
       if (chart === charts.drawdown) return asFiniteNumber(row?.drawdown);
       if (state.period !== "1D" && state.metric !== "cumulative_return") {
-        const bars = currentBars();
-        const bar = bars.find((candidate) => candidate.time === date)
-          || bars.find((candidate) => candidate.periodStart <= date && candidate.periodEnd >= date);
+        const bar = periodBarForDate(date);
         return asFiniteNumber(bar?.close);
       }
       return row ? metricValue(row, state.metric, initialCash) : null;
@@ -1258,8 +1288,8 @@
       if (destroyed || !parameter) return;
       const date = asDate(parameter.time || parameter.date);
       if (!date) return;
-      const row = rows.find((item) => item.date === date) || null;
-      const dayEvents = events.filter((event) => event.date === date);
+      const row = rowByDate.get(date) || null;
+      const dayEvents = eventsByDate.get(date) || [];
       safeCallback(config.onHover, {
         date,
         row: row ? {...row} : null,
@@ -1273,7 +1303,7 @@
         events: dayEvents.map((event) => ({...event})),
         eventCount: dayEvents.length,
         period: state.period,
-        bar: currentBars().find((candidate) => candidate.time === date) || null,
+        bar: periodBarForDate(date),
       });
     }
 
@@ -1349,7 +1379,7 @@
       resize,
       destroy,
       getEventGroups: () => currentGroups().map((group) => ({...group, events: group.events.map((event) => ({...event}))})),
-      getState: () => ({...state, renderCount, usingFallback, markerError: lastMarkerError ? {...lastMarkerError} : null}),
+      getState: () => ({...state, renderCount, periodAggregationCount, usingFallback, markerError: lastMarkerError ? {...lastMarkerError} : null}),
       getData: () => ({rows: rows.map((row) => ({...row})), events: events.map((event) => ({...event})), runId: object.run_id || null, portfolioId: object.portfolio_id || null}),
     };
 

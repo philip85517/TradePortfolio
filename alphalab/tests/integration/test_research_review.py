@@ -245,6 +245,25 @@ def test_review_candidates_filter_without_changing_frozen_rank(tmp_path):
     assert all(reasons[0] in row["reason"] for row in reason_rows)
 
 
+def test_candidates_endpoint_returns_lazy_industry_options_and_quality(tmp_path):
+    state = _state(tmp_path, industry=True)
+    state.candidates_frame["industry"] = pd.Series("UNKNOWN", index=state.candidates_frame.index, dtype="string")
+    server = create_review_server(state)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        payload = _get_json(server, "/api/candidates")
+    finally:
+        server.shutdown()
+        thread.join(timeout=2)
+        server.server_close()
+
+    assert set(payload["industries"]) == {"制造业", "信息传输、软件和信息技术服务业"}
+    assert payload["industry_info"]["quality"] == "current-snapshot"
+    assert payload["industry_info"]["coverage"] == pytest.approx(1.0)
+    assert {row["industry"] for row in payload["rows"]} == set(payload["industries"])
+
+
 def test_review_page_and_summary_are_read_only_and_explain_run(tmp_path):
     state = _state(tmp_path)
     summary = state.summary()

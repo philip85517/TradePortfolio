@@ -535,6 +535,32 @@ test('large local fixture does not rebuild chart series for repeated hover event
   controller.destroy();
 });
 
+test('large weekly and monthly hovers reuse cached period aggregation and date indexes', () => {
+  const h = charts();
+  const document = fakeDocument();
+  const container = fakeElement();
+  container.ownerDocument = document;
+  const library = fakeChartApi([]);
+  const nav = [];
+  const events = [];
+  for (let index = 0; index < 5000; index += 1) {
+    const date = new Date(Date.UTC(2010, 0, 1 + index)).toISOString().slice(0, 10);
+    nav.push({date, equity: 100000 + index});
+    if (index < 1000) events.push({id: `period-event-${index}`, date, action: index % 2 ? 'SELECT' : 'BUY', filled: index % 2 === 0, symbol: '000001'});
+  }
+  const controller = h.create(container, {data: {nav, events, capabilities: {session_list: nav.map((row) => row.date)}}, initialCash: 100000, library});
+  for (const period of ['1W', '1M']) {
+    controller.update({period});
+    const before = controller.getState().periodAggregationCount;
+    const renders = controller.getState().renderCount;
+    for (let index = 0; index < 100; index += 1) library.charts[0].emitCrosshair({time: nav[index].date});
+    assert.equal(controller.getState().periodAggregationCount, before);
+    assert.equal(controller.getState().renderCount, renders);
+  }
+  assert.equal(controller.getState().periodAggregationCount, 2);
+  controller.destroy();
+});
+
 test('local named chart assets are present and vendor bundle is the locked 4.2.3 standalone build', () => {
   const source = fs.readFileSync(modulePath, 'utf8');
   const vendorPath = path.resolve('alphalab/research/static/vendor/lightweight-charts.standalone.production.js');

@@ -115,6 +115,41 @@ test('normalizes detail and fallback identity while keeping null metrics distinc
   assert.equal(ui.formatMissing(0, '不会使用'), '0');
 });
 
+test('fallback selects the frozen manifest portfolio and horizon instead of primary summary', () => {
+  const payload = {
+    run_id: 'run-scoped-fallback',
+    portfolio_id: 'primary',
+    summary: {horizon: 21, total_return: 0.1, status: 'COMPLETE', liquidation_status: 'LIQUIDATED'},
+    manifest: {
+      run_id: 'run-scoped-fallback',
+      portfolios: [{portfolio_id: 'primary', name: '主组合'}, {portfolio_id: 'alternate', name: '替代组合'}],
+      portfolio_performance: {
+        primary: {21: {horizon: 21, total_return: 0.1, status: 'COMPLETE', liquidation_status: 'LIQUIDATED', open_positions: {}}},
+        alternate: {
+          21: {horizon: 21, total_return: 0.2, status: 'COMPLETE', liquidation_status: 'LIQUIDATED', open_positions: {}},
+          42: {horizon: 42, total_return: 0.9, status: 'COMPLETE', liquidation_status: 'OPEN_POSITION', open_positions: {"000002": 10}},
+        },
+      },
+    },
+  };
+  const model = ui.normalizeReviewPayload(payload, {fallback: true, portfolioId: 'alternate', horizon: 42});
+  assert.equal(model.portfolioId, 'alternate');
+  assert.equal(model.horizon, '42');
+  assert.equal(model.data.summary.total_return, 0.9);
+  assert.equal(model.data.status.code, 'COMPLETE_OPEN');
+  assert.equal(model.data.ending_holdings[0].symbol, '000002');
+});
+
+test('fallback leaves legacy completion liquidation status unknown without affirmative evidence', () => {
+  const model = ui.normalizeReviewPayload({
+    run_id: 'legacy-run',
+    portfolio_id: 'strategy',
+    horizons: [706],
+    summary: {horizon: 706, total_return: 0.1, status: 'COMPLETE'},
+  }, {fallback: true, portfolioId: 'strategy', horizon: 706});
+  assert.notEqual(model.data.status.code, 'COMPLETE_LIQUIDATED');
+});
+
 test('event filters and factual summary separate fills, decisions, deferred attempts, and terminal exits', () => {
   const data = sampleReview().by_horizon['706'];
   assert.equal(ui.eventIsFill(data.events[0]), true);
@@ -278,4 +313,49 @@ test('period and filter changes clear a stale grouped event chooser', () => {
   assert.equal(controller.getState().eventGroup, null);
   assert.doesNotMatch(container.region('details'), /选择要查看的单个事件/);
   controller.destroy();
+});
+
+test('holdings render ending market value and settlement evidence separately from initial entry fields', () => {
+  const open = sampleReview({
+    summary: {status: 'COMPLETE', liquidation_status: 'OPEN_POSITION', ending_equity: 1234.5},
+    status: {code: 'COMPLETE_OPEN', label: '完成但有未平仓', explanation: '仍有持仓。'},
+    ending_holdings: [{symbol: '000002', name: '乙公司', shares: 50, market_value: 1234.5, unsettled: false, source: 'frozen_ending_holdings'}],
+    capabilities: {daily_nav: true, ending_holdings_evidence: true},
+  });
+  const openContainer = observableContainer();
+  const openController = ui.create(openContainer, {data: open, charts: null});
+  openController.update({tab: 'holdings'});
+  const openHtml = openContainer.region('details');
+  assert.match(openHtml, /已保存市值/);
+  assert.match(openHtml, /1,234\.50/);
+  assert.match(openHtml, /已结算/);
+  assert.doesNotMatch(openHtml, /乙公司.*10\.0000/);
+  openController.destroy();
+
+  const unsettled = sampleReview({
+    summary: {status: 'COMPLETE', liquidation_status: 'UNSETTLED_DELISTING'},
+    status: {code: 'UNSETTLED', label: '含未结算股份', explanation: '仍有未结算股份。'},
+    ending_holdings: [{symbol: '000003', shares: 20, market_value: 800, unsettled: true, source: 'frozen_ending_holdings'}],
+    capabilities: {daily_nav: true, ending_holdings_evidence: true},
+  });
+  const unsettledContainer = observableContainer();
+  const unsettledController = ui.create(unsettledContainer, {data: unsettled, charts: null});
+  unsettledController.update({tab: 'holdings'});
+  assert.match(unsettledContainer.region('details'), /未结算/);
+  unsettledController.destroy();
+
+  const unknown = sampleReview({
+    summary: {status: 'COMPLETE'},
+    status: {code: 'COMPLETE', label: '结果已保存', explanation: '清算状态未知。'},
+    ending_holdings: [],
+    capabilities: {daily_nav: true, ending_holdings_evidence: false},
+  });
+  const unknownContainer = observableContainer();
+  const unknownController = ui.create(unknownContainer, {data: unknown, charts: null});
+  unknownController.update({tab: 'holdings'});
+  const unknownHtml = unknownContainer.region('details');
+  assert.match(unknownHtml, /期末持仓\/清算证据未提供/);
+  assert.doesNotMatch(unknownHtml, /全部清算后现金/);
+  assert.doesNotMatch(unknownHtml, /冻结证据显示期末没有持仓/);
+  unknownController.destroy();
 });

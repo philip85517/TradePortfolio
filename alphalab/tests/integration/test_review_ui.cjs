@@ -29,6 +29,23 @@ function reviewExports() {
  const context={module:{exports:{}}};vm.runInNewContext(fs.readFileSync('alphalab/research/static/app.js','utf8'),context);
  return context.module.exports;
 }
+
+test('candidate response refreshes the existing industry filter and quality badge after lazy enrichment', async () => {
+ const nodes=new Map();
+ function node(id){
+  if(!nodes.has(id)) nodes.set(id,{hidden:false,innerHTML:'',value:'',textContent:'',children:[],dataset:{},classList:{toggle(){},add(){}},setAttribute(){},appendChild(child){this.children.push(child);},querySelectorAll(){return[];},addEventListener(e,fn){this[e]=fn;}});
+  return nodes.get(id);
+ }
+ const document={getElementById:node,querySelector:node,querySelectorAll(){return[];},addEventListener(){},createElement(){return {value:'',textContent:''};}};
+ const summary={run_id:'run-industry',requested_date:'2025-06-30',signal_date:'2025-06-30',industries:[],industry_info:{quality:'unavailable',coverage:0},portfolios:[],candidate_count:1,eligible_count:1,selected_count:0};
+ const candidates={rows:[],industries:['制造业'],industry_info:{quality:'current-snapshot',coverage:1},reasons:[]};
+ const context={document,localStorage:{getItem(){return null;}},URLSearchParams,location:{search:''},window:{},fetch:(path)=>Promise.resolve({ok:true,json:async()=>path.startsWith('api/candidates')?candidates:summary})};
+ vm.runInNewContext(fs.readFileSync('alphalab/research/static/app.js','utf8'),context);
+ await new Promise((resolve)=>setImmediate(resolve));
+ await new Promise((resolve)=>setImmediate(resolve));
+ assert.equal(node('industryQuality').textContent,'快照 100.00%');
+ assert.deepEqual(node('industry').children.map((option)=>option.value),['制造业']);
+});
 test('open positions display valuation separately from realized cash and gains',()=>{
  const {performanceCardHtml,portfolioStatus}=reviewExports();
  const result={status:'COMPLETE',liquidation_status:'OPEN_POSITION',total_return:.2,profit_loss:200,

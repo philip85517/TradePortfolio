@@ -595,6 +595,7 @@ class ReviewRequestHandler(BaseHTTPRequestHandler):
                             reason=_first(params, "reason", "all"),
                         ),
                         "industries": self.review_state.industries(),
+                        "industry_info": self.review_state.industry_info(),
                         "reasons": self.review_state.reasons(),
                     }
                 )

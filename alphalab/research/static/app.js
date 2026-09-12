@@ -77,6 +77,25 @@
 
   function hideError() { $("errorBanner").hidden = true; }
 
+  function renderIndustryMetadata(industries, industryInfo) {
+    const info = industryInfo || {};
+    $("industryQuality").textContent = info.quality === "point-in-time"
+      ? `PIT ${percent(info.coverage)}`
+      : info.quality === "current-snapshot"
+        ? `快照 ${percent(info.coverage)}`
+        : "未绑定";
+    const industry = $("industry");
+    const current = industry.value;
+    industry.innerHTML = '<option value="all">全部行业</option>';
+    for (const value of industries || []) {
+      const option = document.createElement("option");
+      option.value = value;
+      option.textContent = value;
+      industry.appendChild(option);
+    }
+    industry.value = (industries || []).includes(current) ? current : "all";
+  }
+
   function renderSummary(summary) {
     const labels = reviewLabels(summary);
     $("requestedDate").textContent = labels.requestedDate;
@@ -98,21 +117,8 @@
     const quality = summary.data_quality || {};
     const warnings = Number(quality.invalid_ohlc_rows || 0) + Number(quality.duplicate_groups || 0) + Number(quality.unknown_adjustment_rows || 0);
     $("qualityState").textContent = warnings ? `${warnings.toLocaleString()} 条警告` : "无明显警告";
-    const industryInfo = summary.industry_info || {};
-    $("industryQuality").textContent = industryInfo.quality === "point-in-time"
-      ? `PIT ${percent(industryInfo.coverage)}`
-      : industryInfo.quality === "current-snapshot"
-        ? `快照 ${percent(industryInfo.coverage)}`
-        : "未绑定";
     $("subtitle").textContent = `运行 ${summary.run_id} · ${labels.rule} · 只读审阅`;
-    const industry = $("industry");
-    industry.innerHTML = '<option value="all">全部行业</option>';
-    for (const value of summary.industries || []) {
-      const option = document.createElement("option");
-      option.value = value;
-      option.textContent = value;
-      industry.appendChild(option);
-    }
+    renderIndustryMetadata(summary.industries, summary.industry_info);
     renderPortfolioOptions(summary.portfolios || []);
   }
 
@@ -171,6 +177,7 @@
     return api(`/api/candidates?${query}`).then((payload) => {
       if (request !== candidateRequest) return;
       state.candidates = payload.rows || [];
+      renderIndustryMetadata(payload.industries, payload.industry_info);
       renderReasonOptions(payload.reasons || []);
       renderCandidates(state.candidates);
       if (!state.candidates.some((row) => String(row.symbol) === String(state.selectedSymbol))) {
