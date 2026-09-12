@@ -383,7 +383,7 @@ def _scope(
         "requested_end_date": _safe_text(_first_value(dates.get("requested_end_date"), wizard.get("requested_end_date"), manifest.get("requested_date"))),
         "entry_date": _date_text(_first_value(diagnostics.get("entry_date"), dates.get("entry_date"))),
         "exit_date": _date_text(_first_value(dates.get("exit_date"), diagnostics.get("evaluated_date"))),
-        "actual_date_range": nav_dates,
+        "actual_date_range": [nav_dates[0], nav_dates[-1]] if nav_dates else None,
         "valid_date_range": [_date_text(value) for value in data_range] if data_range else nav_dates,
         "calendar_source": _safe_text(_first_value(dates.get("calendar_source"), wizard.get("calendar_source"))),
         "session_count": len(_research_sessions(spec)),
@@ -731,7 +731,9 @@ def _status(
 ) -> dict[str, Any]:
     raw_status = str(summary.get("status") or manifest.get("status") or "").upper()
     liquidation = str(summary.get("liquidation_status") or "").upper()
-    if raw_status in {"RUNNING", "PENDING", "PREPARING", "CHECKING"}:
+    if raw_status in {"PLANNED", "QUEUED", "SCHEDULED"}:
+        code, label, explanation = "PLANNED", "待运行", "研究计划已保存，尚未开始运行。"
+    elif raw_status in {"RUNNING", "PENDING", "PREPARING", "CHECKING"}:
         code, label, explanation = "RUNNING", "运行中", "研究仍在运行，冻结结果尚未完成。"
     elif raw_status in {"FAILED", "ERROR", "CANCELLED", "CANCELED"}:
         code, label, explanation = "FAILED", "运行失败", "研究运行失败，当前没有可完整复盘的冻结结果。"
@@ -809,14 +811,14 @@ def _capabilities(
                 "source": "daily_nav_observed_closes" if nav else None,
                 "completeness": completeness,
                 "missing_dates": missing,
-                "last_period_may_be_partial": bool(nav and sessions and nav_dates and nav_dates[-1] != sessions[-1]),
+                "last_period_may_be_partial": _last_period_may_be_partial(nav_dates, "weekly"),
             },
             "monthly": {
                 "available": bool(nav),
                 "source": "daily_nav_observed_closes" if nav else None,
                 "completeness": completeness,
                 "missing_dates": missing,
-                "last_period_may_be_partial": bool(nav and sessions and nav_dates and nav_dates[-1] != sessions[-1]),
+                "last_period_may_be_partial": _last_period_may_be_partial(nav_dates, "monthly"),
             },
         },
         "session_list": sessions,
@@ -845,6 +847,29 @@ def _expected_sessions(sessions: Sequence[str], nav_dates: Sequence[str]) -> lis
         return []
     start, end = nav_dates[0], nav_dates[-1]
     return [value for value in sessions if start <= value <= end]
+
+
+def _last_period_may_be_partial(nav_dates: Sequence[str], period: str) -> bool:
+    """Flag a trailing calendar period that ends before its visible boundary.
+
+    The frozen session list is bounded by the research interval, so comparing
+    its last value with the last NAV date cannot tell whether the interval
+    itself stopped mid-period.  Use only the observable calendar boundary:
+    Friday closes a trading week and a civil month-end closes a month.  A
+    holiday-shortened period remains conservatively marked partial because no
+    future session is fabricated to prove completeness.
+    """
+    if not nav_dates:
+        return False
+    try:
+        last = pd.Timestamp(nav_dates[-1])
+    except (TypeError, ValueError, OverflowError):
+        return True
+    if period == "weekly":
+        return last.weekday() != 4
+    if period == "monthly":
+        return not bool(last.is_month_end)
+    return True
 
 
 def _benchmark_for_horizon(manifest: Mapping[str, Any], portfolio_id: str, horizon: int) -> dict[str, Any]:

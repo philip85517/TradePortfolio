@@ -144,7 +144,7 @@ class ReviewState:
         industry_path = data_source.get("industry_db_path") if isinstance(data_source, dict) else None
         self.industry_db_path = Path(industry_path).expanduser() if industry_path and Path(industry_path).is_file() else None
         self.candidates_frame = run.candidates_frame.copy()
-        self._enrich_candidate_metadata()
+        self._candidate_metadata_loaded = False
 
     def summary(self) -> dict[str, Any]:
         candidates = self.run.candidates_frame
@@ -352,6 +352,7 @@ class ReviewState:
         industry: str = "all",
         reason: str = "all",
     ) -> list[dict[str, Any]]:
+        self._ensure_candidate_metadata()
         frame = self.candidates_frame.copy()
         selected = frame["selected"].fillna(False).astype(bool)
         eligible = frame.get("eligible", pd.Series(False, index=frame.index)).fillna(False).astype(bool)
@@ -389,6 +390,7 @@ class ReviewState:
         portfolio_id: str | None = None,
         timeframe: str = "1d",
     ) -> dict[str, Any]:
+        self._ensure_candidate_metadata()
         symbol = str(symbol).strip()
         mode = str(mode).strip().lower() or "selection"
         if mode not in {"selection", "evaluation"}:
@@ -549,6 +551,13 @@ class ReviewState:
                 self.candidates_frame[column] = self.candidates_frame[column].where(
                     self.candidates_frame[column].notna(), values
                 )
+
+    def _ensure_candidate_metadata(self) -> None:
+        """Load optional candidate labels only for endpoints that display them."""
+        if self._candidate_metadata_loaded:
+            return
+        self._candidate_metadata_loaded = True
+        self._enrich_candidate_metadata()
 
 
 class ReviewRequestHandler(BaseHTTPRequestHandler):

@@ -145,10 +145,10 @@ def test_review_supplements_industry_from_existing_local_universe(tmp_path):
     state = _state(tmp_path, industry=True)
 
     summary = state.summary()
+    assert summary["industry_info"]["quality"] == "unavailable"
+    state.candidates()
     detail = state.stock_detail("300468")
 
-    assert summary["industry_info"]["quality"] == "current-snapshot"
-    assert summary["industry_info"]["coverage"] == pytest.approx(1.0)
     assert detail["candidate"]["industry"] == "信息传输、软件和信息技术服务业"
     assert detail["candidate"]["industry_level3"] == "软件"
 

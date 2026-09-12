@@ -168,3 +168,46 @@ the wizard UI. Consumers must preserve null NAV rows and must not interpret a
 derived initial event's missing cost fields as zero. A benchmark is marked
 available only when a comparable frozen benchmark mapping is present; the
 real fixture therefore reports it as unavailable.
+
+## Follow-up fix wave
+
+The independent review identified five important contract issues. Focused RED
+coverage was added before the fixes with:
+
+```text
+/opt/miniconda3/bin/python -m pytest -q alphalab/tests/integration/test_result_projection.py alphalab/tests/integration/test_research_review.py alphalab/tests/integration/test_workflow.py
+3 failed, 46 passed in 22.72s
+```
+
+The failures covered `PLANNED` falling through to `COMPLETE`, the unbounded
+`scope.actual_date_range`, static review assets trying to load a missing run,
+and eager configured-DB access during frozen review routes. The fixed focused
+set passed:
+
+```text
+/opt/miniconda3/bin/python -m pytest -q alphalab/tests/integration/test_result_projection.py alphalab/tests/integration/test_research_review.py alphalab/tests/integration/test_workflow.py
+49 passed in 15.71s
+```
+
+The follow-up keeps `PLANNED` as a truthful `待运行` status, exposes only the
+first and last actual NAV dates, computes weekly and monthly trailing partial
+flags independently from visible calendar boundaries, and serves the named
+review static assets before attempting run loading. `ReviewState` now defers
+optional candidate metadata enrichment until candidate or stock endpoints;
+summary and portfolio reads remain frozen-only even when a DB path is
+configured. Workbench tests cover summary/portfolio reads without DB access,
+missing-DB stock rejection, provider/adapter call absence, unchanged manifest
+and NAV hashes, and static routing for a missing run.
+
+Follow-up files in the fix commit:
+
+- `alphalab/research/result_projection.py`
+- `alphalab/research/review.py`
+- `alphalab/research/workbench.py`
+- `alphalab/tests/integration/test_result_projection.py`
+- `alphalab/tests/integration/test_research_review.py`
+- `.superpowers/sdd/2026-09-12-portfolio-result-review/task-1-report.md`
+
+The full `alphalab/tests` suite was already independently verified at
+`406 passed` on the base Task1 commit; this bounded follow-up ran the affected
+projection, review, and workbench suites only.

@@ -3,14 +3,17 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import threading
 from pathlib import Path
+from urllib.error import HTTPError
 from urllib.request import urlopen
 
 import pandas as pd
 import pytest
 
 from alphalab.research.review import ReviewRun, ReviewState, create_review_server
+from alphalab.research.workbench import create_workbench_server
 from alphalab.research.result_projection import build_review_projection
 
 
@@ -231,3 +234,161 @@ def test_portfolio_endpoint_does_not_need_market_database(tmp_path: Path):
         server.server_close()
 
     assert payload["review"]["by_horizon"]["2"]["nav"]
+
+
+def test_projection_preserves_planned_status_range_and_independent_partial_periods():
+    manifest = _manifest()
+    manifest["status"] = "PLANNED"
+    manifest["portfolio_performance"]["small"]["2"]["status"] = "PLANNED"
+    projection = build_review_projection(
+        manifest,
+        portfolio_id="small",
+        portfolio_frame=_portfolio_frame(),
+        nav_frame=_nav_frame(),
+    )
+
+    horizon = projection["by_horizon"]["2"]
+    assert horizon["status"]["code"] == "PLANNED"
+    assert horizon["status"]["label"] == "待运行"
+    assert projection["scope"]["actual_date_range"] == ["2025-01-02", "2025-01-06"]
+    assert horizon["capabilities"]["aggregation"]["weekly"]["last_period_may_be_partial"] is True
+    assert horizon["capabilities"]["aggregation"]["monthly"]["last_period_may_be_partial"] is True
+
+    complete_manifest = _manifest()
+    complete_manifest["spec"]["wizard_metadata"]["research_sessions"] = ["2025-01-30", "2025-01-31"]
+    complete_nav = pd.DataFrame(
+        [
+            {"portfolio_id": "small", "date": "2025-01-30", "horizon": 2, "equity": 1_000.0},
+            {"portfolio_id": "small", "date": "2025-01-31", "horizon": 2, "equity": 1_000.0},
+        ]
+    )
+    complete = build_review_projection(
+        complete_manifest,
+        portfolio_id="small",
+        portfolio_frame=_portfolio_frame(),
+        nav_frame=complete_nav,
+    )["by_horizon"]["2"]["capabilities"]["aggregation"]
+    assert complete["weekly"]["last_period_may_be_partial"] is False
+    assert complete["monthly"]["last_period_may_be_partial"] is False
+
+
+def _write_workbench_run(tmp_path: Path, db_path: Path) -> Path:
+    run_dir = tmp_path / "runs" / "run-projection"
+    run_dir.mkdir(parents=True)
+    manifest = _manifest()
+    manifest["diagnostics"]["data_source"] = {"db_path": str(db_path)}
+    candidates = pd.DataFrame(
+        [{"symbol": "000001", "name": "甲公司", "selected": True, "eligible": True}]
+    )
+    portfolio = _portfolio_frame()
+    nav = _nav_frame()
+    portfolios = portfolio.copy()
+    portfolio_nav = nav.copy()
+    returns = pd.DataFrame(columns=["run_id", "portfolio_id", "horizon", "symbol", "return", "contribution", "winning"])
+    frames = {
+        "candidates.csv": candidates,
+        "portfolio.csv": portfolio,
+        "nav.csv": nav,
+        "portfolio_returns.csv": returns,
+        "portfolios.csv": portfolios,
+        "portfolio_nav.csv": portfolio_nav,
+    }
+    for filename, frame in frames.items():
+        frame.to_csv(run_dir / filename, index=False)
+    manifest["artifacts"] = [*frames, "manifest.json"]
+    manifest["artifact_hashes"] = {
+        filename: hashlib.sha256((run_dir / filename).read_bytes()).hexdigest()
+        for filename in frames
+    }
+    (run_dir / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False), encoding="utf-8")
+    return run_dir
+
+
+class _ReviewFlow:
+    def __init__(self, runs_dir: Path):
+        self.runs_dir = runs_dir
+
+
+def _workbench_json(server, path: str) -> dict:
+    with urlopen(f"http://{server.server_address[0]}:{server.server_address[1]}{path}") as response:
+        return json.loads(response.read())
+
+
+def test_workbench_static_review_asset_does_not_load_run(tmp_path: Path):
+    runs_dir = tmp_path / "runs"
+    runs_dir.mkdir()
+    server = create_workbench_server(_ReviewFlow(runs_dir))
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        with urlopen(
+            f"http://{server.server_address[0]}:{server.server_address[1]}"
+            "/research/review/missing-run/app.js"
+        ) as response:
+            body = response.read().decode("utf-8")
+    finally:
+        server.shutdown()
+        thread.join(timeout=2)
+        server.server_close()
+    assert "LightweightCharts" in body
+
+
+def test_workbench_frozen_routes_skip_db_and_preserve_artifacts(tmp_path: Path, monkeypatch):
+    db_path = tmp_path / "configured.duckdb"
+    db_path.touch()
+    run_dir = _write_workbench_run(tmp_path, db_path)
+    before = {
+        filename: hashlib.sha256((run_dir / filename).read_bytes()).hexdigest()
+        for filename in ["manifest.json", "nav.csv"]
+    }
+    calls: list[str] = []
+
+    class SpyAdapter:
+        def __init__(self, *args, **kwargs):
+            calls.append("init")
+
+        def load(self, *args, **kwargs):
+            calls.append("load")
+            raise AssertionError("frozen summary/portfolio must not access market DB")
+
+    import alphalab.research.review as review_module
+
+    monkeypatch.setattr(review_module, "DuckDBMarketDataAdapter", SpyAdapter)
+    server = create_workbench_server(_ReviewFlow(run_dir.parent))
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        summary = _workbench_json(server, "/research/review/run-projection/api/summary")
+        portfolio = _workbench_json(server, "/research/review/run-projection/api/portfolio")
+    finally:
+        server.shutdown()
+        thread.join(timeout=2)
+        server.server_close()
+    after = {
+        filename: hashlib.sha256((run_dir / filename).read_bytes()).hexdigest()
+        for filename in ["manifest.json", "nav.csv"]
+    }
+    assert summary["run_id"] == "run-projection"
+    assert portfolio["review"]["schema_version"] == 1
+    assert calls == []
+    assert after == before
+
+
+def test_workbench_stock_route_rejects_missing_db(tmp_path: Path):
+    run_dir = _write_workbench_run(tmp_path, tmp_path / "missing.duckdb")
+    server = create_workbench_server(_ReviewFlow(run_dir.parent))
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        with pytest.raises(HTTPError) as error:
+            urlopen(
+                f"http://{server.server_address[0]}:{server.server_address[1]}"
+                "/research/review/run-projection/api/stock?symbol=000001"
+            )
+        assert error.value.code == 400
+        payload = json.loads(error.value.read())
+    finally:
+        server.shutdown()
+        thread.join(timeout=2)
+        server.server_close()
+    assert "行情数据库不存在" in payload["error"]

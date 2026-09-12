@@ -51,13 +51,18 @@ class WorkbenchHTTPMixin:
                 filename = 'wizard.html' if path in {'/wizard', '/wizard/'} else path[1:]
                 self._send_file(STATIC_ROOT / filename)
                 return True
-            flow = self.get_workflow()
             if self.command == 'GET' and path.startswith('/research/review/'):
                 parts = path.split('/')
                 run_id = unquote(parts[3]) if len(parts) > 3 else ''
                 if len(parts) == 4:
                     self.send_response(302); self.send_header('Location', path + '/'); self.end_headers()
                     return True
+                review_asset = parts[4:]
+                if review_asset in ([''], ['app.js'], ['styles.css']):
+                    filename = 'index.html' if review_asset == [''] else review_asset[0]
+                    self._send_file(STATIC_ROOT / filename)
+                    return True
+                flow = self.get_workflow()
                 run = load_review_run(flow.runs_dir, run_id)
                 data_source = run.manifest.get('diagnostics', {}).get('data_source', {})
                 data_source = data_source if isinstance(data_source, dict) else {}
@@ -71,6 +76,7 @@ class WorkbenchHTTPMixin:
                 finally:
                     self.path = original
                 return True
+            flow = self.get_workflow()
             parts = path.removeprefix('/api/wizard/').strip('/').split('/')
             body = self._body() if self.command != 'GET' else {}
             if parts == ['drafts']:
