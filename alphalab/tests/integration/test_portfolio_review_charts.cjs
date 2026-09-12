@@ -58,6 +58,25 @@ function longNavData() {
   return data;
 }
 
+function earlyPeriodData() {
+  const data = longNavData();
+  const sessionDates = [];
+  for (let timestamp = Date.UTC(2023, 0, 3); timestamp <= Date.UTC(2023, 0, 31); timestamp += 24 * 60 * 60 * 1000) {
+    const date = new Date(timestamp);
+    if (date.getUTCDay() === 0 || date.getUTCDay() === 6) continue;
+    sessionDates.push(date.toISOString().slice(0, 10));
+  }
+  const dates = [...sessionDates, '2024-12-03', '2025-12-03'];
+  data.nav = dates.map((date, index) => ({
+    date,
+    equity: 1000 + index,
+    daily_return: index ? 0.001 : 0,
+    drawdown: 0,
+  }));
+  data.capabilities.session_list = dates;
+  return data;
+}
+
 function fakeElement(width = 640, height = 360) {
   const element = {
     children: [],
@@ -384,6 +403,31 @@ test('locateEvent expands a bounded range before positioning an out-of-range fac
     assert.ok(visible.to > visible.from);
   }
   assert.equal(errors.length, 0);
+  controller.destroy();
+});
+
+test('period locate keeps an early event and its mapped close candle in the visible window', () => {
+  const h = charts();
+  const document = fakeDocument();
+  const container = fakeElement();
+  container.ownerDocument = document;
+  const log = [];
+  const library = fakeChartApi(log, {strict: true});
+  const controller = h.create(container, {data: earlyPeriodData(), initialCash: 1000, library});
+  const expectedClose = { '1W': '2023-01-06', '1M': '2023-01-31' };
+  for (const period of ['1W', '1M']) {
+    controller.update({period, metric: 'unit_nav', range: '1Y'});
+    controller.locateEvent('buy-1');
+    const candle = library.charts[0].series.find((series) => series.kind === 'candlestick');
+    const marker = candle.markers.find((item) => item.eventIds.includes('buy-1'));
+    const visible = library.charts[0].visibleRanges.at(-1);
+    assert.ok(marker, period);
+    assert.equal(marker.time, expectedClose[period]);
+    assert.equal(marker.sourceDate, '2023-01-03');
+    assert.ok(candle.data.some((point) => point.time === expectedClose[period] && point.open !== undefined), period);
+    assert.ok(visible.from <= expectedClose[period] && expectedClose[period] <= visible.to, period);
+    assert.ok(visible.from <= '2023-01-03' && '2023-01-03' <= visible.to, period);
+  }
   controller.destroy();
 });
 

@@ -905,8 +905,16 @@
       const dates = source.map((row) => row.date);
       let index = dates.findIndex((value) => value >= date);
       if (index < 0) index = dates.length - 1;
-      const from = dates[Math.max(0, index - 10)] || date;
-      const to = dates[Math.min(dates.length - 1, index + 10)] || date;
+      let from = dates[Math.max(0, index - 10)] || date;
+      let to = dates[Math.min(dates.length - 1, index + 10)] || date;
+      if (state.period !== "1D" && state.metric !== "cumulative_return") {
+        const periodKey = periodKeyForDate(date, state.period);
+        const bar = currentBars().find((candidate) => candidate.periodKey === periodKey);
+        if (bar?.time) {
+          if (bar.time < from) from = bar.time;
+          if (bar.time > to) to = bar.time;
+        }
+      }
       return {from: date < from ? date : from, to: date > to ? date : to};
     }
 
